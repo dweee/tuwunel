@@ -1,6 +1,10 @@
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::{
+	extract::State,
+	response::{IntoResponse, Redirect, Response},
+};
+use http::{HeaderValue, header};
 use reqwest::Url;
 use ruma::{
 	MilliSecondsSinceUnixEpoch, Mxc, UserId,
@@ -24,7 +28,7 @@ use tuwunel_service::{
 	media::{Animate, CACHE_CONTROL_IMMUTABLE, CORP_CROSS_ORIGIN, Dim, MXC_LENGTH, Media},
 };
 
-use crate::{ClientIp, Ruma};
+use crate::{ClientIp, Ruma, RumaResponse};
 
 /// # `GET /_matrix/client/v1/media/config`
 pub(crate) async fn get_media_config_route(
@@ -159,7 +163,7 @@ pub(crate) async fn get_content_thumbnail_route(
 	State(services): State<crate::State>,
 	ClientIp(client): ClientIp,
 	body: Ruma<get_content_thumbnail::v1::Request>,
-) -> Result<get_content_thumbnail::v1::Response> {
+) -> Result<Response> {
 	let user = body.sender_user();
 
 	let dim = Dim::from_ruma(body.width, body.height, body.method.clone())?;
@@ -169,19 +173,36 @@ pub(crate) async fn get_content_thumbnail_route(
 		media_id: &body.media_id,
 	};
 
+	if let Some(url) = services
+		.media
+		.client_redirect_url(&mxc, &dim.normalized(), animate, None)
+		.await?
+	{
+		return Ok(media_redirect(&url));
+	}
+
 	let Media {
 		content,
 		content_type,
 		content_disposition,
 	} = fetch_thumbnail(&services, &mxc, user, body.timeout_ms, &dim, animate).await?;
 
-	Ok(get_content_thumbnail::v1::Response {
+	if let Some(url) = services
+		.media
+		.client_redirect_url(&mxc, &dim.normalized(), animate, None)
+		.await?
+	{
+		return Ok(media_redirect(&url));
+	}
+
+	Ok(RumaResponse(get_content_thumbnail::v1::Response {
 		file: content,
 		content_type: content_type.map(Into::into),
 		cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
 		cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
 		content_disposition,
 	})
+	.into_response())
 }
 
 /// # `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}`
@@ -197,11 +218,19 @@ pub(crate) async fn get_content_route(
 	State(services): State<crate::State>,
 	ClientIp(client): ClientIp,
 	body: Ruma<get_content::v1::Request>,
-) -> Result<get_content::v1::Response> {
+) -> Result<Response> {
 	let mxc = Mxc {
 		server_name: &body.server_name,
 		media_id: &body.media_id,
 	};
+
+	if let Some(url) = services
+		.media
+		.client_redirect_url(&mxc, &Dim::default(), Animate::Allowed, None)
+		.await?
+	{
+		return Ok(media_redirect(&url));
+	}
 
 	let Media {
 		content,
@@ -209,13 +238,14 @@ pub(crate) async fn get_content_route(
 		content_disposition,
 	} = fetch_file(&services, &mxc, body.timeout_ms, None).await?;
 
-	Ok(get_content::v1::Response {
+	Ok(RumaResponse(get_content::v1::Response {
 		file: content,
 		content_type: content_type.map(Into::into),
 		cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
 		cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
 		content_disposition,
 	})
+	.into_response())
 }
 
 /// # `GET /_matrix/client/v1/media/download/{serverName}/{mediaId}/{fileName}`
@@ -231,11 +261,19 @@ pub(crate) async fn get_content_as_filename_route(
 	State(services): State<crate::State>,
 	ClientIp(client): ClientIp,
 	body: Ruma<get_content_as_filename::v1::Request>,
-) -> Result<get_content_as_filename::v1::Response> {
+) -> Result<Response> {
 	let mxc = Mxc {
 		server_name: &body.server_name,
 		media_id: &body.media_id,
 	};
+
+	if let Some(url) = services
+		.media
+		.client_redirect_url(&mxc, &Dim::default(), Animate::Allowed, Some(&body.filename))
+		.await?
+	{
+		return Ok(media_redirect(&url));
+	}
 
 	let Media {
 		content,
@@ -243,13 +281,14 @@ pub(crate) async fn get_content_as_filename_route(
 		content_disposition,
 	} = fetch_file(&services, &mxc, body.timeout_ms, Some(&body.filename)).await?;
 
-	Ok(get_content_as_filename::v1::Response {
+	Ok(RumaResponse(get_content_as_filename::v1::Response {
 		file: content,
 		content_type: content_type.map(Into::into),
 		cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
 		cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
 		content_disposition,
 	})
+	.into_response())
 }
 
 /// # `GET /_matrix/client/v1/media/preview_url`
@@ -356,4 +395,16 @@ async fn fetch_file(
 		content_type,
 		content_disposition,
 	})
+}
+
+/// A signed URL is a temporary capability; never cache the redirect itself.
+fn media_redirect(url: &Url) -> Response {
+	let mut response = Redirect::temporary(url.as_str()).into_response();
+	response
+		.headers_mut()
+		.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+	response
+		.headers_mut()
+		.insert(header::VARY, HeaderValue::from_static("Authorization"));
+	response
 }

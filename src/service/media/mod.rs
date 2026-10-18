@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, pin_mut};
 use http::StatusCode;
-use object_store::ObjectMeta;
+use object_store::{Attribute, Attributes, ObjectMeta};
 use ruma::{
 	Mxc, OwnedMxcUri, OwnedUserId, UserId,
 	api::error::{ErrorKind, RetryAfter},
@@ -301,7 +301,7 @@ impl Service {
 		)?;
 
 		//TODO: Dangling metadata in database if creation fails
-		self.create_media_file(&key, file)
+		self.create_media_file(&key, file, content_disposition, walk.stored_type(content_type))
 			.map_ok(|()| walk.animates())
 			.await
 	}
@@ -605,6 +605,54 @@ impl Service {
 		pin_mut!(urls);
 
 		Ok(urls.next().await)
+	}
+
+	/// Direct authenticated-client download, retaining Matrix content headers.
+	/// Old objects without those headers and unavailable providers fall back to
+	/// the ordinary media path. Never expose a URL for an unverified object.
+	pub async fn client_redirect_url(
+		&self,
+		mxc: &Mxc<'_>,
+		dim: &Dim,
+		animate: Animate,
+		filename: Option<&str>,
+	) -> Result<Option<Url>> {
+		let config = &self.services.config;
+		if !config.media_allow_redirect
+			|| config.media_deny_framing
+			|| config.media_deny_inline_styles
+		{
+			return Ok(None);
+		}
+
+		let Ok(Metadata { key, content_type, content_disposition }) = self
+			.db
+			.search_file_metadata(mxc, dim, animate)
+			.await
+		else {
+			return Ok(None);
+		};
+
+		if !animate.accepts_type(content_type.as_deref()) {
+			return Ok(None);
+		}
+
+		let attributes =
+			download_attributes(content_disposition.as_ref(), content_type.as_deref(), filename);
+		let path = self.get_media_name_sha256(&key);
+		for provider in self.storage_providers() {
+			if let Some(url) = provider
+				.signed_media_url(&path, REDIRECT_TTL, &attributes)
+				.await
+				.log_debug_err()
+				.ok()
+				.flatten()
+			{
+				return Ok(Some(url));
+			}
+		}
+
+		Ok(None)
 	}
 
 	/// Gets all the MXC URIs in our media database
@@ -954,7 +1002,14 @@ impl Service {
 			.await
 	}
 
-	async fn create_media_file(&self, key: &[u8], file: &[u8]) -> Result {
+	async fn create_media_file(
+		&self,
+		key: &[u8],
+		file: &[u8],
+		content_disposition: Option<&ContentDisposition>,
+		content_type: Option<&str>,
+	) -> Result {
+		let attributes = download_attributes(content_disposition, content_type, None);
 		self.storage_providers()
 			.try_stream()
 			.ready_try_filter(|provider| {
@@ -973,7 +1028,7 @@ impl Service {
 				);
 
 				if let Err(e) = provider
-					.put_one(path.as_str(), file.to_vec())
+					.put_one_with_attributes(path.as_str(), file.to_vec(), attributes.clone())
 					.await
 				{
 					return Err!(Database(error!(
@@ -1053,8 +1108,31 @@ impl Service {
 
 #[inline]
 #[must_use]
-pub fn encode_key(key: &[u8]) -> String { general_purpose::URL_SAFE_NO_PAD.encode(key) }
+pub fn encode_key(key: &[u8]) -> String {
+	general_purpose::URL_SAFE_NO_PAD.encode(key)
+}
 
 fn mtime_millis(object: &ObjectMeta) -> u64 {
 	u64::try_from(object.last_modified.timestamp_millis()).unwrap_or(0)
+}
+
+/// The headers are stored on the object because a redirect cannot supply them
+/// on the final response. The same policy sanitizes proxied Matrix downloads.
+fn download_attributes(
+	content_disposition: Option<&ContentDisposition>,
+	content_type: Option<&str>,
+	filename: Option<&str>,
+) -> Attributes {
+	let disposition = utils::content_disposition::make_content_disposition(
+		content_disposition,
+		content_type,
+		filename,
+	);
+	Attributes::from_iter([
+		(
+			Attribute::ContentType,
+			content_type.unwrap_or("application/octet-stream").to_owned(),
+		),
+		(Attribute::ContentDisposition, disposition.to_string()),
+	])
 }

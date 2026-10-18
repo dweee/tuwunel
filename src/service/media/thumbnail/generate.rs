@@ -281,7 +281,8 @@ pub(super) async fn store_encoded(
 		Some(content_type),
 	)?;
 
-	self.create_media_file(&key, &content).await?;
+	self.create_media_file(&key, &content, Some(&content_disposition), Some(content_type))
+		.await?;
 
 	let media = Media {
 		content,

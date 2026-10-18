@@ -43,7 +43,8 @@ impl super::super::Service {
 				.create_file_metadata(mxc, None, dim, content_disposition, content_type)?;
 
 		// TODO: Remove dangling metadata when file creation fails.
-		self.create_media_file(&key, file).await?;
+		self.create_media_file(&key, file, content_disposition, content_type)
+			.await?;
 
 		Ok(())
 	}

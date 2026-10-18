@@ -33,8 +33,9 @@ use derive_more::Debug;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use http::Method;
 use object_store::{
-	Attributes, CopyMode, DynObjectStore, GetResult, MultipartUpload, ObjectMeta, ObjectStore,
-	ObjectStoreExt, PutPayload, PutResult, path::Path, signer::Signer,
+	Attributes, CopyMode, DynObjectStore, GetOptions, GetResult, MultipartUpload, ObjectMeta,
+	ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+	path::Path, signer::Signer,
 };
 use tuwunel_core::{
 	Error, Result,
@@ -146,7 +147,9 @@ where
 	PutPayload: From<T> + From<PutPayload>,
 {
 	if size.is_none_or(|size| size >= self.multipart_threshold()) {
-		return self.put_multi(path, input).await;
+		return self
+			.put_multi(path, input, Attributes::default())
+			.await;
 	}
 
 	debug!(
@@ -163,7 +166,8 @@ where
 		.map(Bytes::from)
 		.collect();
 
-	self.put_single(path, payload).await
+	self.put_single(path, payload, Attributes::default())
+		.await
 }
 
 /// Stores one contiguous object under `path`.
@@ -184,10 +188,33 @@ pub async fn put_one<T>(&self, path: &str, input: T) -> Result<PutResult>
 where
 	PutPayload: From<T> + From<PutPayload>,
 {
+	self.put_one_with_attributes(path, input, Attributes::default())
+		.await
+}
+
+/// Stores an object with the response headers a direct download must retain.
+#[implement(Provider)]
+pub async fn put_one_with_attributes<T>(
+	&self,
+	path: &str,
+	input: T,
+	attributes: Attributes,
+) -> Result<PutResult>
+where
+	PutPayload: From<T> + From<PutPayload>,
+{
+	// Filesystem providers do not support object attributes; Matrix retains
+	// their response metadata in its database as before.
+	let attributes = if matches!(&self.config, StorageProvider::local(_)) {
+		Attributes::default()
+	} else {
+		attributes
+	};
+
 	let payload: PutPayload = input.into();
 
 	if payload.content_length() < self.multipart_threshold() {
-		return self.put_single(path, payload).await;
+		return self.put_single(path, payload, attributes).await;
 	}
 
 	let part_size = self.multipart_part_size();
@@ -199,7 +226,7 @@ where
 		"Selecting multi-part upload..."
 	);
 
-	self.put_multi(path, chunked(payload, part_size).try_stream())
+	self.put_multi(path, chunked(payload, part_size).try_stream(), attributes)
 		.await
 }
 
@@ -217,7 +244,7 @@ where
 		?path,
 	)
 )]
-async fn put_multi<S, T>(&self, path: &str, input: S) -> Result<PutResult>
+async fn put_multi<S, T>(&self, path: &str, input: S, attributes: Attributes) -> Result<PutResult>
 where
 	S: Stream<Item = Result<T>> + Send,
 	PutPayload: From<T> + From<PutPayload>,
@@ -225,7 +252,7 @@ where
 	let path = self.to_abs_path(path)?;
 	let mut handle = self
 		.provider
-		.put_multipart(&path)
+		.put_multipart_opts(&path, PutMultipartOptions { attributes, ..Default::default() })
 		.map_err(Error::from)
 		.await?;
 
@@ -234,7 +261,7 @@ where
 		.inspect_err(|e| error!(?path, chain = %error_chain(e), "Failed to store object"))
 		.await
 	{
-		| Ok(()) =>
+		| Ok(()) => {
 			handle
 				.complete()
 				.map_err(Error::from)
@@ -245,9 +272,10 @@ where
 						"Failed to store object during completion",
 					);
 				})
-				.await,
+				.await
+		},
 
-		| Err(e) =>
+		| Err(e) => {
 			handle
 				.abort()
 				.map_ok(|()| Err(e))
@@ -259,7 +287,8 @@ where
 						"Additional errors during error handling",
 					);
 				})
-				.await?,
+				.await?
+		},
 	}
 }
 
@@ -277,11 +306,16 @@ where
 		?path,
 	)
 )]
-async fn put_single(&self, path: &str, input: PutPayload) -> Result<PutResult> {
+async fn put_single(
+	&self,
+	path: &str,
+	input: PutPayload,
+	attributes: Attributes,
+) -> Result<PutResult> {
 	let path = self.to_abs_path(path)?;
 
 	self.provider
-		.put(&path, input)
+		.put_opts(&path, input, PutOptions { attributes, ..Default::default() })
 		.map_err(Error::from)
 		.await
 }
@@ -419,6 +453,34 @@ pub async fn signed_get_url(&self, path: &str, ttl: Duration) -> Result<Option<U
 		.map_err(Error::from)
 		.map_ok(Some)
 		.await
+}
+
+/// Signs only an existing object whose headers match the Matrix response.
+/// HEAD avoids downloading the body and makes mixed local/S3 migrations safe.
+#[implement(Provider)]
+pub async fn signed_media_url(
+	&self,
+	path: &str,
+	ttl: Duration,
+	attributes: &Attributes,
+) -> Result<Option<Url>> {
+	if self.signer.is_none() {
+		return Ok(None);
+	}
+
+	let object = self
+		.provider
+		.get_opts(&self.to_abs_path(path)?, GetOptions::new().with_head(true))
+		.await?;
+
+	if !attributes
+		.iter()
+		.all(|(key, value)| object.attributes.get(key) == Some(value))
+	{
+		return Ok(None);
+	}
+
+	self.signed_get_url(path, ttl).await
 }
 
 /// Deletes one object from this provider.

@@ -14,6 +14,11 @@ use axum::{
 pub use client_ip::{ConfiguredIpSource, TrustedPeerSubnets};
 use const_str::{concat, join, replace};
 use http::{HeaderValue, header};
+use ruma::api::{
+	Metadata,
+	client::authenticated_media::{get_content, get_content_as_filename, get_content_thumbnail},
+	path_builder::PathBuilder,
+};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tuwunel_core::{Server, err};
 
@@ -404,10 +409,23 @@ fn register_client_media_and_device_routes(
 	media_deny_framing: bool,
 	media_deny_inline_styles: bool,
 ) -> Router<State> {
-	let media_content_router = Router::new()
-		.ruma_route(&client::get_content_thumbnail_route)
-		.ruma_route(&client::get_content_route)
-		.ruma_route(&client::get_content_as_filename_route);
+	// Retain Ruma's complete route history and authenticated request extractor,
+	// while permitting either a typed file response or a raw HTTP redirect.
+	let media_content_router = get_content_thumbnail::v1::Request::PATH_BUILDER
+		.all_paths()
+		.fold(Router::new(), |router, path| {
+			router.route(path, get(client::get_content_thumbnail_route))
+		});
+	let media_content_router = get_content::v1::Request::PATH_BUILDER
+		.all_paths()
+		.fold(media_content_router, |router, path| {
+			router.route(path, get(client::get_content_route))
+		});
+	let media_content_router = get_content_as_filename::v1::Request::PATH_BUILDER
+		.all_paths()
+		.fold(media_content_router, |router, path| {
+			router.route(path, get(client::get_content_as_filename_route))
+		});
 
 	let media_content_router =
 		media_content_headers(media_content_router, media_deny_framing, media_deny_inline_styles);
