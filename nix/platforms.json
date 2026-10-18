@@ -1,0 +1,10 @@
+{
+  "x86_64-linux": [
+    "tuwunel-deps",
+    "matrix-tuwunel"
+  ],
+  "aarch64-linux": [
+    "tuwunel-deps",
+    "matrix-tuwunel"
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "upstream": "matrix-construct/tuwunel",
+  "branch": "main",
+  "track": "release",
+  "author": {
+    "name": "dave",
+    "email": "git@d.monke.fail"
+  },
+  "required_paths": [
+    "nix/package.nix",
+    "tests/test_authenticated_media.py",
+    "src/api/client/media.rs",
+    "src/service/storage/provider.rs"
+  ],
+  "protected_paths": [
+    "ci/**",
+    "nix/platforms.json",
+    "upstream-flake.nix"
+  ],
+  "matrix": [
+    {
+      "system": "x86_64-linux",
+      "packages": [
+        "tuwunel-deps",
+        "matrix-tuwunel"
+      ],
+      "checks": [
+        "authenticated-media"
+      ],
+      "tests": []
+    },
+    {
+      "system": "aarch64-linux",
+      "packages": [
+        "tuwunel-deps",
+        "matrix-tuwunel"
+      ],
+      "checks": [
+        "authenticated-media"
+      ],
+      "tests": []
+    }
+  ]
+}

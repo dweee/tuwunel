@@ -1,0 +1,140 @@
+name: Tuwunel Linux
+"on":
+  push:
+    branches: [flakey]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package attribute, or all for the complete native matrix
+        required: true
+        default: all
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: tuwunel-linux-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  plan:
+    if: ${{ vars.DAVE_FORK_CI_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check Attic publication handling without credentials
+        run: |
+          python3 ci/test-push-attic.py
+          python3 ci/test-transfer-attic.py
+      - id: matrix
+        env:
+          SELECTED_PACKAGE: ${{ inputs.package || 'all' }}
+        run: |
+          matrix=$(python3 ci/matrix.py others --package "$SELECTED_PACKAGE")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+  build:
+    needs: plan
+    name: ${{ matrix.package }} (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_version: "2.34.7"
+          enable_kvm: false
+          nix_conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            substituters = https://cache.nixos.org/
+            extra-substituters = ${{ vars.ATTIC_SUBSTITUTER }}
+            extra-trusted-public-keys = ${{ vars.ATTIC_PUBLIC_KEY }}
+            max-jobs = 1
+            cores = 2
+      - name: Evaluate and build the selected native package
+        env:
+          TARGET_SYSTEM: ${{ matrix.system }}
+          TARGET_PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "$TARGET_SYSTEM"
+          target=".#packages.$TARGET_SYSTEM.$TARGET_PACKAGE"
+          SECONDS=0
+          nix build "$target" --no-update-lock-file --no-write-lock-file --no-link --print-out-paths -L > outputs.txt
+          {
+            echo "Built $TARGET_PACKAGE for $TARGET_SYSTEM"
+            echo "Package build: ${SECONDS}s"
+            cat outputs.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save selected runtime closures independently of cache publication
+        timeout-minutes: 15
+        env:
+          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+        run: python3 ci/transfer-attic.py export --directory attic-transfer
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
+          path: attic-transfer/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false
+  publish:
+    needs: [plan, build]
+    if: ${{ vars.ATTIC_PUSH_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    name: Publish ${{ matrix.package }} (${{ matrix.system }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_version: "2.34.7"
+          enable_kvm: false
+          nix_conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+            substituters = https://cache.nixos.org/
+            extra-substituters =
+      - name: Install the trusted pinned Attic client before importing build data
+        id: attic
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          client=$(nix build --inputs-from . 'nixpkgs#attic-client' --no-update-lock-file --no-write-lock-file --no-link --print-out-paths --max-jobs 0 --builders "")
+          test -x "$client/bin/attic"
+          echo "binary=$client/bin/attic" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
+          path: attic-transfer
+      - name: Import data without running any package programs
+        timeout-minutes: 15
+        env:
+          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+        run: python3 ci/transfer-attic.py import --directory attic-transfer
+      - name: Publish imported package outputs to Attic
+        timeout-minutes: 30
+        env:
+          ATTIC_BIN: ${{ steps.attic.outputs.binary }}
+          ATTIC_ENDPOINT: ${{ vars.ATTIC_ENDPOINT }}
+          ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: python3 ci/push-attic.py --outputs attic-transfer/outputs.txt

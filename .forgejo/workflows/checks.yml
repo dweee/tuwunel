@@ -1,0 +1,31 @@
+name: Portable fork checks
+on:
+  push:
+    branches: [flakey]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: nix
+    timeout-minutes: 15
+    container:
+      image: nixos/nix@sha256:7a007c766426c1877758ddc5cb87a965ac131fc78c582ce0083d922d51ae945c
+    steps:
+      - name: Checkout exact source
+        env:
+          TOKEN: ${{ github.token }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
+          git init -q .
+          git remote add origin "$SERVER/$REPO.git"
+          git -c http.extraHeader="Authorization: Basic $auth" fetch -q --depth=1 origin "$SHA"
+          git checkout -q --detach FETCH_HEAD
+      - name: Check portable publisher fixtures
+        run: |
+          nix shell --extra-experimental-features 'nix-command flakes' --option accept-flake-config false --inputs-from . nixpkgs#python3 -c bash -c 'python3 ci/test-push-attic.py && python3 ci/test-transfer-attic.py && python3 -m py_compile tests/test_authenticated_media.py'

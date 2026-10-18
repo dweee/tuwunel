@@ -1,0 +1,24 @@
+name: Sync and test upstream
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [upstream-updated]
+permissions: {}
+jobs:
+  upstream:
+    permissions:
+      contents: write
+    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@f506348a154600abbbc53025c39b14020b014e7d
+    with:
+      tool-repository: dweee/dave-fork-ci
+      tool-revision: f506348a154600abbbc53025c39b14020b014e7d
+      auto-merge: ${{ vars.FORK_CI_AUTO_MERGE == 'true' && vars.ATTIC_PUSH_ENABLED == 'true' }}
+      cache: ${{ vars.ATTIC_PUSH_ENABLED == 'true' }}
+      attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+      attic-cache: ${{ vars.ATTIC_CACHE }}
+      attic-substituter: ${{ vars.ATTIC_SUBSTITUTER }}
+      attic-public-key: ${{ vars.ATTIC_PUBLIC_KEY }}
+    secrets:
+      ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
