@@ -51,6 +51,7 @@
       let
         pkgsHost = import inputs.nixpkgs {
           inherit system;
+          config.allowUnfree = false;
         };
         pkgsHostStatic = pkgsHost.pkgsStatic;
 
@@ -156,6 +157,7 @@
             pkgsCrossStatic =
               (import inputs.nixpkgs {
                 inherit system;
+                config.allowUnfree = false;
                 crossSystem = {
                   config = crossSystem;
                 };
