@@ -21,7 +21,7 @@ To use the existing nixpkgs service, import `inputs.tuwunel.nixosModules.default
 
 ## CI and cache
 
-GitHub Actions builds the dependency and validated server packages natively on Linux x86 and ARM runners. Builds receive public read settings only. Separate disposable publisher jobs receive a token restricted to this repository's Attic cache. Checksummed closure archives are retained independently as release backups. Pull requests never receive the upload credential.
+GitHub Actions builds dependency packages first, publishes them from isolated jobs, and then builds validated server packages natively on Linux x86 and ARM runners. Successful dependency publication survives a later server build failure. Builds receive public read settings only. Separate disposable publisher jobs receive a token restricted to this repository's Attic cache. Checksummed closure archives are retained independently as release backups. Pull requests never receive the upload credential.
 
 Configure the repository variables and scoped secret described in [ci/ATTIC.md](ci/ATTIC.md). The scheduled upstream controller is pinned to a reviewed commit; upstream release candidates must build, test and cache before any promotion is enabled. Protected-path conflicts require review. Forgejo keeps the canonical copy and performs lightweight validation without publishing fleet configuration.
 
