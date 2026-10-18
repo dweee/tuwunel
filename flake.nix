@@ -45,7 +45,10 @@
         ];
       };
       packageFor = system: import ./nix/package.nix {
-        pkgs = import inputs.nixpkgs { inherit system; };
+        pkgs = import inputs.nixpkgs {
+          inherit system;
+          config.allowUnfree = false;
+        };
         unwrapped = unwrappedFor system;
       };
     in original // {
