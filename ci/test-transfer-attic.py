@@ -64,18 +64,24 @@ class TransferSafetyTests(unittest.TestCase):
             with self.assertRaises(ValueError): module.transfer('export', Path(temporary), 1024)
 
     def test_workflow_token_is_confined_to_the_isolated_publisher(self):
+        import re
         for path in Path(__file__).resolve().parents[1].joinpath('.github/workflows').glob('*actions.yml'):
             with self.subTest(workflow=path.name):
-                build, separator, publisher = path.read_text().partition('\n  publish:\n')
-                self.assertTrue(separator)
-                self.assertNotIn('secrets.ATTIC_TOKEN', build)
-                self.assertEqual(publisher.count('secrets.ATTIC_TOKEN'),1)
-                self.assertIn('needs: [plan, build]', publisher)
-                self.assertIn('--max-jobs 0 --builders', publisher)
-                self.assertIn('github.event.repository.default_branch', publisher)
-                self.assertLess(publisher.index('Install the trusted pinned Attic client'), publisher.index('ci/transfer-attic.py import'))
-                self.assertLess(publisher.index('ci/transfer-attic.py import'), publisher.index('secrets.ATTIC_TOKEN'))
-                self.assertNotIn('Evaluate and build the selected native package', publisher)
+                sections = re.split(r'(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):\n', path.read_text().split('\njobs:\n', 1)[1])[1:]
+                jobs = dict(zip(sections[::2], sections[1::2]))
+                self.assertEqual(set(jobs), {'plan', 'dependencies', 'publish-dependencies', 'build', 'publish'})
+                for name, job in jobs.items():
+                    if name not in {'publish', 'publish-dependencies'}:
+                        self.assertNotIn('secrets.ATTIC_TOKEN', job)
+                        continue
+                    self.assertEqual(job.count('secrets.ATTIC_TOKEN'), 1)
+                    dependency = 'dependencies' if name == 'publish-dependencies' else 'build'
+                    self.assertRegex(job, r'needs:\n    - plan\n    - ' + dependency + r'\n')
+                    self.assertIn('--max-jobs 0 --builders', job)
+                    self.assertIn('github.event.repository.default_branch', job)
+                    self.assertLess(job.index('Install the trusted pinned Attic client'), job.index('ci/transfer-attic.py import'))
+                    self.assertLess(job.index('ci/transfer-attic.py import'), job.index('secrets.ATTIC_TOKEN'))
+                    self.assertNotIn('Evaluate and build the selected native package', job)
 
 
 if __name__ == '__main__': unittest.main()
