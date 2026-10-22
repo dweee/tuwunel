@@ -108,7 +108,7 @@ in the [Out of scope](#out-of-scope) section.
 | MSC3958 | ✅ ● | 100/100 | Suppress notifications from message edits | SuppressEdits push rule provided via Ruma server_default ruleset |
 | MSC3952 | ✅ ◐ | 80/90 | Intentional Mentions | Intentional mentions push rules ride on Ruma server_default; flag advertised. |
 | MSC3943 | ✅ ● | 100/100 | Partial joins to nameless rooms should include heroes' memberships. | send_join partial-state response includes hero memberships and their auth chains |
-| MSC3939 | ✅ ● | 90/90 | Account locking | Login gate landed; /refresh and OIDC token paths still mint for locked accounts |
+| MSC3939 | ✅ ● | 90/90 | Account locking | Login and refresh gates implemented; OIDC account-state gates remain pending |
 | MSC3938 | ✅ ● | 100/100 | Remove deprecated `keyId` parameters from `/keys` endpoints | only the keyless /key/v2/server is routed; no notary /query left to change |
 | MSC3930 | ✅ ● | 100/100 | Polls push rules/notifications | Default poll push rules via ruma server_default; seeded at registration |
 | MSC3925 | 🟨 ● | 70/70 | m.replace aggregation with full event | Full m.replace fold; off by default (bundle_edit_relations); backfill unindexed |
@@ -776,7 +776,7 @@ in the [Out of scope](#out-of-scope) section.
 | MSC3572 | ❌ ◐ | 0/0 | Relation aggregation cleanup | no relations rename; m.relations only |
 | MSC3523 | ❌ ● | 0/0 | Timeboxed/ranged relations endpoint | no from_target/to_target query params on /relations |
 | MSC3429 | ❌ ● | 0/0 | Individual room preview API | no /rooms/{id}/preview endpoint |
-| MSC3391 | ✅ ● | 100/100 | API to delete account data | src/api/client/account_data.rs:126; both DELETE routes via Ruma&lt;R&gt;; tombstone... |
+| MSC3391 | ✅ ● | 100/100 | API to delete account data | Both DELETE routes reject protected keys before mutation |
 | MSC3306 | ❌ ● | 0/0 | How to count unread messages | notification_count uses push-rule Notify actions, not MSC3306 algo |
 | MSC3302 | ✅ ● | 100/100 | Stories via To-Device-Messaging | m.stories.blocklist and m.stories.ignore ride the generic account-data path |
 | MSC3244 | ❌ ● | 0/10 | Room version capabilities | capabilities lacks room_capabilities knock/restricted info |

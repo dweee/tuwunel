@@ -111,10 +111,11 @@ fn set_table_options(opts: &mut Options, desc: &Descriptor, cache: Option<&Cache
 		prepopulate,
 	);
 
+	// The options string amends the installed table factory, so install it first.
+	opts.set_block_based_table_factory(&table);
+
 	opts.set_options_from_string(&string)
 		.map_err(map_err)?;
-
-	opts.set_block_based_table_factory(&table);
 
 	Ok(())
 }
@@ -249,7 +250,8 @@ fn get_cache(ctx: &Context, desc: &Descriptor) -> Option<Cache> {
 		.expected_add(desc.val_size_hint.unwrap_or_default());
 
 	let size = match cap {
-		| Some(cap) => cache_size(config, cap, ent_size),
+		// Whole MiB, so reported capacities stay round and divide evenly across the shards.
+		| Some(cap) => cache_size(config, cap, ent_size).next_multiple_of(1 << 20),
 		| _ => desc.cache_size,
 	};
 

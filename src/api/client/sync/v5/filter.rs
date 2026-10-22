@@ -1,4 +1,4 @@
-use futures::{StreamExt, pin_mut};
+use futures::StreamExt;
 use ruma::{
 	RoomId,
 	api::client::sync::sync_events::v5::request::ListFilters,
@@ -9,7 +9,7 @@ use tuwunel_core::{
 	is_equal_to, is_true,
 	utils::{
 		BoolExt, FutureBoolExt, IterStream, ReadyExt,
-		future::{self, OptionFutureExt, ReadyBoolExt},
+		future::{self, OptionFutureExt, ReadyBoolExt, ReadyEqExt},
 		option::OptionExt,
 	},
 };
@@ -24,19 +24,20 @@ pub(super) async fn filter_room(
 	membership: Option<&MembershipState>,
 ) -> bool {
 	#[expect(clippy::match_same_arms)] // helps readability
-	let match_invite = filter
-		.is_invite
-		.map_async(async |is_invite| match (membership, is_invite) {
-			| (Some(MembershipState::Invite), true) => true,
-			| (Some(MembershipState::Invite), false) => false,
-			| (Some(_), true) => false,
-			| (Some(_), false) => true,
-			| _ =>
-				services
-					.state_cache
-					.is_invited(sender_user, room_id)
-					.await == is_invite,
-		});
+	let invite_matches = async |is_invite| match (membership, is_invite) {
+		| (Some(MembershipState::Invite), true) => true,
+		| (Some(MembershipState::Invite), false) => false,
+		| (Some(_), true) => false,
+		| (Some(_), false) => true,
+		| _ =>
+			services
+				.state_cache
+				.is_invited(sender_user, room_id)
+				.eq(&is_invite)
+				.await,
+	};
+
+	let match_invite = filter.is_invite.map_async(invite_matches);
 
 	let match_direct = filter
 		.is_dm
@@ -48,7 +49,8 @@ pub(super) async fn filter_room(
 			services
 				.state_accessor
 				.is_encrypted_room(room_id)
-				.await == is_encrypted
+				.eq(&is_encrypted)
+				.await
 		});
 
 	let match_space_child = filter
@@ -130,13 +132,9 @@ pub(super) async fn filter_room_meta(
 		.once_joined(sender_user, room_id)
 		.is_false();
 
-	pin_mut!(not_visible, not_invited, not_once_joined, not_exists, is_disabled, is_banned);
 	not_visible
-		.and(not_invited)
-		.and(not_once_joined)
-		.or(not_exists)
-		.or(is_disabled)
-		.or(is_banned)
+		.and2(not_invited, not_once_joined)
+		.or3(not_exists, is_disabled, is_banned)
 		.is_false()
 		.await
 }

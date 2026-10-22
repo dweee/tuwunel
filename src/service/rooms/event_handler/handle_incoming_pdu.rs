@@ -1,9 +1,6 @@
-use std::collections::HashMap;
-
-use futures::{FutureExt, TryStreamExt, future::try_join5};
+use futures::{FutureExt, TryFutureExt, TryStreamExt, future::try_join5};
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId,
-	RoomId, RoomVersionId, ServerName, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId, RoomId, ServerName, UserId,
 	events::{
 		AnyStrippedStateEvent, StateEventType,
 		room::member::{MembershipState, RoomMemberEventContent},
@@ -18,16 +15,21 @@ use tuwunel_core::{
 	trace,
 	utils::{
 		BoolExt,
-		stream::{IterStream, TryWidebandExt},
+		future::ReadyEqExt,
+		stream::{IterStream, TryBroadbandExt, TryReadyExt},
 	},
 	warn,
 };
 
-use super::backoff::{Context, Disposition};
+use super::{
+	backoff::{Context, Disposition, Suppression, UPGRADE_RETRY},
+	fetch_prev::{Pdus, PrevFetch},
+	handle_prev_pdu::PrevUpgrade,
+	prev_walk::PrevWalk,
+	room_version_of,
+};
 use crate::rooms::{state_cache::MembershipUpdate, timeline::RawPduId};
 
-type PrevResultsHandled = SmallVec<[PrevHandled; MAX_PREV_EVENTS]>;
-type PrevHandled = (OwnedEventId, Handled);
 type PrevSplit = SmallVec<[OwnedEventId; MAX_PREV_EVENTS]>;
 
 type Handled = Option<(RawPduId, bool)>;
@@ -156,66 +158,99 @@ pub async fn handle_incoming_pdu<'a>(
 			kind = ?incoming_pdu.event_type(),
 			"Not a timeline event.",
 		);
+
 		return Ok(None);
 	}
 
 	// Skip old events
-	let first_ts_in_room = self
+	let first_normal_ts = self
 		.services
 		.timeline
-		.first_pdu_in_room(room_id)
+		.first_normal_pdu_in_room(room_id)
 		.await?
 		.origin_server_ts();
 
-	if incoming_pdu.origin_server_ts() < first_ts_in_room {
+	if incoming_pdu.origin_server_ts() < first_normal_ts {
 		debug!(
 			origin_server_ts = ?incoming_pdu.origin_server_ts(),
-			?first_ts_in_room,
+			?first_normal_ts,
 			"Skipping old event."
 		);
 		return Ok(None);
 	}
 
-	// 9. Fetch any missing prev events doing all checks listed here starting at 1.
-	//    These are timeline events
-	let (sorted_prev_events, eventid_info) = self
-		.fetch_prev(
-			origin,
-			room_id,
-			event_id,
-			incoming_pdu.prev_events(),
-			&room_version,
-			recursion_level,
-			first_ts_in_room,
-		)
-		.await?;
+	let gapped = self
+		.services
+		.timeline
+		.non_outlier_pdus_exist(incoming_pdu.prev_events())
+		.await
+		.is_false();
 
-	self.handle_prev_events(
+	self.prev_walk.enter(gapped);
+
+	let create_event_id = create_event.event_id();
+	let upgrade = PrevUpgrade {
 		origin,
 		room_id,
 		event_id,
-		sorted_prev_events,
-		eventid_info,
-		&room_version,
+		room_version: &room_version,
 		recursion_level,
-		first_ts_in_room,
-		create_event.event_id(),
-	)
-	.boxed() // size firewall
-	.await?;
+		first_normal_ts,
+		create_event_id,
+	};
 
-	// Done with prev events, now handling the incoming event
-	self.upgrade_outlier_to_timeline_pdu(
-		origin,
-		room_id,
-		incoming_pdu,
-		pdu,
-		&room_version,
-		recursion_level,
-		create_event.event_id(),
-	)
-	.boxed() // size firewall
-	.await
+	// Start before the first await so a dropped future still settles the gapped count.
+	let pass = gapped.then(|| PrevWalk::start(self, &upgrade));
+
+	let standing = gapped
+		.then_async(|| self.is_suppressed(Context::Incoming, event_id, UPGRADE_RETRY))
+		.await
+		.unwrap_or(Suppression::Absent);
+
+	if standing.is_deny() {
+		if let Some(pass) = pass {
+			pass.hold();
+		}
+
+		debug_warn!(%origin, %room_id, %event_id, "Backing off from a gapped incoming event.");
+		return Ok(None);
+	}
+
+	// 9. Fetch any missing prev events doing all checks listed here starting at 1.
+	//    These are timeline events
+	let fetch = self
+		.fetch_prev(upgrade, incoming_pdu.prev_events())
+		.await;
+
+	let stopping = self.services.server.is_stopping();
+	let walk = pass.and_then(|pass| pass.fetched(fetch.as_ref(), stopping));
+	let fetch = fetch?;
+
+	let walking = fetch.sorted.is_empty().is_false();
+	let attempt = walking.then(|| self.record_attempt(Context::Incoming, event_id));
+	let PrevFetch { sorted, pdus, .. } = fetch;
+
+	let (handled, upgraded) = self
+		.handle_prev_events(upgrade, sorted, pdus)
+		.boxed() // size firewall
+		.and_then(|upgraded| {
+			self.upgrade_outlier_to_timeline_pdu(upgrade, incoming_pdu, pdu)
+				.boxed() // size firewall
+				.map(move |handled| Ok((handled, upgraded)))
+		})
+		.unwrap_or_else(|error| (Err(error), 0))
+		.await;
+
+	let appended = handled.as_ref().map(Option::is_some);
+
+	if let Some(walk) = walk {
+		walk.settle(appended, upgraded, self.services.server.is_stopping());
+	}
+
+	self.record_completion(Context::Incoming, event_id, standing, attempt, appended)
+		.await;
+
+	handled
 }
 
 /// Apply a federated leave that rescinds an out-of-band invite for a local
@@ -279,7 +314,8 @@ async fn handle_rescinded_invite(
 		.services
 		.state_cache
 		.user_membership(&target, room_id)
-		.await != Some(MembershipState::Invite)
+		.ne(&Some(MembershipState::Invite))
+		.await
 	{
 		return Ok(false);
 	}
@@ -304,7 +340,7 @@ async fn handle_rescinded_invite(
 		return Ok(false);
 	}
 
-	let Some(room_version_id) = super::room_version_of(&invite_state) else {
+	let Some(room_version_id) = room_version_of(&invite_state) else {
 		return Ok(false);
 	};
 
@@ -339,20 +375,16 @@ async fn handle_rescinded_invite(
 
 /// Upgrade an incoming PDU's previous events, walking interior events after
 /// their parents so each derives state locally instead of refetching it.
+///
+/// Extremities upgrade concurrently up to `prev_events_concurrency`; interior
+/// events upgrade one at a time. Returns how many previous events were upgraded.
 #[implement(super::Service)]
-#[expect(clippy::too_many_arguments)]
 async fn handle_prev_events(
 	&self,
-	origin: &ServerName,
-	room_id: &RoomId,
-	event_id: &EventId,
+	upgrade: PrevUpgrade<'_>,
 	sorted_prev_events: Vec<OwnedEventId>,
-	mut eventid_info: HashMap<OwnedEventId, (PduEvent, CanonicalJsonObject)>,
-	room_version: &RoomVersionId,
-	recursion_level: usize,
-	first_ts_in_room: MilliSecondsSinceUnixEpoch,
-	create_event_id: &EventId,
-) -> Result<()> {
+	mut pdus: Pdus, // HashMap::remove takes &mut self
+) -> Result<usize> {
 	trace!(
 		events = sorted_prev_events.len(),
 		event_ids = ?sorted_prev_events,
@@ -362,9 +394,9 @@ async fn handle_prev_events(
 	let (interior, extremities): (PrevSplit, PrevSplit) = sorted_prev_events
 		.into_iter()
 		.partition(|prev_id| {
-			eventid_info.get(prev_id).is_some_and(|(pdu, _)| {
+			pdus.get(prev_id).is_some_and(|(pdu, _)| {
 				pdu.prev_events()
-					.any(|prev| eventid_info.contains_key(prev))
+					.any(|prev| pdus.contains_key(prev))
 			})
 		});
 
@@ -375,25 +407,15 @@ async fn handle_prev_events(
 			.prev_events_concurrency,
 	);
 
-	extremities
+	let upgraded = extremities
 		.into_iter()
 		.try_stream()
-		.map_ok(|prev_id| (eventid_info.remove(&prev_id), prev_id))
-		.widen_and_then(concurrency, async |(info, prev_id)| {
-			self.upgrade_prev_event(
-				origin,
-				room_id,
-				event_id,
-				info,
-				room_version,
-				recursion_level,
-				first_ts_in_room,
-				prev_id,
-				create_event_id,
-			)
-			.await
+		.map_ok(|prev_id| (pdus.remove(&prev_id), prev_id))
+		.broadn_and_then(concurrency, async |(info, prev_id)| {
+			self.upgrade_prev_event(upgrade, info, &prev_id)
+				.await
 		})
-		.try_collect::<PrevResultsHandled>()
+		.ready_try_fold(0, tally_upgraded)
 		.boxed() // size firewall
 		.await?;
 
@@ -401,74 +423,61 @@ async fn handle_prev_events(
 	interior
 		.into_iter()
 		.try_stream()
-		.map_ok(|prev_id| (eventid_info.remove(&prev_id), prev_id))
-		.try_for_each(async |(info, prev_id)| {
-			self.upgrade_prev_event(
-				origin,
-				room_id,
-				event_id,
-				info,
-				room_version,
-				recursion_level,
-				first_ts_in_room,
-				prev_id,
-				create_event_id,
-			)
-			.await?;
-
-			Ok(())
+		.map_ok(|prev_id| (pdus.remove(&prev_id), prev_id))
+		.and_then(async |(info, prev_id)| {
+			self.upgrade_prev_event(upgrade, info, &prev_id)
+				.await
 		})
+		.ready_try_fold(upgraded, tally_upgraded)
 		.boxed() // size firewall
 		.await
 }
 
-/// Upgrade one previous event, folding a transient failure into a no-op so a
-/// single bad prev does not abort the batch; a shutdown still propagates.
+/// Upgrade one previous event, folding a failure into a non-fatal skip so a
+/// single bad prev does not abort the batch.
+///
+/// A failure records a transient backoff for the prev. A shutdown propagates
+/// through the leading running check; an interruption surfacing from inside
+/// the upgrade is not a verdict on the prev and records nothing.
 #[implement(super::Service)]
-#[expect(clippy::too_many_arguments)]
 async fn upgrade_prev_event(
 	&self,
-	origin: &ServerName,
-	room_id: &RoomId,
-	event_id: &EventId,
+	upgrade: PrevUpgrade<'_>,
 	info: Option<(PduEvent, CanonicalJsonObject)>,
-	room_version: &RoomVersionId,
-	recursion_level: usize,
-	first_ts_in_room: MilliSecondsSinceUnixEpoch,
-	prev_id: OwnedEventId,
-	create_event_id: &EventId,
-) -> Result<PrevHandled> {
+	prev_id: &EventId,
+) -> Result<Handled> {
 	self.services.server.check_running()?;
-	match self
-		.handle_prev_pdu(
-			origin,
-			room_id,
-			event_id,
-			info,
-			room_version,
-			recursion_level,
-			first_ts_in_room,
-			&prev_id,
-			create_event_id,
-		)
-		.await
-	{
-		| Ok(handled) => {
-			if handled.is_some() {
-				self.record_success(Context::Upgrade, &prev_id)
-					.await;
-				debug!(?prev_id, ?handled, "Prev event processed.");
-			} else {
-				debug_warn!(?prev_id, "Prev event not processed.");
-			}
 
-			Ok((prev_id, handled))
+	let PrevUpgrade { room_id, event_id, .. } = upgrade;
+
+	match self.handle_prev_pdu(upgrade, info, prev_id).await {
+		| Err(error) if error.is_interrupted() || self.services.server.is_stopping() => {
+			debug!(?prev_id, ?event_id, ?room_id, %error, "Prev event processing interrupted.");
+
+			Ok(None)
 		},
-		| Err(e) => {
-			self.record_outcome(Context::Upgrade, &prev_id, Disposition::Transient);
-			warn!(?prev_id, ?event_id, ?room_id, "Prev event processing failed: {e}");
+		| Err(error) => {
+			self.record_outcome(Context::Upgrade, prev_id, Disposition::Transient);
+			warn!(?prev_id, ?event_id, ?room_id, %error, "Prev event processing failed.");
 
-			Ok((prev_id, None))
+			Ok(None)
+		},
+		| Ok(None) => {
+			debug_warn!(?prev_id, "Prev event not processed.");
+
+			Ok(None)
+		},
+		| Ok(handled) => {
+			self.record_success(Context::Upgrade, prev_id)
+				.await;
+
+			debug!(?prev_id, ?handled, "Prev event processed.");
+
+			Ok(handled)
 		},
 	}
+}
+
+fn tally_upgraded(upgraded: usize, handled: Handled) -> Result<usize> {
+	Ok(upgraded.saturating_add(usize::from(handled.is_some())))
 }

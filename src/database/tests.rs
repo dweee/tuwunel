@@ -2,12 +2,18 @@
 #![expect(clippy::needless_borrows_for_generic_args)]
 
 mod cbor;
+mod txn;
 
 use std::{
-	env::temp_dir, fmt::Debug, fs::remove_dir_all, path::PathBuf, process::id as process_id,
+	env::temp_dir,
+	fmt::Debug,
+	fs::remove_dir_all,
+	path::{Path, PathBuf},
+	process::id as process_id,
 	sync::Arc,
 };
 
+use futures::{StreamExt, TryStreamExt};
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
@@ -22,14 +28,31 @@ use tuwunel_core::{
 };
 
 use crate::{
-	Cbor, Database, Ignore, Interfix, Map, Txn,
+	Cbor, Database, Ignore, Interfix, Map, MapId, Txn,
 	de::from_slice,
 	keyval::{serialize_key, serialize_val},
-	maps::descriptor,
+	map,
+	maps::{MAPS, descriptor},
 	ser,
 	ser::{Json, serialize_to_vec},
 	txn::next_record,
 };
+
+#[tokio::test]
+async fn catalog_handles_match_names() -> Result {
+	let db = open_database("catalog-handles").await?;
+
+	for (position, desc) in MAPS.iter().enumerate() {
+		let Ok(map) = db.get(desc.name) else { continue };
+		let id = MapId::named(desc.name);
+
+		assert_eq!(id.0, position);
+		assert!(Arc::ptr_eq(&db[id], map));
+	}
+
+	assert!(Arc::ptr_eq(&db[map!("pduid_pdu")], db.get("pduid_pdu")?));
+	Ok(())
+}
 
 #[test]
 #[cfg_attr(
@@ -1039,6 +1062,71 @@ fn serde_tuple_option_none_none_none() {
 }
 
 #[test]
+fn serde_u32_i32() -> Result {
+	for (value, expected) in [(0_u32, [0; 4]), (1, [0, 0, 0, 1]), (u32::MAX, [0xFF; 4])] {
+		let bytes = serialize_to_vec(&value)?;
+		let decoded: u32 = from_slice(&bytes)?;
+
+		assert_eq!(bytes, expected);
+		assert_eq!(decoded, value);
+	}
+
+	for (value, expected) in [
+		(i32::MIN, [0x80, 0, 0, 0]),
+		(-1, [0xFF; 4]),
+		(0, [0; 4]),
+		(i32::MAX, [0x7F, 0xFF, 0xFF, 0xFF]),
+	] {
+		let bytes = serialize_to_vec(&value)?;
+		let decoded: i32 = from_slice(&bytes)?;
+
+		assert_eq!(bytes, expected);
+		assert_eq!(decoded, value);
+	}
+
+	Ok(())
+}
+
+#[test]
+fn serde_tuple_u32() -> Result {
+	let value = (u32::MAX, "text");
+	let bytes = serialize_to_vec(&value)?;
+	let decoded: (u32, &str) = from_slice(&bytes)?;
+
+	assert_eq!(bytes, b"\xFF\xFF\xFF\xFF\xFFtext");
+	assert_eq!(decoded, value);
+
+	let value = ("text", u32::MAX);
+	let bytes = serialize_to_vec(&value)?;
+	let decoded: (&str, u32) = from_slice(&bytes)?;
+
+	assert_eq!(bytes, b"text\xFF\xFF\xFF\xFF\xFF");
+	assert_eq!(decoded, value);
+
+	let value = (1_u64, u32::MAX);
+	let bytes = serialize_to_vec(&value)?;
+	let decoded: (u64, u32) = from_slice(&bytes)?;
+
+	assert_eq!(bytes, b"\x00\x00\x00\x00\x00\x00\x00\x01\xFF\xFF\xFF\xFF\xFF");
+	assert_eq!(decoded, value);
+	Ok(())
+}
+
+#[test]
+fn de_u32_i32_underflow() {
+	let unsigned = from_slice::<u32>(&[0; 3])
+		.unwrap_err()
+		.to_string();
+
+	let signed = from_slice::<i32>(&[0; 3])
+		.unwrap_err()
+		.to_string();
+
+	assert!(unsigned.contains("u32 buffer underflow"));
+	assert!(signed.contains("i32 buffer underflow"));
+}
+
+#[test]
 fn serde_tuple_integer_string() {
 	let integer: u64 = 123_456;
 	let user_id: &UserId = "@user:example.com".try_into().unwrap();
@@ -1151,14 +1239,7 @@ fn txn_record_truncated() {
 
 #[tokio::test]
 async fn txn_insert_raw_preserves_bytes() -> Result {
-	let path = database_path("txn");
-	let raw_config = Figment::new()
-		.merge(("server_name", "localhost"))
-		.merge(("database_path", &path))
-		.merge(("test", ["fresh", "cleanup"]));
-
-	let server = new_server(&raw_config)?;
-	let database = Database::open(&server).await?;
+	let database = open_database("txn").await?;
 
 	let first = database.get("alias_roomid")?;
 	let second = database.get("alias_userid")?;
@@ -1258,15 +1339,110 @@ async fn txn_insert_raw_preserves_bytes() -> Result {
 	);
 
 	drop(database);
-	drop(server);
 
 	Ok(())
+}
+
+#[tokio::test]
+async fn raw_stream_range_bounds() -> Result {
+	let database = open_database("raw-stream-range").await?;
+	let map = database.get("presenceid_presence")?;
+	let rows = [
+		(0_u64, "zero"),
+		(1, "one"),
+		(2, "two-a"),
+		(2, "two-b"),
+		(3, "three"),
+		(u64::MAX, "last"),
+	];
+
+	for row in rows {
+		let key = serialize_key(row)?;
+
+		map.insert(&key, b"value");
+	}
+
+	for count in 4_u64..10 {
+		let key = serialize_key((count, "deleted"))?;
+
+		map.insert(&key, b"value");
+	}
+
+	database.engine.sort()?;
+
+	for count in 4_u64..10 {
+		let key = serialize_key((count, "deleted"))?;
+
+		map.remove(&key);
+	}
+
+	for _ in 0..2 {
+		let stream = {
+			let upper = 3_u64.to_be_bytes();
+
+			map.raw_stream_range(&1_u64.to_be_bytes(), Some(&upper))
+		};
+
+		let keys: Vec<_> = stream
+			.map_ok(|(key, _)| key.to_owned())
+			.try_collect()
+			.await?;
+
+		let expected: Vec<_> = rows[1..4]
+			.iter()
+			.copied()
+			.map(|row| serialize_key(row).map(|key| key.as_ref().to_owned()))
+			.collect::<Result<Vec<_>>>()?;
+
+		assert_eq!(keys, expected);
+
+		assert_eq!(
+			map.raw_stream_range(&3_u64.to_be_bytes(), Some(&3_u64.to_be_bytes()))
+				.take(1)
+				.count()
+				.await,
+			0
+		);
+
+		assert_eq!(
+			map.raw_stream_range(&4_u64.to_be_bytes(), Some(&10_u64.to_be_bytes()))
+				.take(1)
+				.count()
+				.await,
+			0
+		);
+
+		let last: Vec<_> = map
+			.raw_stream_range(&u64::MAX.to_be_bytes(), None)
+			.map_ok(|(key, _)| key.to_owned())
+			.try_collect()
+			.await?;
+
+		assert_eq!(last, [serialize_key(rows[5])?.as_ref().to_owned()]);
+		database.engine.sort()?;
+	}
+
+	Ok(())
+}
+
+async fn open_database(name: &str) -> Result<Arc<Database>> {
+	let path = database_path(name);
+	let server = new_server(&base_config(&path))?;
+
+	Database::open(&server).await
 }
 
 fn database_path(name: &str) -> PathBuf {
 	temp_dir()
 		.join("tuwunel")
 		.join(format!("database-{name}-{}", process_id()))
+}
+
+fn base_config(path: &Path) -> Figment {
+	Figment::new()
+		.merge(("server_name", "localhost"))
+		.merge(("database_path", path))
+		.merge(("test", ["fresh", "cleanup"]))
 }
 
 fn new_server(raw_config: &Figment) -> Result<Arc<Server>> {
@@ -1288,12 +1464,9 @@ fn new_server(raw_config: &Figment) -> Result<Arc<Server>> {
 async fn a_restore_is_not_repeated_on_reopen() -> Result {
 	let path = database_path("restore");
 	let backups = path.with_extension("backups");
-	let raw_config = Figment::new()
-		.merge(("server_name", "localhost"))
-		.merge(("database_path", &path))
+	let raw_config = base_config(&path)
 		.merge(("database_backup_path", &backups))
-		.merge(("database_restore_backup", 1))
-		.merge(("test", ["fresh", "cleanup"]));
+		.merge(("database_restore_backup", 1));
 
 	let server = new_server(&raw_config)?;
 
@@ -1315,14 +1488,7 @@ async fn a_restore_is_not_repeated_on_reopen() -> Result {
 
 #[tokio::test]
 async fn sort_flushes_every_column_family() -> Result {
-	let path = database_path("sort");
-	let raw_config = Figment::new()
-		.merge(("server_name", "localhost"))
-		.merge(("database_path", &path))
-		.merge(("test", ["fresh", "cleanup"]));
-
-	let server = new_server(&raw_config)?;
-	let database = Database::open(&server).await?;
+	let database = open_database("sort").await?;
 
 	let first = database.get("alias_roomid")?;
 	let second = database.get("alias_userid")?;
@@ -1342,7 +1508,6 @@ async fn sort_flushes_every_column_family() -> Result {
 	assert_eq!(second.get(b"second").await?.as_ref(), b"value");
 
 	drop(database);
-	drop(server);
 
 	Ok(())
 }

@@ -355,6 +355,11 @@ pub async fn take_one_time_key(
 		.insert(user_id, update_count.to_be_bytes());
 
 	let prefix = (user_id, device_id, Interfix);
+	let _guard = self
+		.claiming_one_time_keys
+		.lock(&(user_id.to_owned(), device_id.to_owned()))
+		.await;
+
 	let one_time_keys = otk
 		.stream_prefix(&prefix)
 		.ignore_err()
@@ -1091,6 +1096,9 @@ pub async fn mark_device_key_update(
 		.await
 		.log_err()
 		.ok();
+
+	// Retire this change before discovering and waking federation peers.
+	drop(count);
 
 	if !local {
 		return;

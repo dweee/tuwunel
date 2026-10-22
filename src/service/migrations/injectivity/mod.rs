@@ -1,177 +1,101 @@
-//! Short id injectivity: the one-time scan and repair.
+//! Repair reported short-id residue while preserving unproven data.
 //!
-//! Releases before v1.8.3 could mint two short ids for one identity,
-//! leaving stale reverse rows in both families, ghost entries in a few
-//! compressed states, and auth chains cached from both allocations. The
-//! migration measures that residue, repairs what matches the shapes it
-//! handles, and marks itself complete like any other. Every release
-//! through v1.8.3 also memoized auth chains truncated at a missing
-//! ancestor, which no scan tells from a whole one, so the cache is
-//! discarded once on a marker of its own.
+//! A database the superseded repair settled is repaired only when its short-id
+//! families disagree. A versioned record distinguishes a verified clean
+//! completion, one that left residue, and a settlement whose families agree.
+//! Legacy markers are kept present so older binaries skip their superseded
+//! repair.
 
-mod repair;
-mod scan;
+mod seen;
 
-use tuwunel_core::{Result, result::LogErr, utils::TryReadyExt, warn};
+use tuwunel_core::result::NotFound;
+use tuwunel_database::Database;
 
-use self::{
-	repair::{heal, repair},
-	scan::scan,
-};
+use self::seen::{MARKER, repair, run, settle, stamp};
 use crate::Services;
 
-/// Global marker recording the scan and repair reached a verdict.
+const SUPERSEDED: &str = "fix_short_injectivity";
+const CACHE_CLEARED: &str = "clear_auth_chain_cache";
+const LEGACY: [&str; 2] = [SUPERSEDED, CACHE_CLEARED];
+
+/// Records a fresh database without scanning its populations.
 ///
-/// A decline stamps it like a settled repair, so no residue causes a
-/// rescan on later boots; the decline's counters become the value where
-/// a settled repair leaves it empty. Only an error leaves it unwritten,
-/// and an error fails the boot. Every reader tests presence only.
-static MARKER: &str = "fix_short_injectivity";
-
-/// Global marker recording the one-time auth chain cache clear.
-///
-/// Gating the clear on [`MARKER`] would re-run it on every boot an
-/// errored repair leaves unstamped.
-static CLEAR_MARKER: &str = "clear_auth_chain_cache";
-
-/// Scan passes one boot allows before giving up on convergence.
-///
-/// A heal completes torn writes and rescans to re-measure what they
-/// explain. Early passes may heal, while the final pass either repairs the
-/// settled residue or declines one that remains healable.
-const PASSES: usize = 3;
-
-/// The verdict [`repair`] reaches; the caller stamps [`MARKER`] on any
-/// verdict.
-///
-/// Only an error escapes without a verdict, leaving the marker unwritten
-/// and failing the boot.
-enum Verdict {
-	Settled,
-	Declined(Reason),
-}
-
-/// Why a repair declined, numbered for the decline record.
-///
-/// The reason decides which counters of the record were measured: an
-/// unverifiable scan measured nothing past the counter, a healable or
-/// family-anomalous verdict measured the families only, and a deep
-/// anomaly measured everything.
-enum Reason {
-	Unverifiable = 1,
-	Healable = 2,
-	FamilyAnomalous = 3,
-	DeepAnomalous = 4,
-}
-
-impl From<Reason> for u64 {
-	fn from(reason: Reason) -> Self {
-		match reason {
-			| Reason::Unverifiable => 1,
-			| Reason::Healable => 2,
-			| Reason::FamilyAnomalous => 3,
-			| Reason::DeepAnomalous => 4,
-		}
-	}
-}
-
-/// Runs the one-time chain cache clear, then the injectivity scan, heal,
-/// and repair behind [`MARKER`].
-///
-/// The clear takes [`CLEAR_MARKER`] and runs ahead of the early return, so
-/// a database that already completed the repair still discards its chains.
-/// The stamp follows any verdict: a settled repair stamps the empty value,
-/// a decline stamps its counters, and only an error leaves the marker
-/// unwritten and fails the boot. A heal rescans rather than repairing,
-/// because it changes the losers and winners the repair consumes.
-#[tracing::instrument(level = "debug", skip_all)]
-pub(super) async fn fix(services: &Services) -> Result {
-	let global = &services.db["global"];
-	let chains_cleared_this_boot = match global.get(CLEAR_MARKER).await {
-		| Ok(_) => false,
-		| Err(error) if error.is_not_found() => true,
-		| Err(error) => return Err(error),
-	};
-
-	if chains_cleared_this_boot {
-		clear_chain_cache(services).await?;
-		services.db["authchainkey_authchain"]
-			.sort()
-			.log_err()
-			.ok();
-	}
-
-	match global.get(MARKER).await {
-		| Ok(_) => return Ok(()),
-		| Err(error) if error.is_not_found() => (),
-		| Err(error) => return Err(error),
-	}
-
-	for pass in 1..=PASSES {
-		let residue = scan(services).await?;
-
-		// The last pass evaluates rather than heals, bounding a residue whose
-		// heals never settle.
-		if pass < PASSES && heal(services, &residue) {
-			continue;
-		}
-
-		match repair(services, &residue, chains_cleared_this_boot).await? {
-			| Verdict::Settled => global.insert(MARKER, []),
-			| Verdict::Declined(reason) => global.raw_put(MARKER, residue.decline_record(reason)),
-		}
-
-		break;
-	}
-
-	Ok(())
-}
-
-/// Discards auth chains cached before walk completeness was enforced.
-///
-/// A chain truncated at a missing ancestor is well-formed, so no scan
-/// separates it from a whole one and the population goes at once. The
-/// cache is derived and rebuilds on demand.
-#[tracing::instrument(level = "debug", skip_all)]
-async fn clear_chain_cache(services: &Services) -> Result {
-	let global = &services.db["global"];
-
-	warn!("Discarding cached auth chains; entries from earlier releases may be truncated.");
-
-	clear_chains(services).await?;
-	global.insert(CLEAR_MARKER, []);
-
-	Ok(())
-}
-
-/// Deletes every auth chain cache row under one cork.
-///
-/// The fallible scan must finish before its caller finalizes a marker. It is
-/// snapshot-based, so it holds only because migrations precede the workers
-/// that populate the cache.
-pub(super) async fn clear_chains(services: &Services) -> Result {
-	let _cork = services.db.cork_and_sync();
-	let progress = &services.server.progress;
-
-	progress.begin(CLEAR_MARKER);
-	services.db["authchainkey_authchain"]
-		.for_clear()
-		.ready_try_for_each(|_| {
-			progress.advance();
-
-			Ok(())
-		})
-		.await
-}
-
-/// Stamps both markers on a fresh database.
-///
-/// A fresh database never ran the unserialized allocator and holds no
-/// cached chains, so it has neither residue to scan for nor a cache to
-/// discard.
+/// The versioned record is written and synced fallibly, so a failed write or
+/// sync never certifies it. Legacy markers for older binaries follow only a
+/// certified record, so a database whose stamp fails stays eligible on the next
+/// start.
 pub(super) fn mark_clean(services: &Services) {
+	if stamp(&services.db).is_none() {
+		return;
+	}
+
 	let global = &services.db["global"];
 
-	global.insert(MARKER, []);
-	global.insert(CLEAR_MARKER, []);
+	for marker in LEGACY {
+		global.insert(marker, []);
+	}
+}
+
+/// Repairs an eligible database without making repair failures fatal to startup.
+///
+/// A database the superseded repair settled has its short-id families checked
+/// once instead, and is repaired only when they disagree. Read-only opens are
+/// skipped, and an outcome is recorded only once it is durable. Legacy markers
+/// wait for that record, so a database whose attempt ends without one stays
+/// eligible on the next start.
+pub(super) async fn fix(services: &Services) {
+	let db = &services.db;
+
+	if settled_before(db).await && settle(services).await {
+		return;
+	}
+
+	run(db, async || {
+		services.server.progress.begin(MARKER);
+		repair(services).await
+	})
+	.await;
+
+	if db["global"].get(MARKER).await.is_ok() {
+		stamp_legacy(services).await;
+	}
+}
+
+/// Whether the superseded repair settled this database before this one ran.
+///
+/// The settled form is the superseded marker's empty value beside a recorded
+/// auth chain cache clear; without the clear, the full repair runs and clears
+/// the cache. A decline record, an absent marker or a failed read leaves the
+/// database eligible, and a recorded outcome is left for the runner to honor. A
+/// build that stamped the legacy markers before attempting this repair leaves
+/// the same form when its attempt ended early, and nothing tells the two apart.
+async fn settled_before(db: &Database) -> bool {
+	let global = &db["global"];
+
+	global.get(MARKER).await.is_missing()
+		&& global.get(CACHE_CLEARED).await.is_ok()
+		&& global
+			.get(SUPERSEDED)
+			.await
+			.as_deref()
+			.is_ok_and(<[u8]>::is_empty)
+}
+
+/// Writes each absent legacy marker so a rollback never reruns the old repair.
+///
+/// Releases before this repair gate their own scan on the marker's presence
+/// alone. Existing values, decline records included, are kept, and a failed
+/// read never counts as absence.
+async fn stamp_legacy(services: &Services) {
+	if services.db.engine.is_read_only() {
+		return;
+	}
+
+	let global = &services.db["global"];
+
+	for marker in LEGACY {
+		if global.get(marker).await.is_missing() {
+			global.insert(marker, []);
+		}
+	}
 }

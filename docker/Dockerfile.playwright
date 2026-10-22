@@ -26,6 +26,8 @@ COPY <<EOF /playwright/playwright.toml
     new_user_displayname_suffix = ""
     rc_messages_per_second = 10000
     rc_message_burst_count = 10000
+    rate_limiting.login.account.burst_count = 1000
+    rate_limiting.login.failed.burst_count = 1000
     log = "warn,tuwunel=info"
     log_colors = false
     log_thread_ids = false
@@ -44,32 +46,50 @@ ENTRYPOINT tuwunel -Oserver_name=\""$SERVER_NAME\""
 
 
 # Playwright runtime image with element-web pre-built. The official Microsoft
-# Playwright image already ships pinned Chromium / Firefox / WebKit and their
-# system deps. Pin its version via ARG.
+# Playwright image supplies the browsers' system deps; the Chromium build
+# itself follows element-web's own Playwright version (see below).
 FROM mcr.microsoft.com/playwright:v1.61.0-noble AS playwright-base
-ARG element_web_ref="develop"
 
-# corepack's bundled signing keys in this image are stale relative to current
-# pnpm releases; install pnpm directly via npm to sidestep that mismatch.
-# `serve` is pre-installed so playwright.config.ts's webServer (which runs
-# `npx serve -p 8080 -L ./webapp` in CI mode) starts instantly instead of
-# spending most of its 30s startup window fetching the package.
-RUN npm install -g pnpm serve
+# element-web's root postinstall runs electron-builder's install-app-deps for
+# apps/desktop, which rebuilds native modules (pkcs11js) through node-gyp; the
+# image carries python3 but no make or C++ compiler.
+RUN \
+--mount=type=cache,dst=/var/cache/apt,id=playwright-var-cache-apt,sharing=locked \
+--mount=type=cache,dst=/var/lib/apt,id=playwright-var-lib-apt,sharing=locked \
+<<EOF
+    set -eux
+    rm -f /etc/apt/apt.conf.d/docker-clean
+    DEBIAN_FRONTEND=noninteractive apt-get -y -U install --no-install-recommends make g++
+EOF
+
+ARG element_web_ref="develop"
 
 WORKDIR /usr/src
 ADD https://github.com/element-hq/element-web.git#${element_web_ref} element-web
 
-WORKDIR /usr/src/element-web
+# corepack's bundled signing keys in this image are stale relative to current
+# pnpm releases; install pnpm directly via npm to sidestep that mismatch, at
+# the exact version element-web declares in devEngines.packageManager (which
+# also satisfies its own version gate). An unpinned install floats to the
+# latest release, and pnpm 12.6.0 began running `pnpm exec` commands in a
+# process group of their own: Playwright's webServer teardown kills the pnpm
+# process group and then waits for the command's stdio to close, so the
+# orphaned `serve` kept every acceptance shard alive after its last test.
+# `serve` is pre-installed so playwright.config.ts's webServer (which runs
+# `pnpm exec serve -p 8080 -L ./webapp` in CI mode) starts instantly instead
+# of spending most of its 30s startup window fetching the package.
+RUN npm install -g "pnpm@$(node -p "require('/usr/src/element-web/package.json').devEngines.packageManager.version")" serve
 
-# element-web pins pnpm via devEngines.packageManager with onFail "error"; the
-# npm-installed pnpm above floats to latest and would hard-fail the version
-# check, including in the child pnpm a postinstall script spawns (which a CLI
-# --pm-on-fail flag cannot reach). Relax the gate to a warning at the source so
-# every pnpm process proceeds; devEngines is not part of the frozen lockfile.
-RUN node -e "const fs=require('fs'),p=require('./package.json');if(p.devEngines?.packageManager)p.devEngines.packageManager.onFail='warn';fs.writeFileSync('package.json',JSON.stringify(p,null,2))"
+WORKDIR /usr/src/element-web
 
 RUN --mount=type=cache,target=/root/.local/share/pnpm,sharing=locked \
     pnpm install --frozen-lockfile
+
+# Each Playwright release launches one pinned Chromium build, and element-web
+# moves its @playwright/test pin on its own schedule, so the build this image
+# tag ships stops matching. Fetch the one element-web's Playwright expects,
+# as pnpm follows devEngines above; nothing downloads while the tag matches.
+RUN pnpm --dir apps/web exec playwright install chromium
 
 # Tuwunel HomeserverContainer. Out-of-lined to docker/lib/playwright.tuwunel.ts in
 # the workspace so it gets TS tooling and proper diffs; pulled in from the
@@ -188,6 +208,12 @@ ARG playwright_retries="1"
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV CI=true
+# pnpm 11 verifies node_modules before every `pnpm exec` and reinstalls when
+# they look stale (verifyDepsBeforeRun defaults to install). CI=true alone
+# makes them look stale, since it flips enableGlobalVirtualStore, which pnpm
+# records at install time, and the reinstall outlasts the webServer's 30s
+# startup window. node_modules is final once the image is built.
+ENV pnpm_config_verify_deps_before_run=false
 ENV playwright_run=$playwright_run
 ENV playwright_skip=$playwright_skip
 ENV playwright_shard=$playwright_shard

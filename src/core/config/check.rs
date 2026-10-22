@@ -78,7 +78,10 @@ pub fn check(config: &Config) -> Result {
 	check_storage(config)?;
 	check_registration(config)?;
 	check_registration_terms(config)?;
+	check_profile_requests(config)?;
+	check_relation_limits(config)?;
 	check_password_hashing(config)?;
+	check_jwt(config)?;
 	check_turn_and_media_misc(config)?;
 	check_url_previews(config)?;
 	check_room_version(config)?;
@@ -114,6 +117,36 @@ fn check_observability(config: &Config) -> Result {
 			"sentry_traces_sample_rate",
 			"Sentry traces sample rate must be between 0.0 and 1.0 inclusive"
 		));
+	}
+
+	Ok(())
+}
+
+fn check_profile_requests(config: &Config) -> Result {
+	if config.max_remote_profile_fields == 0 {
+		return Err!(Config("max_remote_profile_fields", "Must be greater than zero"));
+	}
+
+	if config.max_profile_fields_per_request == 0 {
+		return Err!(Config("max_profile_fields_per_request", "Must be greater than zero"));
+	}
+
+	if config.limit_profile_requests_to_users_who_share_rooms
+		&& !config.require_auth_for_profile_requests
+	{
+		return Err!(Config(
+			"limit_profile_requests_to_users_who_share_rooms",
+			"limit_profile_requests_to_users_who_share_rooms requires \
+			 require_auth_for_profile_requests to be enabled"
+		));
+	}
+
+	Ok(())
+}
+
+fn check_relation_limits(config: &Config) -> Result {
+	if config.thread_latest_reply_search_limit == 0 {
+		return Err!(Config("thread_latest_reply_search_limit", "Must be greater than zero"));
 	}
 
 	Ok(())
@@ -344,32 +377,38 @@ fn check_registration(config: &Config) -> Result {
 	let no_token =
 		config.registration_token.is_none() && config.registration_token_file.is_none();
 
+	let email_required =
+		config.smtp.connection_uri.is_some() && config.smtp.require_email_for_registration;
+
 	if config.allow_registration
 		&& no_token
+		&& !email_required
 		&& !config.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse
 	{
 		return Err!(Config(
 			"registration_token",
-			"!! You have `allow_registration` enabled without a token configured in your config \
-			 which means you are allowing ANYONE to register on your tuwunel instance without \
-			 any 2nd-step (e.g. registration token). If this is not the intended behaviour, \
-			 please set a registration token. For security and safety reasons, tuwunel will \
-			 shut down. If you are extra sure this is the desired behaviour you want, please \
-			 set the following config option to true:
+			"!! You have `allow_registration` enabled without a registration token or a \
+			 required email stage (`smtp.require_email_for_registration` with \
+			 `smtp.connection_uri`). This allows ANYONE to register without any 2nd-step. \
+			 Please set a registration token or require an email stage. For security and safety \
+			 reasons, tuwunel will shut down. If you are extra sure this is the desired \
+			 behaviour you want, please set the following config option to true:
 `yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse`"
 		));
 	}
 
 	if config.allow_registration
 		&& no_token
+		&& !email_required
 		&& config.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse
 	{
 		warn!(
 			"Open registration is enabled via setting \
 			 `yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse` and \
-			 `allow_registration` to true without a registration token configured. You are \
+			 `allow_registration` to true without a registration token or a required email \
+			 stage (`smtp.require_email_for_registration` with `smtp.connection_uri`). You are \
 			 expected to be aware of the risks now. If this is not the desired behaviour, \
-			 please set a registration token."
+			 please set a registration token or require an email stage."
 		);
 	}
 
@@ -427,6 +466,17 @@ fn check_password_hashing(config: &Config) -> Result {
 			 hashes are cheaper to crack than the default. See argon2_m_cost for the \
 			 recommended pairs."
 		);
+	}
+
+	Ok(())
+}
+
+fn check_jwt(config: &Config) -> Result {
+	let jwt = &config.jwt;
+
+	// Without [global.jwt], the derived Default's empty format would fail this.
+	if jwt.enable {
+		jwt.key_format()?;
 	}
 
 	Ok(())
