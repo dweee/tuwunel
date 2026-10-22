@@ -4,7 +4,6 @@
 //! membership metadata. Invite and tombstone checks use the normal event-build
 //! pipeline as non-persisting authorization probes.
 
-use futures::pin_mut;
 use ruma::{
 	EventId, RoomId, UserId,
 	events::{
@@ -99,23 +98,63 @@ pub async fn user_can_redact(
 ///
 /// Missing event state is allowed, and missing or invalid history visibility
 /// defaults to `shared`. The `shared` decision also accounts for the user's
-/// membership intervals around the event.
+/// membership intervals around the event. Under `joined` and `invited`, the
+/// user's own membership event is visible when the membership it sets
+/// qualifies, per the spec's before-or-after rule.
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, level = "trace")]
-pub async fn user_can_see_event(
+pub async fn user_can_see_event<Pdu>(&self, user_id: &UserId, pdu: &Pdu) -> bool
+where
+	Pdu: Event,
+{
+	let Some((shortstatehash, history_visibility)) =
+		self.history_visibility_at(pdu.event_id()).await
+	else {
+		return true;
+	};
+
+	match history_visibility {
+		| HistoryVisibility::WorldReadable => true,
+
+		// Allow the user's own invite or join, or a user at least invited at the event
+		| HistoryVisibility::Invited =>
+			matches!(
+				pdu.membership_for(user_id),
+				Some(MembershipState::Join | MembershipState::Invite)
+			) || self
+				.user_was_invited(shortstatehash, user_id)
+				.await,
+
+		// Allow the user's own join, or a user joined at the event
+		| HistoryVisibility::Joined =>
+			matches!(pdu.membership_for(user_id), Some(MembershipState::Join))
+				|| self
+					.user_was_joined(shortstatehash, user_id)
+					.await,
+
+		// An unrecognized value is treated as shared.
+		| HistoryVisibility::Shared | _ =>
+			self.user_shared_history(shortstatehash, pdu.room_id(), pdu.event_id(), user_id)
+				.await,
+	}
+}
+
+/// The room state an event was sent in and the history visibility it carried.
+///
+/// Missing or invalid history visibility reads as `shared`, and `None` means
+/// the event has no recorded state.
+#[implement(super::Service)]
+#[tracing::instrument(skip_all, level = "trace")]
+async fn history_visibility_at(
 	&self,
-	user_id: &UserId,
-	room_id: &RoomId,
 	event_id: &EventId,
-) -> bool {
-	let Ok(shortstatehash) = self
+) -> Option<(ShortStateHash, HistoryVisibility)> {
+	let shortstatehash = self
 		.services
 		.state
 		.pdu_shortstatehash(event_id)
 		.await
-	else {
-		return true;
-	};
+		.ok()?;
 
 	let history_visibility = self
 		.state_get_content(shortstatehash, &StateEventType::RoomHistoryVisibility, "")
@@ -124,24 +163,7 @@ pub async fn user_can_see_event(
 			c.history_visibility
 		});
 
-	match history_visibility {
-		| HistoryVisibility::WorldReadable => true,
-
-		// Allow if any member on requesting server was AT LEAST invited, else deny
-		| HistoryVisibility::Invited =>
-			self.user_was_invited(shortstatehash, user_id)
-				.await,
-
-		// Allow if any member on requested server was joined, else deny
-		| HistoryVisibility::Joined =>
-			self.user_was_joined(shortstatehash, user_id)
-				.await,
-
-		// An unrecognized value is treated as shared.
-		| HistoryVisibility::Shared | _ =>
-			self.user_shared_history(shortstatehash, room_id, event_id, user_id)
-				.await,
-	}
+	Some((shortstatehash, history_visibility))
 }
 
 /// Whether a user may see an event under `shared` history visibility.
@@ -244,12 +266,50 @@ pub async fn user_can_see_room(&self, user_id: &UserId, room_id: &RoomId) -> boo
 	let left = state_cache.is_left(user_id, room_id);
 	let world_readable = self.is_world_readable(room_id);
 
-	pin_mut!(joined, invited, left, world_readable);
-	joined
-		.or(invited)
-		.or(left)
-		.or(world_readable)
+	joined.or3(invited, left, world_readable).await
+}
+
+/// Reports whether a user may peek into a room, as a room preview does.
+///
+/// A member always may, and anyone else only while the room's history is
+/// world-readable. Unlike `user_can_see_room`, a pending invite or a retained
+/// left membership grants nothing here.
+#[implement(super::Service)]
+#[tracing::instrument(skip_all, level = "trace")]
+pub async fn user_can_peek(&self, user_id: &UserId, room_id: &RoomId) -> bool {
+	// Sequenced rather than raced, so a member's point get skips the state read.
+	self.services
+		.state_cache
+		.is_joined(user_id, room_id)
 		.await
+		|| self.is_world_readable(room_id).await
+}
+
+/// Reports whether the room's history was world-readable at an event.
+///
+/// A peek may show only such events, so an event without recorded state, or
+/// with missing or invalid history visibility, does not qualify. The event that
+/// makes the room world-readable counts as well, as the spec requires.
+#[implement(super::Service)]
+#[tracing::instrument(skip_all, level = "trace")]
+pub async fn is_world_readable_at<Pdu>(&self, pdu: &Pdu) -> bool
+where
+	Pdu: Event,
+{
+	let opens_history = pdu.is_type_and_state_key(&TimelineEventType::RoomHistoryVisibility, "")
+		&& pdu
+			.get_content()
+			.is_ok_and(|c: RoomHistoryVisibilityEventContent| {
+				c.history_visibility == HistoryVisibility::WorldReadable
+			});
+
+	opens_history
+		|| self
+			.history_visibility_at(pdu.event_id())
+			.await
+			.is_some_and(|(_, history_visibility)| {
+				history_visibility == HistoryVisibility::WorldReadable
+			})
 }
 
 /// Probes whether a sender may invite a target user.

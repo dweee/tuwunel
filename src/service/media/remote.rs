@@ -168,7 +168,7 @@ async fn fetch_thumbnail_unauthenticated(
 
 	let request = Request {
 		allow_remote: true,
-		allow_redirect: true,
+		allow_redirect: false,
 		animated: animate.into(),
 		method: dim.method.clone().into(),
 		width: dim.width.into(),
@@ -202,7 +202,7 @@ async fn fetch_content_unauthenticated(
 
 	let request = Request {
 		allow_remote: true,
-		allow_redirect: true,
+		allow_redirect: false,
 		server_name: mxc.server_name.into(),
 		media_id: mxc.media_id.into(),
 		timeout_ms,
@@ -387,9 +387,14 @@ where
 	Request::Authentication: FedAuth,
 	Request::PathBuilder: FedPath,
 {
-	self.services
-		.federation
-		.execute(server.unwrap_or(mxc.server_name), request)
+	// query-depth firewall
+	let fetch = Box::pin(
+		self.services
+			.federation
+			.execute(server.unwrap_or(mxc.server_name), request),
+	);
+
+	fetch
 		.await
 		.map_err(|error| handle_federation_error(mxc, server, error))
 }
@@ -462,7 +467,6 @@ pub async fn fetch_remote_thumbnail_legacy(
 pub async fn fetch_remote_content_legacy(
 	&self,
 	mxc: &Mxc<'_>,
-	allow_redirect: bool,
 	timeout_ms: Duration,
 ) -> Result<media::get_content::v3::Response, Error> {
 	self.check_legacy_freeze()?;
@@ -475,7 +479,7 @@ pub async fn fetch_remote_content_legacy(
 			server_name: mxc.server_name.into(),
 			media_id: mxc.media_id.into(),
 			timeout_ms,
-			allow_redirect,
+			allow_redirect: false,
 		})
 		.await?;
 

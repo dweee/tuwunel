@@ -23,7 +23,7 @@ use tuwunel_core::{
 };
 use tuwunel_service::rooms::short::ShortStateHash;
 
-use crate::{Ruma, client::message::visibility_filter};
+use crate::{Ruma, client::visibility_filter};
 
 const LIMIT_MAX: usize = 50;
 
@@ -120,7 +120,8 @@ pub(crate) async fn room_initial_sync_route(
 		.ready_try_filter_map(|e| Ok(extract_variant!(e, AnyRawAccountDataEvent::Room)))
 		.try_collect::<Vec<_>>();
 
-	let (visibility, state, events, account_data) = try_join4(visibility, state, events, account_data)
+	let (visibility, state, events, account_data) =
+		try_join4(visibility, state, events, account_data)
 			.boxed() // erase the state stream's higher-ranked event lifetime
 			.await?;
 

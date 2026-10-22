@@ -1,25 +1,34 @@
 use std::{collections::BTreeMap, pin::pin, sync::Arc};
 
-use futures::{Stream, StreamExt, TryFutureExt, future::join3};
+use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future::join3};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId, OwnedUserId, RoomId, UInt,
 	UserId,
 	api::{Direction, client::threads::get_threads::v1::IncludeThreads},
-	events::{AnySyncMessageLikeEvent, TimelineEventType, relation::RelationType},
+	events::{
+		AnySyncMessageLikeEvent, TimelineEventType, relation::RelationType,
+		room::encrypted::Relation,
+	},
 	serde::Raw,
 	uint,
 };
 use serde::Deserialize;
 use serde_json::json;
 use tuwunel_core::{
-	Event, Result, err,
-	matrix::pdu::{PduCount, PduEvent, PduId, RawPduId},
+	Event, Result, err, implement,
+	matrix::{
+		Pdu,
+		pdu::{PduCount, PduEvent, PduId, RawPduId},
+	},
 	utils::{
-		ReadyExt,
-		stream::{TryIgnore, WidebandExt, automatic_width},
+		BoolExt, ReadyExt,
+		result::{LogErr, NotFound},
+		stream::{TryIgnore, TryReadyExt, WidebandExt, automatic_width},
 	},
 };
 use tuwunel_database::{Deserialized, Map, Txn};
+
+use crate::rooms::{pdu_metadata::RelationQuery, timeline::ExtractRelatesTo};
 
 #[cfg(test)]
 mod tests;
@@ -267,6 +276,60 @@ impl Service {
 		Ok(())
 	}
 
+	/// Returns the root row changed by redacting a counted thread reply.
+	///
+	/// The caller holds the room lock while the count decreases and the latest
+	/// reply is replaced. A bounded miss omits the latest event while preserving
+	/// the count; the whole bundle is removed when no reply remains.
+	/// Missing roots and unchanged summaries return `None`; storage errors are logged.
+	pub async fn redacted_reply_root(
+		&self,
+		root_event_id: &EventId,
+		reply_id: &RawPduId,
+		reply_event_id: &EventId,
+	) -> Option<(RawPduId, CanonicalJsonObject)> {
+		matches!(reply_id.pdu_count(), PduCount::Normal(_)).into_option()?;
+
+		let root_id = self
+			.services
+			.timeline
+			.get_pdu_id(root_event_id)
+			.await
+			.optional()
+			.log_err()
+			.ok()??;
+
+		root_id
+			.shortroomid()
+			.eq(&reply_id.shortroomid())
+			.into_option()?;
+
+		let root = self.summary_root(&root_id).await?;
+		let count = thread_count(&root).and_then(|count| count.checked_sub(uint!(1)));
+		let replace =
+			thread_latest(&root).is_some_and(|latest| latest == reply_event_id.as_str());
+
+		let latest = replace
+			.then_async(|| self.latest_thread_reply(root_id, reply_event_id))
+			.await;
+
+		let latest = latest.map(|latest| latest.log_err().ok().flatten());
+
+		let changed = count.is_some() || latest.is_some();
+
+		changed.into_option()?;
+
+		let root = set_thread_count(root, count);
+		let root = match (count, latest) {
+			| (Some(count), _) if count == uint!(0) => set_thread_latest(root, None),
+			| (_, None) => root,
+			| (_, Some(None)) => omit_thread_latest(root),
+			| (_, Some(Some(latest))) => set_thread_latest(root, Some(latest)),
+		};
+
+		Some((root_id, root))
+	}
+
 	pub fn threads_until<'a>(
 		&'a self,
 		user_id: &'a UserId,
@@ -474,5 +537,265 @@ impl Service {
 		txn.insert_raw(&self.db.threadactivityid_rootid, activity_id, root_id);
 		txn.insert_raw(&self.db.threadrootid_latestcount, root_id, latest.to_be_bytes());
 		txn.execute();
+	}
+
+	/// Rebuilds stored thread counts and removes redacted latest replies.
+	///
+	/// Each root is locked and walked once; an unredacted stored latest is kept,
+	/// and a backfilled root keeps its count. Returns the numbers of rewritten
+	/// and failed roots, skipping missing bundles.
+	#[tracing::instrument(skip_all, level = "debug")]
+	pub async fn rebuild_thread_summaries(&self) -> (usize, usize) {
+		// get_relations already fans out per root, so a concurrent outer stage nests fan-outs.
+		self.db
+			.threadid_userids
+			.raw_keys()
+			.ignore_err()
+			.map(RawPduId::from)
+			.then(async |root_id| {
+				self.rebuild_thread_summary(root_id)
+					.await
+					.log_err()
+			})
+			.ready_fold((0_usize, 0_usize), |(changed, failed), result| match result {
+				| Ok(rewritten) => (changed.saturating_add(usize::from(rewritten)), failed),
+				| Err(_) => (changed, failed.saturating_add(1)),
+			})
+			.await
+	}
+}
+
+#[implement(Service)]
+async fn summary_root(&self, root_id: &RawPduId) -> Option<CanonicalJsonObject> {
+	self.try_summary_root(root_id)
+		.await
+		.log_err()
+		.ok()?
+}
+
+#[implement(Service)]
+async fn try_summary_root(&self, root_id: &RawPduId) -> Result<Option<CanonicalJsonObject>> {
+	self.services
+		.timeline
+		.get_pdu_json_from_id(root_id)
+		.await
+		.optional()
+}
+
+#[implement(Service)]
+async fn latest_thread_reply(
+	&self,
+	root_id: RawPduId,
+	excluding: &EventId,
+) -> Result<Option<CanonicalJsonValue>> {
+	let limit = self
+		.services
+		.server
+		.config
+		.thread_latest_reply_search_limit;
+
+	let replies = self
+		.thread_replies(root_id, limit)
+		.ready_try_filter(|(_, pdu)| pdu.event_id != excluding);
+
+	pin!(replies)
+		.try_next()
+		.await
+		.map(|reply| reply.and_then(|(_, pdu)| thread_reply_json(&pdu)))
+}
+
+#[implement(Service)]
+fn thread_replies(
+	&self,
+	root_id: RawPduId,
+	limit: usize,
+) -> impl Stream<Item = Result<(PduCount, Pdu)>> + Send + '_ {
+	let PduId { shortroomid, count } = root_id.into();
+
+	self.services
+		.pdu_metadata
+		.try_get_relations_limited(RelationQuery {
+			shortroomid,
+			target: count,
+			from: None,
+			dir: Direction::Backward,
+			user_id: None,
+			limit,
+		})
+		.ready_try_filter(|(_, pdu)| !pdu.is_redacted())
+		.ready_try_filter(|(_, pdu)| is_thread_reply(pdu))
+}
+
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+async fn rebuild_thread_summary(&self, root_id: RawPduId) -> Result<bool> {
+	let Some(pdu) = self.try_summary_root(&root_id).await? else {
+		return Ok(false);
+	};
+
+	let Some(_) = thread_bundle(&pdu) else { return Ok(false) };
+	let room_id: &RoomId = pdu.get("room_id").try_into()?;
+	let _lock = self.services.state.mutex.lock(room_id).await;
+	let Some(root) = self.try_summary_root(&root_id).await? else {
+		return Ok(false);
+	};
+
+	let Some(_) = thread_bundle(&root) else { return Ok(false) };
+
+	let (count, latest) = self
+		.thread_replies(root_id, usize::MAX)
+		.ready_try_fold((0_usize, None), |(count, latest), (_, pdu)| {
+			Ok((count.saturating_add(1), latest.or(Some(pdu))))
+		})
+		.await?;
+
+	// A backfilled root keeps its count; its replies are not in the relation index.
+	let count = matches!(root_id.pdu_count(), PduCount::Normal(_))
+		.and_then(|| UInt::try_from(count).ok())
+		.or_else(|| thread_count(&root));
+
+	let replace = match thread_latest(&root).and_then(|id| <&EventId>::try_from(id).ok()) {
+		| None => false,
+		| Some(latest) => self
+			.services
+			.timeline
+			.get_pdu(latest)
+			.await
+			.optional()?
+			.is_none_or(|pdu| pdu.is_redacted()),
+	};
+
+	let changed = replace || thread_count(&root) != count;
+
+	if !changed {
+		return Ok(false);
+	}
+
+	let latest = replace.then(|| latest.as_ref().and_then(thread_reply_json));
+	let root = set_thread_count(root, count);
+	let root = match latest {
+		| None => root,
+		| Some(latest) => set_thread_latest(root, latest),
+	};
+
+	self.services
+		.timeline
+		.replace_pdu(&root_id, &root)
+		.await?;
+
+	Ok(true)
+}
+
+fn thread_count(root: &CanonicalJsonObject) -> Option<UInt> {
+	UInt::try_from(i64::from(thread_bundle(root)?.get("count")?.as_integer()?)).ok()
+}
+
+fn thread_bundle(root: &CanonicalJsonObject) -> Option<&CanonicalJsonObject> {
+	["unsigned", "m.relations", "m.thread"]
+		.into_iter()
+		.try_fold(root, |object, field| object.get(field)?.as_object())
+}
+
+fn thread_latest(root: &CanonicalJsonObject) -> Option<&str> {
+	thread_bundle(root)?
+		.get("latest_event")?
+		.as_object()?
+		.get("event_id")?
+		.as_str()
+}
+
+fn set_thread_count(mut root: CanonicalJsonObject, count: Option<UInt>) -> CanonicalJsonObject {
+	if let Some((thread, count)) = thread_bundle_mut(&mut root).zip(count) {
+		thread.insert("count".into(), CanonicalJsonValue::Integer(count.into()));
+	}
+
+	root
+}
+
+/// Borrows the stored thread bundle for a summary rewrite.
+///
+/// Missing or non-object components leave the root unchanged.
+pub(crate) fn thread_bundle_mut(
+	root: &mut CanonicalJsonObject,
+) -> Option<&mut CanonicalJsonObject> {
+	["unsigned", "m.relations", "m.thread"]
+		.into_iter()
+		.try_fold(root, |object, field| object.get_mut(field)?.as_object_mut())
+}
+
+fn set_thread_latest(
+	mut root: CanonicalJsonObject,
+	latest: Option<CanonicalJsonValue>,
+) -> CanonicalJsonObject {
+	let Some(latest) = latest else {
+		return remove_thread_bundle(root);
+	};
+
+	if let Some(thread) = thread_bundle_mut(&mut root) {
+		thread.insert("latest_event".into(), latest);
+	}
+
+	root
+}
+
+fn omit_thread_latest(mut root: CanonicalJsonObject) -> CanonicalJsonObject {
+	if thread_count(&root).is_none_or(|count| count == uint!(0)) {
+		return remove_thread_bundle(root);
+	}
+
+	if let Some(thread) = thread_bundle_mut(&mut root) {
+		thread.remove("latest_event");
+	}
+
+	root
+}
+
+fn remove_thread_bundle(mut root: CanonicalJsonObject) -> CanonicalJsonObject {
+	let Some(unsigned) = root
+		.get_mut("unsigned")
+		.and_then(CanonicalJsonValue::as_object_mut)
+	else {
+		return root;
+	};
+
+	let Some(relations) = unsigned
+		.get_mut("m.relations")
+		.and_then(CanonicalJsonValue::as_object_mut)
+	else {
+		return root;
+	};
+
+	relations.remove("m.thread");
+	if relations.is_empty() {
+		unsigned.remove("m.relations");
+	}
+
+	root
+}
+
+fn thread_reply_json(pdu: &Pdu) -> Option<CanonicalJsonValue> {
+	serde_json::from_str(
+		pdu.to_sync_message_like_without_unsigned()
+			.json()
+			.get(),
+	)
+	.ok()
+}
+
+fn is_thread_reply(pdu: &impl Event) -> bool {
+	pdu.get_content()
+		.is_ok_and(|content: ExtractRelatesTo| matches!(content.relates_to, Relation::Thread(_)))
+}
+
+/// Returns the thread root named by borrowed event content.
+///
+/// Uses the same relation shape as the timeline append path, including legacy replies.
+pub(crate) fn thread_root(content: &CanonicalJsonValue) -> Option<OwnedEventId> {
+	let content: ExtractRelatesTo =
+		serde_json::from_value(serde_json::to_value(content).ok()?).ok()?;
+
+	match content.relates_to {
+		| Relation::Thread(thread) => Some(thread.event_id),
+		| _ => None,
 	}
 }

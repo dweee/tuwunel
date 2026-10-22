@@ -82,6 +82,8 @@ pub async fn join<'a>(
 
 	let (federation_lock, state_lock) = self.lock_join(room_id, &servers).await;
 
+	self.check_room_ban(sender_user, room_id).await?;
+
 	let user_is_guest = !is_appservice
 		&& self
 			.services
@@ -106,23 +108,25 @@ pub async fn join<'a>(
 		.is_joined(sender_user, room_id)
 		.await
 	{
-		debug_warn!("{sender_user} is already joined in {room_id}");
+		debug_warn!(%sender_user, %room_id, "User is already joined.");
 		return Ok(());
 	}
 
 	// Resolved state can lag a federated re-invite; trust the invite index.
-	if let Ok(membership) = self
+	if self
 		.services
 		.state_accessor
 		.get_member(room_id, sender_user)
-		.await && membership.membership == MembershipState::Ban
-		&& !self
+		.await
+		.is_ok_and(|content| content.membership == MembershipState::Ban)
+		&& self
 			.services
 			.state_cache
 			.is_invited(sender_user, room_id)
 			.await
+			.is_false()
 	{
-		debug_warn!("{sender_user} is banned from {room_id} but attempted to join");
+		debug_warn!(%sender_user, %room_id, "Banned user attempted to join.");
 		return Err!(Request(Forbidden("You are banned from the room.")));
 	}
 
@@ -149,6 +153,21 @@ pub async fn join<'a>(
 
 	self.copy_predecessor_push_rules(sender_user, room_id)
 		.await;
+
+	Ok(())
+}
+
+#[implement(Service)]
+async fn check_room_ban(&self, sender_user: &UserId, room_id: &RoomId) -> Result {
+	if self.services.metadata.is_banned(room_id).await
+		&& !self
+			.services
+			.admin
+			.user_is_admin(sender_user)
+			.await
+	{
+		return Err!(Request(Forbidden("This room is banned on this homeserver.")));
+	}
 
 	Ok(())
 }
@@ -622,8 +641,8 @@ async fn ingest_send_join_state(
 		.ready_filter_map(Result::ok)
 		.ready_filter_map(|(event_id, value)| {
 			Pdu::from_object_federation(room_id, &event_id, value, room_version_rules)
-				.inspect_err(|e| {
-					debug_warn!("Invalid PDU {event_id:?} in send_join response: {e:?}");
+				.inspect_err(|error| {
+					debug_warn!(?event_id, %error, "Invalid PDU in the join response.");
 				})
 				.map(move |(pdu, value)| (event_id, pdu, value))
 				.ok()
@@ -671,16 +690,15 @@ async fn ingest_send_join_auth_chain(
 		})
 		.inspect_err(|e| debug_error!("Invalid send_join auth_chain event: {e:?}"))
 		.ready_filter_map(Result::ok)
-		.ready_for_each(|(event_id, mut value)| {
-			if !room_version_rules
-				.event_format
-				.require_room_create_room_id
-				&& value["type"] == "m.room.create"
-			{
-				let room_id = CanonicalJsonValue::String(room_id.as_str().into());
-				value.insert("room_id".into(), room_id);
-			}
-
+		.ready_filter_map(|(event_id, value)| {
+			Pdu::from_object_federation(room_id, &event_id, value, room_version_rules)
+				.inspect_err(|error| {
+					debug_warn!(?event_id, %error, "Invalid PDU in the join response.");
+				})
+				.map(move |(_, value)| (event_id, value))
+				.ok()
+		})
+		.ready_for_each(|(event_id, value)| {
 			self.services
 				.timeline
 				.add_pdu_outlier(&event_id, &value);
@@ -841,6 +859,10 @@ async fn join_local(
 	// Drop before the federation fallback: handle_incoming_pdu re-acquires
 	// the same per-room state mutex while ingesting prev_events; deadlock.
 	drop(state_lock);
+	let (federation_lock, state_lock) = self.lock_join_remote(room_id).await;
+
+	self.check_room_ban(sender_user, room_id).await?;
+	drop(state_lock);
 
 	let Ok((make_join_response, remote_server)) = self
 		.make_join_request(sender_user, room_id, servers)
@@ -889,6 +911,8 @@ async fn join_local(
 		.ok_or_else(|| {
 			err!(Request(InvalidParam("Signed join was not accepted as a timeline event.")))
 		})?;
+
+	drop(federation_lock);
 
 	Ok(())
 }

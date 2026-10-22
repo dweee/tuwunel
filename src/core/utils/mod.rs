@@ -6,6 +6,7 @@
 
 pub mod arrayvec;
 pub mod bool;
+pub mod budget;
 pub mod bytes;
 pub mod content_disposition;
 pub mod debug;
@@ -15,6 +16,7 @@ pub mod hash;
 pub mod html;
 pub mod json;
 pub mod math;
+pub mod mutex;
 pub mod mutex_map;
 pub mod option;
 pub mod rand;
@@ -38,11 +40,13 @@ pub use ::tuwunel_macros::{async_noinline, implement};
 pub use self::{
 	arrayvec::ArrayVecExt,
 	bool::BoolExt,
+	budget::budget,
 	bytes::{increment, u64_from_bytes, u64_from_u8},
 	debug::slice_truncated as debug_slice_truncated,
 	future::{BoolExt as FutureBoolExt, OptionStream, TryExtExt as TryFutureExtExt},
 	hash::sha256::delimited as calculate_hash,
 	json::{deserialize_from_str, serialized_len, to_canonical_object},
+	mutex::MutexExt,
 	mutex_map::{Guard as MutexMapGuard, MutexMap},
 	option::OptionExt,
 	rand::{shuffle, string as random_string, string_from as random_string_from},

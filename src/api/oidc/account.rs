@@ -36,10 +36,7 @@ use self::{
 	session_list::sessions_list_html,
 	session_view::session_view_html,
 };
-use super::{
-	authorize::should_serve_native, consume_login_token, peek_login_token, sso_redirect_url,
-	url_encode,
-};
+use super::{consume_login_token, peek_login_token, sso_redirect_url, url_encode};
 
 pub(crate) static ACCOUNT_MANAGEMENT_ACTIONS_SUPPORTED: &[&str] = &[
 	"org.matrix.profile",
@@ -60,8 +57,9 @@ static ACCOUNT_JS: &str = include_str!("account/account.js");
 /// Shared stylesheet served at `/_tuwunel/oidc/account.css`.
 static ACCOUNT_CSS: &str = include_str!("account/account.css");
 
-pub(super) static ACCOUNT_HEAD: &str = r#"
+pub(crate) static ACCOUNT_HEAD: &str = r#"
 	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<link rel="stylesheet" href="/_tuwunel/oidc/account.css">
 "#;
 
@@ -113,14 +111,13 @@ pub(crate) async fn get_account_route(
 fn account_auth_redirect(services: &Services, action: &str, device_id: &str) -> Result<Response> {
 	validate_account_action(action)?;
 
-	let idp_id = services.oauth.providers.get_default_id();
-	let wants_create = false;
-	let serve_native =
-		should_serve_native(services.config.oidc_native_auth, idp_id.is_some(), wants_create);
-
-	match serve_native {
+	match services.config.oidc_native_auth {
 		| true => account_native_redirect(services, action, device_id),
-		| false => account_sso_redirect(services, action, device_id, idp_id.as_deref()),
+		| false => {
+			let idp_id = services.oauth.providers.get_default_id();
+
+			account_sso_redirect(services, action, device_id, idp_id.as_deref())
+		},
 	}
 }
 
@@ -141,7 +138,10 @@ fn account_native_redirect(
 	Ok(account_redirect_response(Redirect::temporary(native_url.as_str())))
 }
 
-fn account_sso_redirect(
+/// Redirect account authentication through the selected identity provider.
+///
+/// The callback preserves the requested action and device selector.
+pub(super) fn account_sso_redirect(
 	services: &Services,
 	action: &str,
 	device_id: &str,
@@ -406,7 +406,10 @@ fn account_error_page(message: &str) -> String {
 	)
 }
 
-fn validate_account_action(action: &str) -> Result {
+/// Reject unsupported account management actions before authentication.
+///
+/// Unsupported actions return an invalid-parameter error.
+pub(super) fn validate_account_action(action: &str) -> Result {
 	ACCOUNT_MANAGEMENT_ACTIONS_SUPPORTED
 		.contains(&action)
 		.ok_or_else(|| err!(Request(InvalidParam("Unsupported account management action"))))

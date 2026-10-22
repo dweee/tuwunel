@@ -213,9 +213,9 @@
 #eventid_pdu_cache_capacity = varies by system
 
 # Maximum number of entries in the RocksDB block cache for the
-# `eventid_backoff` column family: the recent fetch, auth, and upgrade
-# outcomes an event is rate-gated against, keyed by federation step,
-# event ID, and time bucket.
+# `eventid_backoff` column family: the recent fetch, auth, upgrade, and
+# delivery outcomes an event is rate-gated against, keyed by federation
+# step, event ID, and time bucket.
 #
 # Same entry-count semantics as `pdu_cache_capacity`. A server working
 # through a large missing-ancestry gap reads this column heavily.
@@ -493,6 +493,17 @@
 # it increases recovery work; it is not a count of network requests.
 #
 #max_fetch_prev_events = 1024
+
+# Maximum relation rows examined while replacing a redacted latest thread
+# reply.
+#
+# Missing, malformed, unrelated, and redacted events consume the
+# budget before event filtering. If no replacement is found, the thread
+# summary is omitted.
+#
+# reloadable: yes
+#
+#thread_latest_reply_search_limit = 1024
 
 # Simultaneous backward-extremity upgrades during incoming-event recovery.
 #
@@ -987,8 +998,8 @@
 
 # Sets the default `m.federate` property for newly created rooms when the
 # client does not request one. If `allow_federation` is set to false at
-# the same this value is set to false it then always overrides the client
-# requested `m.federate` value to false.
+# the same time this value is set to false, it then always overrides the
+# client-requested `m.federate` value to false.
 #
 # Rooms are fixed to the setting at the time of their creation and can
 # never be changed; changing this value only affects new rooms.
@@ -1019,6 +1030,55 @@
 # reloadable: yes
 #
 #require_auth_for_profile_requests = false
+
+# Maximum fields retained in a remote user's cached profile.
+#
+# Includes displayname and avatar_url and must be greater than zero.
+# A refresh exceeding this count is rejected without changing the cache.
+# Lowering it leaves existing profiles intact; their refreshes must fit
+# the new limit.
+#
+# reloadable: yes
+#
+#max_remote_profile_fields = 100
+
+# Maximum selected profile fields in a sync request or stored filter.
+#
+# Counts raw selectors before duplicate removal for sliding and legacy sync
+# and must be greater than zero.
+# Requests exceeding this count or the 255-byte name limit are rejected.
+# Sliding sync retains normalized selections across omitted selectors;
+# after lowering the limit, an oversized selection requires replacement
+# or a restarted connection.
+# Unfiltered sliding sync profiles are not limited by this count.
+#
+# reloadable: yes
+#
+#max_profile_fields_per_request = 64
+
+# Allow standard users to set or clear their display names through the
+# client profile API.
+#
+# Server admins and appservices are always allowed to change display
+# names.
+#
+# reloadable: yes
+#
+#enable_set_displayname = true
+
+# Restrict client profile retrieval to the user themselves or users who
+# currently share a joined room.
+#
+# Appservices are exempt, and other users are refused with 403
+# `M_FORBIDDEN`. The server refuses to start, or to reload its
+# configuration, with this enabled unless
+# `require_auth_for_profile_requests` is enabled too. Federation profile
+# lookups are unaffected; `allow_inbound_profile_lookup_federation_requests`
+# controls those.
+#
+# reloadable: yes
+#
+#limit_profile_requests_to_users_who_share_rooms = false
 
 # Preserve per-room profile overrides during a global profile update.
 #
@@ -1143,6 +1203,12 @@
 # reloadable: yes
 #
 #allow_room_creation = true
+
+# Allow standard users to create room aliases. Appservices and admins are
+# always allowed to create room aliases.
+# reloadable: yes
+#
+#allow_room_alias_creation = true
 
 # Set to false to disable users from joining or creating room versions
 # that aren't officially supported by tuwunel. Unstable room versions may
@@ -1566,9 +1632,10 @@
 # When false (default), the OIDC server runs only to broker for a
 # configured `identity_provider`, redirecting users to that upstream IdP.
 # When true, an authorization request that selects no provider is served a
-# native login or registration page checked against local accounts;
-# `well_known.client` must be set. Native and external providers coexist;
-# a configured `identity_provider` still brokers as before. Registration
+# login or registration page; `well_known.client` must be set. The login
+# page offers local accounts and each configured identity provider (one
+# single sign-on entry under `single_sso` or `sso_custom_providers_page`),
+# and an explicit `idp_id` goes directly to that provider. Registration
 # here honors `allow_registration`, the registration token, and
 # `registration_terms` exactly as the client registration endpoint does.
 #
@@ -2663,11 +2730,11 @@
 # To disable, set this to be an empty vector (`[]`).
 #
 # Defaults to:
-# ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
+# ["127.0.0.0/8", "0.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
 # "192.168.0.0/16", "100.64.0.0/10", "192.0.0.0/24", "169.254.0.0/16",
 # "192.88.99.0/24", "198.18.0.0/15", "192.0.2.0/24", "198.51.100.0/24",
-# "203.0.113.0/24", "224.0.0.0/4", "::1/128", "fe80::/10", "fc00::/7",
-# "2001:db8::/32", "ff00::/8", "fec0::/10"]
+# "203.0.113.0/24", "224.0.0.0/4", "::1/128", "::/128", "fe80::/10",
+# "fc00::/7", "2001:db8::/32", "ff00::/8", "fec0::/10"]
 #
 #ip_range_denylist =
 
@@ -2880,8 +2947,10 @@
 #max_join_attempts_per_join_request = 3
 
 # Retry failed and incomplete messages to remote servers immediately upon
-# startup. This is called bursting. If this is disabled, said messages may
-# not be delivered until more messages are queued for that server. Do not
+# startup.
+#
+# This is called bursting. If this is disabled, queued messages are retried
+# on a paced timer after startup instead of all at once. Do not
 # change this option unless server resources are extremely limited or the
 # scale of the server's deployment is huge. Do not disable this unless you
 # know what you are doing.
@@ -2948,15 +3017,18 @@
 #
 #enforce_stripped_state_pdu_validation = false
 
-# Allow admins to enter commands in rooms other than "#admins" (admin
-# room) by prefixing your message with "\!admin" or "\\!admin" followed up
-# a normal tuwunel admin command. The reply will be publicly visible to
-# the room, originating from the sender.
+# Allow admins to run commands outside the admin room ("#admins") by
+# prefixing a message with "\!admin" or "\\!admin" and a normal command.
+#
+# The reply is publicly visible to the room, originating from the sender.
+# Disabled by default: the server cannot tell a command an admin typed
+# from one in a message the admin forwarded or a bot on their account
+# reposted. Message formatting can also hide the command from the admin.
 #
 # reloadable: yes
 # example: \\!admin debug ping puppygock.gay
 #
-#admin_escape_commands = true
+#admin_escape_commands = false
 
 # Automatically activate the tuwunel admin room console / CLI on
 # startup. This option can also be enabled with `--console` tuwunel
@@ -3740,13 +3812,13 @@
 #
 #key =
 
-# Format of the 'key'. Only HMAC, ECDSA, and B64HMAC are supported
-# Binary keys cannot be pasted into this config, so B64HMAC is an
-# alternative to HMAC for properly random secret strings.
-# - HMAC is a plaintext shared-secret private-key.
-# - B64HMAC is a base64-encoded version of HMAC.
-# - ECDSA is a PEM-encoded public-key.
-# - EDDSA is a PEM-encoded Ed25519 public-key.
+# Format of the 'key': HMAC, B64HMAC, ECDSA, or EDDSA, case-insensitive.
+#
+# HMAC is a plaintext shared secret, and B64HMAC (also spelled HMACB64)
+# is the same secret base64-encoded in the standard alphabet with '='
+# padding, for random binary secrets that cannot be pasted as text.
+# ECDSA and EDDSA are PEM-encoded public keys, EDDSA for Ed25519.
+# Startup and reload both refuse an unknown format while JWT is enabled.
 #
 # reloadable: yes
 #
@@ -3759,7 +3831,10 @@
 #
 #register_user = true
 
-# JWT algorithm
+# Signature algorithm for validating tokens.
+#
+# The name must suit the key format: HS256, HS384, or HS512 for HMAC
+# and B64HMAC, ES256 or ES384 for ECDSA, and EdDSA for EDDSA.
 #
 # reloadable: yes
 #
@@ -3814,6 +3889,78 @@
 # reloadable: yes
 #
 #validate_signature = true
+
+
+
+#[global.rate_limiting]
+
+
+
+#[global.rate_limiting.login]
+
+
+
+#[global.rate_limiting.login.failed]
+
+# Token-bucket refill rate (failures per second) for wrong passwords
+# against one account.
+#
+# Every password attempt takes a token before the password is checked,
+# and only a wrong password keeps it; once the bucket is empty, even the
+# owner's correct password is refused with `M_LIMIT_EXCEEDED`. Applies to
+# `/login` (but not to the LDAP binds it makes), the built-in OIDC login
+# page and password re-entry for sensitive actions (UIAA), keyed on the
+# account. Mirrors Synapse's `rc_login.failed_attempts` and its default:
+# `burst_count` failures, then about one attempt every six seconds, or
+# some 14,700 a day.
+#
+# `0` disables this limit rather than making a bucket that never refills.
+#
+# reloadable: yes
+#
+#per_second = 0.17
+
+# Token-bucket depth (burst size) for wrong passwords against one
+# account.
+#
+# The number of failures allowed before `per_second` governs. `0`
+# disables this limit, as does a `0` rate. The default is Synapse's
+# `rc_login.failed_attempts.burst_count`.
+#
+# reloadable: yes
+#
+#burst_count = 3
+
+
+
+#[global.rate_limiting.login.account]
+
+# Token-bucket refill rate (sign-ins per second) for successful password
+# logins to one account.
+#
+# Applies to `/login` with `m.login.password` (but not to the LDAP binds it
+# makes) and to the built-in OIDC login page, keyed on the account rather
+# than the client IP. Mirrors Synapse's `rc_login.account` and its default
+# of `burst_count` sign-ins, then about one every five and a half minutes;
+# once those are used up, a correct password is refused with
+# `M_LIMIT_EXCEEDED`.
+#
+# `0` disables this limit rather than making a bucket that never refills.
+#
+# reloadable: yes
+#
+#per_second = 0.003
+
+# Token-bucket depth (burst size) for successful password logins to one
+# account.
+#
+# The number of sign-ins allowed before `per_second` governs. `0` disables
+# this limit, as does a `0` rate. The default is Synapse's
+# `rc_login.account.burst_count`.
+#
+# reloadable: yes
+#
+#burst_count = 5
 
 
 
@@ -4245,6 +4392,65 @@
 # Only set this to false if you expect a provider to be down at startup or
 # for development/testing purposes; checks are disabled when the server
 # is started in '--maintenance' mode.
+#
+#startup_check = true
+
+
+
+#[global.storage_provider.<ID>.gcs]
+
+# The name of the GCS bucket, e.g. "my-media-bucket". Required; an unset
+# bucket disables this provider.
+#
+# A `gs://bucket/path` URL is intentionally not accepted here: the path
+# component would not be applied as an object prefix. Set `bucket` and
+# `base_path` separately instead.
+#
+#bucket =
+
+# Optional path prefix within the bucket where all our operations will take
+# place.
+#
+#base_path =
+
+# (expert use) Path to a Google service account key file. Leave unset to
+# resolve credentials from the environment, which on GCE/GKE ends at the
+# instance metadata server; that is the keyless path and the recommended
+# configuration. Setting this requires exported key material.
+#
+#service_account_path =
+
+# (expert use) Path to an application default credentials file. Leave unset
+# to resolve credentials from the environment. Only service-account and
+# authorized-user documents are recognised, not every
+# external-account/workload-identity-federation file format.
+#
+#application_credentials_path =
+
+# (expert use) Threshold size for switching to multi-part uploads. This value
+# determines what a "large" upload is. The value is a parsed string allowing
+# SI or IEC units for convenience.
+#
+#multipart_threshold = 100 MiB
+
+# (expert use) Size of each individual part within a multi-part upload. Once
+# an upload exceeds `multipart_threshold` the payload is split into parts of
+# this size, each sent as a separate request. The value is a parsed string
+# allowing SI or IEC units for convenience.
+#
+#multipart_part_size = 10 MiB
+
+# (developer use) Allows skipping request signatures.
+#
+#use_signatures = true
+
+# (developer use) Enables checks performed at startup, such as probing the
+# provider. Failures are considered critical startup errors and abort
+# startup. When set to false, faulty providers are only discovered on first
+# use and will not be fatal errors.
+#
+# The check is a listing probe: it requires `storage.objects.list`, proves
+# neither write nor delete permission, and passes on an empty bucket.
 #
 #startup_check = true
 

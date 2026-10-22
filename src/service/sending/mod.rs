@@ -7,15 +7,17 @@ mod tests;
 mod worker;
 
 use std::{
+	collections::HashMap,
 	io::Write,
 	iter::{once, repeat_with},
 	sync::{Arc, Mutex as StdMutex},
+	time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use loole::unbounded;
-use ruma::{RoomId, ServerName, UserId};
+use ruma::{OwnedServerName, RoomId, ServerName, UserId};
 use tokio::task::JoinSet;
 use tuwunel_core::{
 	Result, Server, debug_warn, implement,
@@ -25,11 +27,13 @@ use tuwunel_core::{
 
 use self::worker::num_senders;
 pub use self::{
-	data::Data,
+	data::{Data, Park},
 	dest::Destination,
 	sender::{EDU_LIMIT, PDU_LIMIT},
 };
 use crate::rooms::timeline::RawPduId;
+
+type StalledDestinations = StdMutex<HashMap<OwnedServerName, Option<Instant>>>;
 
 /// Outbound delivery of PDUs and EDUs to federation peers, appservices, and
 /// push gateways.
@@ -44,6 +48,9 @@ pub struct Service {
 
 	// Aborted and joined when the service stops.
 	flushes: StdMutex<JoinSet<()>>,
+
+	// One entry per worker-owned federation destination waiting for replay.
+	stalled: StalledDestinations,
 }
 
 /// One queued unit of delivery.
@@ -114,6 +121,7 @@ impl crate::Service for Service {
 			services: args.services.clone(),
 			channels,
 			flushes: JoinSet::new().into(),
+			stalled: HashMap::new().into(),
 		}))
 	}
 
@@ -122,8 +130,6 @@ impl crate::Service for Service {
 	async fn interrupt(&self) { self.close(); }
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
-
-	fn unconstrained(&self) -> bool { true }
 }
 
 /// Queue a PDU for delivery to one of a user's pushers.
@@ -397,8 +403,9 @@ pub fn flush_appservice(&self, appservice_id: String) -> Result {
 /// Wake the sender for a federation peer that has proven reachable.
 ///
 /// Reachability comes from inbound activity or an operator reset. The flush
-/// is dispatched only when the peer was in its failure bucket, and the return
-/// value reports whether it was.
+/// resumes a waiting sender generation after its notification floor, or
+/// immediately when peer failure rows existed. The return value reports only
+/// whether those peer rows existed.
 #[implement(Service)]
 #[tracing::instrument(
 	level = "debug",
@@ -414,7 +421,19 @@ pub async fn notify_peer_alive(&self, server: &ServerName) -> bool {
 		.note_peer_alive(server)
 		.await;
 
-	if sad {
+	let replay = sad
+		|| self
+			.stalled
+			.lock()
+			.expect("locked")
+			.get(server)
+			.is_some_and(|last| {
+				last.is_none_or(|last| {
+					last.elapsed() >= Duration::from_secs(self.server.config.sender_timeout)
+				})
+			});
+
+	if replay {
 		self.dispatch_flush(Destination::Federation(server.to_owned()))
 			.log_err()
 			.ok();

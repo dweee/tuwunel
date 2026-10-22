@@ -32,7 +32,8 @@ pub(super) use self::{
 };
 // Aliased to keep the subsystem visible where the sibling routes stay qualified.
 use crate::{
-	client, oidc,
+	client::{self, sso_callback_route as client_sso_callback},
+	oidc,
 	oidc::{complete_route as oidc_complete, post_complete_route as oidc_post_complete},
 	server,
 };
@@ -83,7 +84,7 @@ fn register_client_auth_routes(router: Router<State>) -> Router<State> {
 		.ruma_route(&client::refresh_token_route)
 		.ruma_route(&client::sso_login_route)
 		.ruma_route(&client::sso_login_with_provider_route)
-		.ruma_route(&client::sso_callback_route)
+		.route("/_matrix/client/unstable/login/sso/callback/{idp_id}", get(client_sso_callback))
 		.ruma_route(&client::sso_fallback_route)
 		.ruma_route(&client::whoami_route)
 		.ruma_route(&client::logout_route)
@@ -143,8 +144,14 @@ fn register_synapse_admin_users_routes(router: Router<State>, mas_active: bool) 
 		// whois is served at the /_synapse admin path and the client-server admin
 		// aliases where Synapse also mounts it.
 		.route("/_synapse/admin/v1/whois/{user_id}", get(client::users::admin_whois_route))
-		.route("/_matrix/client/v3/admin/whois/{user_id}", get(client::users::admin_whois_route))
-		.route("/_matrix/client/r0/admin/whois/{user_id}", get(client::users::admin_whois_route))
+		.route(
+			"/_matrix/client/v3/admin/whois/{user_id}",
+			get(client::users::admin_whois_route),
+		)
+		.route(
+			"/_matrix/client/r0/admin/whois/{user_id}",
+			get(client::users::admin_whois_route),
+		)
 		.route(
 			"/_matrix/client/unstable/admin/whois/{user_id}",
 			get(client::users::admin_whois_route),
