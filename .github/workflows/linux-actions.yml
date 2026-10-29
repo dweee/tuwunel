@@ -97,6 +97,12 @@ jobs:
             echo "Package build: ${SECONDS}s"
             cat outputs.txt
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report closure transfer size without listing paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < outputs.txt
+          nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
       - name: Save selected runtime closures independently of cache publication
         timeout-minutes: 15
         env:
@@ -219,6 +225,12 @@ jobs:
             echo "Package build: ${SECONDS}s"
             cat outputs.txt
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report closure transfer size without listing paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < outputs.txt
+          nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
       - name: Save selected runtime closures independently of cache publication
         timeout-minutes: 15
         env:
