@@ -102,6 +102,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t outputs < outputs.txt
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print "Workspace available bytes:", $4 * 1024}'
           nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
       - name: Save selected runtime closures independently of cache publication
         timeout-minutes: 15
@@ -230,6 +231,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t outputs < outputs.txt
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print "Workspace available bytes:", $4 * 1024}'
           nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
       - name: Save selected runtime closures independently of cache publication
         timeout-minutes: 15
