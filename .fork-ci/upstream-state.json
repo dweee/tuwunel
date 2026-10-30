@@ -1,0 +1,10 @@
+{
+  "release": {
+    "id": 409023959,
+    "sha": "f473d9a4a8342514302884041e0ccfea1ad503fc",
+    "tag": "v1.9.4"
+  },
+  "track": "release",
+  "upstream": "matrix-construct/tuwunel",
+  "version": 1
+}
