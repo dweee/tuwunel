@@ -57,18 +57,24 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c
+      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
         with:
-          nix_version: 2.34.7
-          enable_kvm: false
-          nix_conf: |
-            experimental-features = nix-command flakes
+          source-tag: v3.24.1
+          summarize: false
+          kvm: false
+          extra-conf: |
+            experimental-features = nix-command flakes parallel-eval
+            eval-cores = 2
             accept-flake-config = false
             substituters = https://cache.nixos.org/
             extra-substituters =
             extra-trusted-public-keys = flakey:mDx4DiNpH5w1Pl8OAKFFWq1ZsypA9lbaFKNiRWhqYE8=
             max-jobs = 1
             cores = 2
+      - name: Verify Determinate client and daemon
+        run: |
+          nix --version | grep -F 'Determinate Nix 3.24.1'
+          nix store info --store daemon --json
       - name: Configure authenticated private cache reads for trusted builds
         if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}',
           github.event.repository.default_branch) }}
@@ -91,10 +97,17 @@ jobs:
             echo "Package build: ${SECONDS}s"
             cat outputs.txt
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report closure transfer size without listing paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < outputs.txt
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print "Workspace available bytes:", $4 * 1024}'
+          nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
       - name: Save selected runtime closures independently of cache publication
         timeout-minutes: 15
         env:
-          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+          ATTIC_MAX_CLOSURE_MIB: "6144"
         run: python3 ci/transfer-attic.py export --directory attic-transfer
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -119,15 +132,21 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c
+      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
         with:
-          nix_version: 2.34.7
-          enable_kvm: false
-          nix_conf: |
-            experimental-features = nix-command flakes
+          source-tag: v3.24.1
+          summarize: false
+          kvm: false
+          extra-conf: |
+            experimental-features = nix-command flakes parallel-eval
+            eval-cores = 2
             accept-flake-config = false
             substituters = https://cache.nixos.org/
             extra-substituters =
+      - name: Verify Determinate client and daemon
+        run: |
+          nix --version | grep -F 'Determinate Nix 3.24.1'
+          nix store info --store daemon --json
       - name: Install the trusted pinned Attic client before importing build data
         id: attic
         timeout-minutes: 15
@@ -143,7 +162,7 @@ jobs:
       - name: Import data without running any package programs
         timeout-minutes: 15
         env:
-          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+          ATTIC_MAX_CLOSURE_MIB: "6144"
         run: python3 ci/transfer-attic.py import --directory attic-transfer
       - name: Publish imported package outputs to Attic
         timeout-minutes: 30
@@ -167,18 +186,24 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c
+      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
         with:
-          nix_version: 2.34.7
-          enable_kvm: false
-          nix_conf: |
-            experimental-features = nix-command flakes
+          source-tag: v3.24.1
+          summarize: false
+          kvm: false
+          extra-conf: |
+            experimental-features = nix-command flakes parallel-eval
+            eval-cores = 2
             accept-flake-config = false
             substituters = https://cache.nixos.org/
             extra-substituters =
             extra-trusted-public-keys = flakey:mDx4DiNpH5w1Pl8OAKFFWq1ZsypA9lbaFKNiRWhqYE8=
             max-jobs = 1
             cores = 2
+      - name: Verify Determinate client and daemon
+        run: |
+          nix --version | grep -F 'Determinate Nix 3.24.1'
+          nix store info --store daemon --json
       - name: Configure authenticated private cache reads for trusted builds
         if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}',
           github.event.repository.default_branch) }}
@@ -201,10 +226,17 @@ jobs:
             echo "Package build: ${SECONDS}s"
             cat outputs.txt
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report closure transfer size without listing paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < outputs.txt
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print "Workspace available bytes:", $4 * 1024}'
+          nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
       - name: Save selected runtime closures independently of cache publication
         timeout-minutes: 15
         env:
-          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+          ATTIC_MAX_CLOSURE_MIB: "6144"
         run: python3 ci/transfer-attic.py export --directory attic-transfer
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -231,15 +263,21 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c
+      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
         with:
-          nix_version: 2.34.7
-          enable_kvm: false
-          nix_conf: |
-            experimental-features = nix-command flakes
+          source-tag: v3.24.1
+          summarize: false
+          kvm: false
+          extra-conf: |
+            experimental-features = nix-command flakes parallel-eval
+            eval-cores = 2
             accept-flake-config = false
             substituters = https://cache.nixos.org/
             extra-substituters =
+      - name: Verify Determinate client and daemon
+        run: |
+          nix --version | grep -F 'Determinate Nix 3.24.1'
+          nix store info --store daemon --json
       - name: Install the trusted pinned Attic client before importing build data
         id: attic
         timeout-minutes: 15
@@ -255,7 +293,7 @@ jobs:
       - name: Import data without running any package programs
         timeout-minutes: 15
         env:
-          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+          ATTIC_MAX_CLOSURE_MIB: "6144"
         run: python3 ci/transfer-attic.py import --directory attic-transfer
       - name: Publish imported package outputs to Attic
         timeout-minutes: 30

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Transfer selected Nix outputs between disposable jobs without running them."""
 import argparse
+import errno
 import gzip
-import importlib.util
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,10 +12,14 @@ import re
 import subprocess
 import sys
 
-
-spec = importlib.util.spec_from_file_location("public_closure", Path(__file__).with_name("public-closure.py"))
+spec = importlib.util.spec_from_file_location('public_closure', Path(__file__).with_name('public-closure.py'))
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
+
+
+class TransferSizeExceeded(ValueError):
+    """The uncompressed transfer stream exceeded its configured limit."""
+
 
 def roots(manifest):
     if manifest.stat().st_size > 1024 * 1024:
@@ -31,7 +36,7 @@ def copy_bounded(source, target, limit):
     while chunk := source.read(1024 * 1024):
         total += len(chunk)
         if total > limit:
-            raise ValueError("Closure transfer exceeds ATTIC_MAX_CLOSURE_MIB")
+            raise TransferSizeExceeded()
         target.write(chunk)
     return total
 
@@ -43,7 +48,7 @@ def transfer(mode, directory, limit):
     manifest = directory / "outputs.txt"
     if mode == "export":
         paths = roots(Path("outputs.txt"))
-        # This must run before an archive or public artifact is created.
+        # Reject denied runtime paths before an archive or public artifact exists.
         requisites = policy.runtime(paths)
         if any(not re.fullmatch(r"/nix/store/[a-z0-9]{32}-[^/\s]+", p) for p in requisites):
             raise ValueError("Invalid closure paths")
@@ -100,10 +105,19 @@ def main():
     args = parser.parse_args()
     try:
         mib = int(os.environ.get("ATTIC_MAX_CLOSURE_MIB") or "2048")
-        if not 1 <= mib <= 4096:
-            raise ValueError("Closure transfer limit must be between 1 and 4096 MiB")
+        if not 1 <= mib <= 8192:
+            raise ValueError("Closure transfer limit must be between 1 and 8192 MiB")
         transfer(args.mode, args.directory, mib * 1024 * 1024)
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except TransferSizeExceeded:
+        print("Nix closure transfer exceeded ATTIC_MAX_CLOSURE_MIB; no cache publication is authorized.", file=sys.stderr)
+        return 1
+    except OSError as error:
+        if error.errno in (errno.ENOSPC, errno.EDQUOT):
+            print("Nix closure transfer ran out of disk space or quota; no cache publication is authorized.", file=sys.stderr)
+        else:
+            print("Nix closure transfer failed; no cache publication is authorized.", file=sys.stderr)
+        return 1
+    except (ValueError, subprocess.SubprocessError):
         print("Nix closure transfer failed; no cache publication is authorized.", file=sys.stderr)
         return 1
     return 0
