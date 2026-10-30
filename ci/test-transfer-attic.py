@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import errno
 import io
 import gzip
 import subprocess
@@ -14,6 +16,29 @@ spec.loader.exec_module(module)
 
 
 class TransferSafetyTests(unittest.TestCase):
+    def test_transfer_limit_is_bounded_at_eight_gib(self):
+        for value, expected in [('6144', 0), ('8192', 0), ('8193', 1)]:
+            with self.subTest(value=value), patch.dict(os.environ, {'ATTIC_MAX_CLOSURE_MIB': value}), \
+                    patch.object(module, 'transfer') as transfer, \
+                    patch('sys.argv', ['transfer', 'export', '--directory', '/tmp/fixture']), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(module.main(), expected)
+                if expected:
+                    transfer.assert_not_called()
+                else:
+                    self.assertEqual(transfer.call_args.args[2], int(value) * 1024 * 1024)
+
+    def test_transfer_failure_categories_do_not_expose_details(self):
+        for error, expected in [(module.TransferSizeExceeded('secret'), 'exceeded ATTIC_MAX_CLOSURE_MIB'),
+                                (OSError(errno.ENOSPC, 'secret'), 'disk space or quota'),
+                                (ValueError('secret'), 'transfer failed')]:
+            with self.subTest(error=error), patch.object(module, 'transfer', side_effect=error), \
+                    patch('sys.argv', ['transfer', 'export', '--directory', '/tmp/fixture']), \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(module.main(), 1)
+                self.assertIn(expected, stderr.getvalue())
+                self.assertNotIn('secret', stderr.getvalue())
+
     def test_oversize_stream_is_rejected_before_excess_is_written(self):
         target = io.BytesIO()
         with self.assertRaises(ValueError): module.copy_bounded(io.BytesIO(b'x' * 1025), target, 1024)

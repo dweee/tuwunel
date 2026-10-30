@@ -107,7 +107,7 @@ jobs:
       - name: Save selected runtime closures independently of cache publication
         timeout-minutes: 15
         env:
-          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+          ATTIC_MAX_CLOSURE_MIB: "6144"
         run: python3 ci/transfer-attic.py export --directory attic-transfer
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -162,7 +162,7 @@ jobs:
       - name: Import data without running any package programs
         timeout-minutes: 15
         env:
-          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+          ATTIC_MAX_CLOSURE_MIB: "6144"
         run: python3 ci/transfer-attic.py import --directory attic-transfer
       - name: Publish imported package outputs to Attic
         timeout-minutes: 30
@@ -236,7 +236,7 @@ jobs:
       - name: Save selected runtime closures independently of cache publication
         timeout-minutes: 15
         env:
-          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+          ATTIC_MAX_CLOSURE_MIB: "6144"
         run: python3 ci/transfer-attic.py export --directory attic-transfer
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -293,7 +293,7 @@ jobs:
       - name: Import data without running any package programs
         timeout-minutes: 15
         env:
-          ATTIC_MAX_CLOSURE_MIB: ${{ vars.ATTIC_MAX_CLOSURE_MIB || '4096' }}
+          ATTIC_MAX_CLOSURE_MIB: "6144"
         run: python3 ci/transfer-attic.py import --directory attic-transfer
       - name: Publish imported package outputs to Attic
         timeout-minutes: 30
