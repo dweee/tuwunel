@@ -7,7 +7,9 @@ use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
-	Result, implement,
+	Result,
+	config::check::reload,
+	implement,
 	ruma::{UserId, profile::ProfileFieldName},
 };
 use tuwunel_service::Services;
@@ -39,7 +41,8 @@ fn serves_visible_profiles_without_acknowledging_failures() -> Result {
 		.with_option(format!("port={port}"))
 		.with_option("listening=true")
 		.with_option("allow_local_presence=false")
-		.with_option("allow_outgoing_presence=false");
+		.with_option("allow_outgoing_presence=false")
+		.with_option("max_profile_fields_per_request=2");
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -142,7 +145,113 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	read_failures(&owner, &peer_id, room.as_str()).await?;
 	membership_failures(&owner, &owner_id, &peer_id, room.as_str()).await?;
 	cleared_fields(&owner, &peer_id, room.as_str()).await?;
-	departed_profile(&owner, &peer, &peer_id, room.as_str()).await
+	departed_profile(&owner, &peer, &peer_id, room.as_str()).await?;
+	room_admission(&owner, &peer, &owner_id, &peer_id).await?;
+	selector_limits(&owner, &owner_id).await
+}
+
+#[tracing::instrument(level = "trace", skip_all)]
+async fn selector_limits(owner: &Client<'_>, owner_id: &UserId) -> Result {
+	for fields in [json!([STATUS, STATUS, STATUS]), json!(["a".repeat(256)])] {
+		let response = owner
+			.sync_field_selection("rejected", None, Some(&fields))
+			.await?;
+
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+	}
+
+	let boundary = json!(["a".repeat(255), STATUS]);
+
+	owner
+		.sync_field_selection("boundary", None, Some(&boundary))
+		.await?
+		.error_for_status()?;
+
+	let duplicate = json!([STATUS, STATUS]);
+
+	owner
+		.sync_field_selection("duplicate", None, Some(&duplicate))
+		.await?
+		.error_for_status()?;
+
+	let selected = json!([STATUS, "displayname"]);
+	let opening: Value = owner
+		.sync_field_selection("tightened", None, Some(&selected))
+		.await?
+		.error_for_status()?
+		.json()
+		.await?;
+
+	let pos = field(&opening, "pos")?;
+	let mut config = (*owner.services.server.config.clone()).clone();
+
+	config.max_profile_fields_per_request = 1;
+	reload(&owner.services.config, &config)?;
+	owner.services.server.config.update(config)?;
+
+	let response = owner
+		.sync_field_selection("tightened", Some(pos), None)
+		.await?;
+
+	assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+	let selected = json!([STATUS]);
+
+	owner
+		.sync_field_selection("tightened", Some(pos), Some(&selected))
+		.await?
+		.error_for_status()?;
+
+	set_status(owner.services, owner_id, "selected").await?;
+
+	let unfiltered: Value = owner
+		.sync_field_selection("all-fields", None, None)
+		.await?
+		.error_for_status()?
+		.json()
+		.await?;
+
+	assert_eq!(update(&unfiltered, owner_id)[STATUS]["text"], "selected");
+
+	let empty: Value = owner
+		.sync_field_selection("no-fields", None, Some(&json!([])))
+		.await?
+		.error_for_status()?
+		.json()
+		.await?;
+
+	assert!(update(&empty, owner_id).is_null());
+
+	Ok(())
+}
+
+#[implement(Client, params = "<'_>")]
+#[tracing::instrument(level = "trace", skip_all)]
+async fn sync_field_selection(
+	&self,
+	conn: &str,
+	pos: Option<&str>,
+	fields: Option<&Value>,
+) -> Result<Response> {
+	let mut body = json!({
+		"conn_id": conn,
+		"extensions": { PROFILES: { "enabled": true } },
+	});
+
+	if let Some(fields) = fields {
+		body["extensions"][PROFILES]["fields"] = fields.clone();
+	}
+
+	let query = pos
+		.map(|pos| format!("?pos={pos}&timeout=0"))
+		.unwrap_or_default();
+
+	let url = format!(
+		"{}/_matrix/client/unstable/org.matrix.simplified_msc3575/sync{query}",
+		self.base
+	);
+
+	self.post_url(&url, &body).await
 }
 
 #[tracing::instrument(level = "trace", skip_all)]
@@ -391,6 +500,97 @@ async fn departed_profile(
 
 		assert!(update(&response, peer_id).is_null(), "a departed peer leaked its profile");
 	}
+
+	Ok(())
+}
+
+#[tracing::instrument(level = "trace", skip_all)]
+async fn room_admission(
+	owner: &Client<'_>,
+	peer: &Client<'_>,
+	owner_id: &UserId,
+	peer_id: &UserId,
+) -> Result {
+	let shared = owner
+		.create_room(&json!({ "preset": "public_chat" }))
+		.await?;
+
+	let denied = peer
+		.create_room(&json!({
+			"preset": "public_chat",
+			"initial_state": [{
+				"type": "m.room.join_rules", "state_key": "",
+				"content": { "join_rule": "knock" }
+			}],
+		}))
+		.await?;
+
+	peer.post(&format!("rooms/{shared}/join"), &json!({}))
+		.await?;
+
+	peer.post(&format!("rooms/{denied}/invite"), &json!({ "user_id": owner_id }))
+		.await?;
+
+	owner
+		.post(&format!("rooms/{denied}/join"), &json!({}))
+		.await?;
+
+	let opening = owner
+		.sync_profiles("room-admission", denied.as_str(), None)
+		.await?;
+
+	let pos = field(&opening, "pos")?;
+
+	owner
+		.post(&format!("rooms/{denied}/leave"), &json!({}))
+		.await?;
+
+	set_status(owner.services, peer_id, "not joined").await?;
+
+	let departed = owner
+		.sync_profiles("room-admission", denied.as_str(), Some(pos))
+		.await?;
+
+	assert!(update(&departed, peer_id).is_null());
+
+	peer.post(&format!("rooms/{denied}/invite"), &json!({ "user_id": owner_id }))
+		.await?;
+
+	denied_room_change(owner, peer_id, denied.as_str(), "invited").await?;
+	owner
+		.post(&format!("rooms/{denied}/leave"), &json!({}))
+		.await?;
+
+	owner
+		.post(&format!("knock/{denied}"), &json!({}))
+		.await?;
+
+	denied_room_change(owner, peer_id, denied.as_str(), "knocking").await?;
+
+	let joined = owner
+		.sync_profiles("joined-control", shared.as_str(), None)
+		.await?;
+
+	assert_eq!(update(&joined, peer_id)[STATUS]["text"], "knocking");
+
+	Ok(())
+}
+
+#[tracing::instrument(level = "trace", skip_all)]
+async fn denied_room_change(
+	owner: &Client<'_>,
+	peer_id: &UserId,
+	room: &str,
+	conn: &str,
+) -> Result {
+	let opening = owner.sync_profiles(conn, room, None).await?;
+	let pos = field(&opening, "pos")?;
+
+	set_status(owner.services, peer_id, conn).await?;
+
+	let response = owner.sync_profiles(conn, room, Some(pos)).await?;
+
+	assert!(update(&response, peer_id).is_null());
 
 	Ok(())
 }

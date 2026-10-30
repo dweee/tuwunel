@@ -8,6 +8,7 @@ mod content;
 mod filter;
 mod format;
 mod id;
+mod msgtype;
 mod redact;
 mod relation;
 pub mod state_key;
@@ -18,24 +19,30 @@ use std::fmt::Debug;
 
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, UserId,
-	events::{AnySyncMessageLikeEvent, TimelineEventType},
+	events::{AnySyncMessageLikeEvent, TimelineEventType, room::member::MembershipState},
 	room_version_rules::RoomVersionRules,
 	serde::Raw,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, value::RawValue as RawJsonValue};
 
-use self::format::to_sync_message_like_without_unsigned;
 pub use self::{
 	filter::{Matches, trim_event_fields},
 	format::{Owned, Ref},
 	id::*,
+	msgtype::MsgType,
 	relation::RelationTypeEqual,
 	state_key::{StateKey, TypeStateKey},
 	type_ext::TypeExt,
 };
+use self::{format::to_sync_message_like_without_unsigned, msgtype::content_msgtype};
 use super::pdu::Pdu;
-use crate::{Result, utils};
+use crate::{Result, utils, utils::BoolExt};
+
+#[derive(Deserialize)]
+struct MemberContent {
+	membership: MembershipState,
+}
 
 /// Abstraction of a PDU so users can have their own PDU types.
 pub trait Event: Clone + Debug + Send + Sync {
@@ -46,6 +53,21 @@ pub trait Event: Clone + Debug + Send + Sync {
 	#[inline]
 	fn is_type_and_state_key(&self, kind: &TimelineEventType, state_key: &str) -> bool {
 		self.kind() == kind && self.state_key() == Some(state_key)
+	}
+
+	/// The membership this event sets for a user, when it is that user's own
+	/// member event.
+	///
+	/// Any other event yields `None`, as does member content whose `membership`
+	/// does not parse. Only that one field is deserialized.
+	#[inline]
+	fn membership_for(&self, user_id: &UserId) -> Option<MembershipState>
+	where
+		Self: Sized,
+	{
+		self.is_type_and_state_key(&TimelineEventType::RoomMember, user_id.as_str())
+			.and_then(|| self.get_content().ok())
+			.map(|content: MemberContent| content.membership)
 	}
 
 	/// Serialize into a Ruma JSON format, consuming.
@@ -159,6 +181,18 @@ pub trait Event: Clone + Debug + Send + Sync {
 		Self: Sized,
 	{
 		content::get::<T, _>(self)
+	}
+
+	/// Reads the `msgtype` of this event's message content.
+	///
+	/// Only that one field is deserialized, and the event type is not checked.
+	/// Content with no readable `msgtype` returns `None`.
+	#[inline]
+	fn msgtype(&self) -> Option<MsgType>
+	where
+		Self: Sized,
+	{
+		content_msgtype(self)
 	}
 
 	/// Resolves the event ID targeted by a redaction event.

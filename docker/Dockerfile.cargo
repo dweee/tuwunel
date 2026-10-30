@@ -13,6 +13,7 @@ ARG RUSTUP_HOME
 ARG CARGO_HOME
 ARG CARGO_TARGET
 ARG CARGO_TARGET_DIR
+ARG LTO_CACHE_DIR
 ARG CARGO_TERM_VERBOSE=0
 ARG RUST_BACKTRACE
 ARG JEMALLOC_OVERRIDE
@@ -25,8 +26,13 @@ ARG CARGO_PROFILE_TEST_INCREMENTAL
 ARG CARGO_PROFILE_BENCH_DEBUG
 ARG CARGO_PROFILE_BENCH_LTO
 ARG CARGO_PROFILE_RELEASE_LTO
+ARG CARGO_PROFILE_RELEASE_NATIVE_LTO
 ARG CARGO_PROFILE_RELEASE_DEBUGINFO_DEBUG
 ARG CARGO_PROFILE_RELEASE_DEBUGINFO_LTO
+ARG CC
+ARG CXX
+ARG AR
+ARG RANLIB
 ARG cargo_profile
 ARG cargo_features
 ARG cargo_spec_features
@@ -59,22 +65,33 @@ ENV ROCKSDB_INCLUDE_DIR="${ROCKSDB_INCLUDE_DIR}"
 # before main). An empty CXXSTDLIB suppresses that directive. Must match the
 # cargo stage's value or the build script re-emits it (rerun-if-env-changed).
 ENV CXXSTDLIB=""
+ENV CC="${CC}"
+ENV CXX="${CXX}"
+ENV AR="${AR}"
+ENV RANLIB="${RANLIB}"
+ENV CFLAGS="-target ${CARGO_TARGET}"
+ENV CXXFLAGS="-target ${CARGO_TARGET}"
 ENV RUSTDOCFLAGS="${RUSTDOCFLAGS}"
 ENV CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG}"
 ENV CARGO_PROFILE_TEST_INCREMENTAL="${CARGO_PROFILE_TEST_INCREMENTAL}"
 ENV CARGO_PROFILE_BENCH_DEBUG="${CARGO_PROFILE_BENCH_DEBUG}"
 ENV CARGO_PROFILE_BENCH_LTO="${CARGO_PROFILE_BENCH_LTO}"
 ENV CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO}"
+ENV CARGO_PROFILE_RELEASE_NATIVE_LTO="${CARGO_PROFILE_RELEASE_NATIVE_LTO}"
 ENV CARGO_PROFILE_RELEASE_DEBUGINFO_DEBUG="${CARGO_PROFILE_RELEASE_DEBUGINFO_DEBUG}"
 ENV CARGO_PROFILE_RELEASE_DEBUGINFO_LTO="${CARGO_PROFILE_RELEASE_DEBUGINFO_LTO}"
 ENV CARGO_BUILD_RUSTFLAGS="${CARGO_BUILD_RUSTFLAGS}"
 ENV CARGO_TARGET_DIR="${CARGO_TARGET_DIR}"
 ENV sched_policy=${sched_policy}
 ENV sched_prio=${sched_prio}
+RUN ln -s \
+    "$(rustc --print sysroot)/lib/rustlib/${CARGO_TARGET}/bin/rust-lld" \
+    /usr/local/bin/ld.lld
 RUN \
 --mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
+--mount=type=cache,id=tuwunel-lto-${rust_toolchain}-${CARGO_TARGET}-${cargo_profile},dst=${LTO_CACHE_DIR},sharing=shared \
 <<EOF
     set -eux
     ulimit -n 65535
@@ -110,6 +127,7 @@ ARG RUSTUP_HOME
 ARG CARGO_HOME
 ARG CARGO_TARGET
 ARG CARGO_TARGET_DIR
+ARG LTO_CACHE_DIR
 ARG cargo_profile
 ARG cargo_target_profile
 ARG cargo_target_prune=""
@@ -124,6 +142,10 @@ ARG VALGRIND_MAX_WORKERS=64
 ARG ROCKSDB_PARALLELISM_THREADS=2
 ARG sched_policy="--batch"
 ARG sched_prio=0
+ARG sched_scope=""
+ARG sched_cpus=""
+ARG cargo_test_timeout=""
+ARG tokio_worker_threads=""
 
 WORKDIR /
 COPY --link --from=source /usr/src/tuwunel /usr/src/tuwunel
@@ -139,13 +161,33 @@ ENV TUWUNEL_DB_POOL_MAX_WORKERS="${VALGRIND_MAX_WORKERS}"
 ENV TUWUNEL_ROCKSDB_PARALLELISM_THREADS="${ROCKSDB_PARALLELISM_THREADS}"
 ENV sched_policy=${sched_policy}
 ENV sched_prio=${sched_prio}
+ENV sched_scope=${sched_scope}
+ENV sched_cpus=${sched_cpus}
 RUN \
 --mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/registry,sharing=locked \
 --mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
+--mount=type=cache,id=tuwunel-lto-${rust_toolchain}-${CARGO_TARGET}-${cargo_profile},dst=${LTO_CACHE_DIR},sharing=shared \
 <<EOF
     set -eux
     ulimit -n 65535
+
+    # A deadline on each test binary turns a hang into a failure naming that
+    # binary, and --no-fail-fast still runs the rest. It goes in cargo's
+    # runner so it reaches only the executables cargo launches; sched_wrap.sh
+    # keeps a runner already set and runs it under its scheduling prefix.
+    if test -n "${cargo_test_timeout}"; then
+        runner="CARGO_TARGET_$(tr 'a-z.-' 'A-Z__' <<< "${CARGO_TARGET}")_RUNNER"
+        export "${runner}=timeout --signal=TERM --kill-after=30s ${cargo_test_timeout}"
+    fi
+
+    # Every server boot sizes tokio to the host's cores, and a test that boots
+    # repeatedly can leave earlier workers running; valgrind aborts a process
+    # past 500 threads, so a target testing under it pins the count. Exported
+    # only when set: an empty value fails argument parsing.
+    if test -n "${tokio_worker_threads}"; then
+        export TOKIO_WORKER_THREADS="${tokio_worker_threads}"
+    fi
 
     example_sha=$(sha1sum tuwunel-example.toml)
 

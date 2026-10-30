@@ -2,6 +2,7 @@ mod dispatch;
 mod netburst;
 mod response;
 mod select;
+mod split;
 #[cfg(test)]
 mod tests;
 mod wake;
@@ -22,29 +23,54 @@ use tuwunel_core::{
 	Result, implement,
 	smallvec::{SmallVec, smallvec},
 	trace,
+	utils::BoolExt,
 };
 
-use self::dispatch::SendingFuture;
+use self::{
+	dispatch::{Completion, SendingFuture},
+	select::Selection,
+	split::Split,
+	wake::{arm_park_wake, arm_wake, is_armed},
+};
 use super::{Destination, Msg, SendingEvent, Service, data::QueueItem};
 
 /// In-flight bookkeeping for one `Destination`.
 ///
-/// Cross-attempt backoff lives in `peer_status` (federation only); appservice
-/// and push paths keep their own status because they are not server-keyed.
+/// Federation uses the peer gate when refused and the sender curve otherwise.
+/// Appservice and push retain their own destination status across retries.
 #[derive(Debug)]
 enum TransactionStatus {
 	/// A durable active generation awaiting its first dispatch after restart.
 	Pending,
-	Running,
-	RunningForceRetry,
-	/// Push backoff: the attempt count and the time of the last failure.
+
+	/// A transaction is in flight after this many consecutive failures.
+	Running {
+		tries: u32,
+	},
+
+	/// As `Running`, with a forced retry requested while it runs.
+	RunningForceRetry {
+		tries: u32,
+	},
+
+	/// Push backoff: consecutive failures and the time of the last one.
 	Failed {
 		tries: u32,
 		last: Instant,
 	},
-	/// A retry is in flight after this many failures.
+
+	/// Retry state after this many consecutive failures.
+	///
+	/// For push the retry is already in flight; for other destinations the
+	/// batch waits for its replay.
 	Retrying {
 		tries: u32,
+	},
+
+	/// As `Retrying`, while a rejected transaction's rooms are sent apart.
+	Splitting {
+		tries: u32,
+		split: Split,
 	},
 }
 
@@ -64,10 +90,9 @@ type NewEvents = SmallVec<[QueueItem; 1]>;
 
 /// Per-worker retry timer keyed by earliest-retry deadline and destination.
 ///
-/// Every recorded federation or push failure arms an entry. Stale entries are
-/// consumed by the destination's in-flight or newer failure generation. The
-/// heap is bounded by concurrently failing destinations, transient federation
-/// re-arms, and stale push entries.
+/// Every federation, appservice, or push failure arms an entry. Traffic-triggered retries
+/// can leave stale entries, which skip an in-flight transaction or replay a
+/// waiting one. Multiple entries may therefore remain for one destination.
 type WakeQueue = BinaryHeap<Reverse<(TokioInstant, Destination)>>;
 
 const DEQUEUE_LIMIT: usize = 48;
@@ -84,6 +109,14 @@ pub const PDU_LIMIT: usize = 50;
 /// rejected and outbound composition stays under it.
 pub const EDU_LIMIT: usize = 100;
 
+/// Most bytes of serialized EDUs one federation transaction may carry.
+///
+/// A peer refuses a body past its request limit, and refused EDU rows ride along
+/// with every later transaction to it, so EDUs past this are dropped instead.
+/// The smallest limit Synapse accepts is 200 units of 64 KiB; each PDU fits in
+/// one unit and the envelope gets one, leaving the rest for EDUs.
+pub(super) const EDU_BYTES_LIMIT: usize = (200 - PDU_LIMIT - 1) * 65_536;
+
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub(super) async fn sender(self: Arc<Self>, id: usize) -> Result {
@@ -92,7 +125,7 @@ pub(super) async fn sender(self: Arc<Self>, id: usize) -> Result {
 	let mut futures = SendingFutures::new();
 	let mut wakes = WakeQueue::new();
 
-	self.startup_netburst(id, &mut futures, &mut statuses)
+	self.startup_netburst(id, &mut futures, &mut statuses, &mut wakes)
 		.boxed() // size firewall
 		.await;
 
@@ -141,7 +174,7 @@ async fn work_loop<'a>(
 				self.handle_response(response, futures, statuses, wakes).await;
 			},
 			request = receiver.recv_async() => match request {
-				Ok(request) => self.handle_request(request, futures, statuses).await,
+				Ok(request) => self.handle_request(request, futures, statuses, wakes).await,
 				Err(_) => return,
 			},
 			() = sleep_until(next_due), if !wakes.is_empty() => {
@@ -158,6 +191,7 @@ async fn handle_request<'a>(
 	msg: Msg,
 	futures: &mut SendingFutures<'a>,
 	statuses: &mut TransactionStatuses,
+	wakes: &mut WakeQueue,
 ) {
 	let synthetic_badge =
 		msg.queue_id.is_empty() && matches!(&msg.event, SendingEvent::BadgeRefresh);
@@ -173,11 +207,11 @@ async fn handle_request<'a>(
 				.await,
 	};
 
-	if let Ok(Some(events)) = self
+	if let Ok(selection) = self
 		.select_events(&msg.dest, new_events, statuses)
 		.await
 	{
-		self.schedule_events(msg.dest, events, futures, statuses);
+		self.schedule_events(msg.dest, selection, futures, statuses, wakes);
 	}
 }
 
@@ -189,14 +223,25 @@ async fn handle_request<'a>(
 fn schedule_events<'a>(
 	&'a self,
 	dest: Destination,
-	events: Vec<SendingEvent>,
+	selection: Selection,
 	futures: &mut SendingFutures<'a>,
 	statuses: &mut TransactionStatuses,
+	wakes: &mut WakeQueue,
 ) {
-	if events.is_empty() {
-		statuses.remove(&dest);
-	} else {
-		futures.push(self.send_events(dest, events));
+	match selection {
+		| Selection::Events(items) if items.is_empty() => {
+			statuses.remove(&dest);
+		},
+		| Selection::Events(items) => futures.push(self.send_events(dest, items, None)),
+		| Selection::Slice(items, split) =>
+			futures.push(self.send_events(dest, items, Some(split))),
+		| Selection::Parked { until } => {
+			statuses.remove(&dest);
+			arm_park_wake(wakes, dest, until);
+		},
+		| Selection::Refused { earliest_retry } if is_armed(wakes, &dest).is_false() =>
+			arm_wake(wakes, dest, earliest_retry),
+		| Selection::Refused { .. } | Selection::Busy => {},
 	}
 }
 
@@ -219,7 +264,8 @@ async fn finish_responses<'a>(&'a self, futures: &mut SendingFutures<'a>) {
 		select! {
 			() = sleep_until(deadline) => return,
 			response = futures.next() => match response {
-				Some(Ok(dest)) => self.db.delete_all_active_requests_for(&dest).await,
+				Some(Completion { result: Ok(_), keys, .. }) =>
+					self.db.delete_active_requests(&keys),
 				Some(_) => {},
 				None => return,
 			},

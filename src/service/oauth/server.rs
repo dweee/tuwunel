@@ -5,7 +5,10 @@ mod jwk;
 mod signing_key;
 mod token;
 
-use std::sync::Arc;
+use std::{
+	fmt::{Debug, Formatter, Result as FmtResult},
+	sync::Arc,
+};
 
 use serde_json::Value as JsonValue;
 use tuwunel_core::{Err, Result, debug_info, debug_warn, err, implement, utils::MutexMap, warn};
@@ -35,7 +38,17 @@ pub struct Server {
 	/// Serializes the read-check-consume of a device grant by its `device_code`
 	/// so concurrent polls of one approved grant cannot each mint a device.
 	device_locks: MutexMap<String, ()>,
+
+	/// Serializes selection, claim and completion of one authorization request
+	/// by its id, holding one entry per request with a holder in flight.
+	auth_request_locks: MutexMap<String, ()>,
+
+	/// Serializes code consumption, retaining one entry per code with active contenders.
+	auth_code_locks: MutexMap<AuthCode, ()>,
 }
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct AuthCode(String);
 
 struct Data {
 	oidc_signingkey: Arc<Map>,
@@ -44,6 +57,10 @@ struct Data {
 	oidcdevicecode_devicegrant: Arc<Map>,
 	oidcusercode_devicecode: Arc<Map>,
 	oidcreqid_authrequest: Arc<Map>,
+}
+
+impl Debug for AuthCode {
+	fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult { f.write_str("[redacted]") }
 }
 
 impl Server {
@@ -73,6 +90,8 @@ impl Server {
 			jwk: init_jwk(&key.key_der, &key.key_id)?,
 			key,
 			device_locks: MutexMap::new(),
+			auth_request_locks: MutexMap::new(),
+			auth_code_locks: MutexMap::new(),
 		}))
 	}
 }

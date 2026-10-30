@@ -11,30 +11,48 @@ use tuwunel_core::{
 
 use super::backoff::{Context, UPGRADE_RETRY};
 
+/// Context of an incoming event, shared across fetching and upgrading its
+/// previous events, and upgrading the event itself.
+///
+/// `event_id` always names the incoming event; the event being upgraded, a
+/// previous one or the incoming one itself, is a separate argument.
+#[derive(Clone, Copy)]
+pub(super) struct PrevUpgrade<'a> {
+	pub(super) origin: &'a ServerName,
+	pub(super) room_id: &'a RoomId,
+	pub(super) event_id: &'a EventId,
+	pub(super) room_version: &'a RoomVersionId,
+	pub(super) recursion_level: usize,
+	pub(super) first_normal_ts: MilliSecondsSinceUnixEpoch,
+	pub(super) create_event_id: &'a EventId,
+}
+
 #[implement(super::Service)]
-#[expect(clippy::too_many_arguments)]
 #[tracing::instrument(
 	name = "prev",
 	level = INFO_SPAN_LEVEL,
 	skip_all,
-	fields(%prev_id),
+	fields(
+		%prev_id,
+	),
 )]
 pub(super) async fn handle_prev_pdu(
 	&self,
-	origin: &ServerName,
-	room_id: &RoomId,
-	event_id: &EventId,
+	upgrade: PrevUpgrade<'_>,
 	eventid_info: Option<(PduEvent, CanonicalJsonObject)>,
-	room_version: &RoomVersionId,
-	recursion_level: usize,
-	first_ts_in_room: MilliSecondsSinceUnixEpoch,
 	prev_id: &EventId,
-	create_event_id: &EventId,
 ) -> Result<Option<(RawPduId, bool)>> {
 	// Check for disabled again because it might have changed
-	if self.services.metadata.is_disabled(room_id).await {
+	if self
+		.services
+		.metadata
+		.is_disabled(upgrade.room_id)
+		.await
+	{
+		let PrevUpgrade { origin, room_id, event_id, .. } = upgrade;
+
 		return Err!(Request(Forbidden(debug_warn!(
-			"Federaton of room {room_id} is currently disabled on this server. Request by \
+			"Federation of room {room_id} is currently disabled on this server. Request by \
 			 origin {origin} and event ID {event_id}"
 		))));
 	}
@@ -45,7 +63,7 @@ pub(super) async fn handle_prev_pdu(
 	};
 
 	// Skip old events
-	if pdu.origin_server_ts() < first_ts_in_room {
+	if pdu.origin_server_ts() < upgrade.first_normal_ts {
 		debug_warn!(?prev_id, "origin_server_ts older than room");
 		return Ok(None);
 	}
@@ -61,15 +79,7 @@ pub(super) async fn handle_prev_pdu(
 
 	self.record_attempt(Context::Upgrade, prev_id);
 
-	self.upgrade_outlier_to_timeline_pdu(
-		origin,
-		room_id,
-		pdu,
-		json,
-		room_version,
-		recursion_level,
-		create_event_id,
-	)
-	.boxed() // size firewall
-	.await
+	self.upgrade_outlier_to_timeline_pdu(upgrade, pdu, json)
+		.boxed() // size firewall
+		.await
 }

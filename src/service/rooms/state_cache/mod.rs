@@ -5,6 +5,8 @@
 //! Read helpers expose point queries and cursor-backed streams over those
 //! derived indexes.
 
+#[cfg(test)]
+mod tests;
 mod update;
 mod via;
 
@@ -217,8 +219,29 @@ pub fn room_servers<'a>(
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn server_in_room<'a>(&'a self, server: &'a ServerName, room_id: &'a RoomId) -> bool {
+	self.server_in_room_result(server, room_id)
+		.await
+		.unwrap_or(false)
+}
+
+/// Tests whether a server is recorded as participating in a room.
+///
+/// Missing rows return `false`; storage failures are preserved for callers
+/// whose authority decision depends on the result.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn server_in_room_result<'a>(
+	&'a self,
+	server: &'a ServerName,
+	room_id: &'a RoomId,
+) -> Result<bool> {
 	let key = (server, room_id);
-	self.db.serverroomids.qry(&key).await.is_ok()
+
+	match self.db.serverroomids.qry(&key).await {
+		| Ok(_) => Ok(true),
+		| Err(error) if error.is_not_found() => Ok(false),
+		| Err(error) => Err(error),
+	}
 }
 
 /// Streams all rooms recorded for a participating server.
@@ -636,7 +659,7 @@ pub fn user_memberships<'a>(
 
 /// Streams rooms in which a user is currently indexed as joined.
 ///
-/// The raw user prefix preserves the established key scan. Storage and
+/// Only the user's exact encoded prefix is scanned. Storage and
 /// decoding failures are skipped, and each room identifier borrows the cursor
 /// until its next poll.
 #[implement(Service)]
@@ -645,9 +668,10 @@ pub fn rooms_joined<'a>(
 	&'a self,
 	user_id: &'a UserId,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
+	let prefix = (user_id, Interfix);
 	self.db
 		.userroomid_joinedcount
-		.keys_raw_prefix(user_id)
+		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
 }
@@ -673,7 +697,7 @@ pub fn rooms_joined_checked<'a>(
 
 /// Streams rooms in which a user is currently indexed as invited.
 ///
-/// The raw user prefix preserves the established key scan. Storage and
+/// Only the user's exact encoded prefix is scanned. Storage and
 /// decoding failures are skipped, and each room identifier borrows the cursor
 /// until its next poll.
 #[implement(Service)]
@@ -682,16 +706,17 @@ pub fn rooms_invited<'a>(
 	&'a self,
 	user_id: &'a UserId,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
+	let prefix = (user_id, Interfix);
 	self.db
 		.userroomid_invitestate
-		.keys_raw_prefix(user_id)
+		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
 }
 
 /// Streams rooms in which a user is currently indexed as knocking.
 ///
-/// The raw user prefix preserves the established key scan. Storage and
+/// Only the user's exact encoded prefix is scanned. Storage and
 /// decoding failures are skipped, and each room identifier borrows the cursor
 /// until its next poll.
 #[implement(Service)]
@@ -700,9 +725,10 @@ pub fn rooms_knocked<'a>(
 	&'a self,
 	user_id: &'a UserId,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
+	let prefix = (user_id, Interfix);
 	self.db
 		.userroomid_knockedstate
-		.keys_raw_prefix(user_id)
+		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
 }
@@ -715,9 +741,10 @@ pub fn rooms_knocked<'a>(
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub fn rooms_left<'a>(&'a self, user_id: &'a UserId) -> impl Stream<Item = &RoomId> + Send + 'a {
+	let prefix = (user_id, Interfix);
 	self.db
 		.userroomid_leftstate
-		.keys_raw_prefix(user_id)
+		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
 }

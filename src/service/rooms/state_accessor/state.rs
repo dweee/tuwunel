@@ -7,11 +7,12 @@ use std::{ops::Deref, sync::Arc};
 
 use futures::{
 	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join, pin_mut,
+	stream::empty,
 };
 use ruma::{
 	OwnedEventId, UserId,
 	events::{
-		StateEventType, TimelineEventType,
+		StateEventType,
 		room::member::{MembershipState, RoomMemberEventContent},
 	},
 };
@@ -38,8 +39,11 @@ use crate::rooms::{
 #[implement(super::Service)]
 #[inline]
 pub async fn user_was_joined(&self, shortstatehash: ShortStateHash, user_id: &UserId) -> bool {
-	self.user_membership(shortstatehash, user_id)
-		.await == MembershipState::Join
+	matches!(
+		self.user_membership(shortstatehash, user_id)
+			.await,
+		MembershipState::Join
+	)
 }
 
 /// Reports whether a user was invited or joined in a selected state snapshot.
@@ -49,10 +53,11 @@ pub async fn user_was_joined(&self, shortstatehash: ShortStateHash, user_id: &Us
 #[implement(super::Service)]
 #[inline]
 pub async fn user_was_invited(&self, shortstatehash: ShortStateHash, user_id: &UserId) -> bool {
-	let s = self
+	let membership = self
 		.user_membership(shortstatehash, user_id)
 		.await;
-	s == MembershipState::Join || s == MembershipState::Invite
+
+	matches!(membership, MembershipState::Join | MembershipState::Invite)
 }
 
 /// Returns a user's membership in a selected state snapshot.
@@ -77,11 +82,8 @@ pub async fn user_membership(
 /// invalid state falls back to [`MembershipState::Leave`].
 #[implement(super::Service)]
 pub async fn user_membership_at_pdu(&self, user_id: &UserId, pdu: &Pdu) -> MembershipState {
-	if pdu.kind() == &TimelineEventType::RoomMember
-		&& pdu.state_key() == Some(user_id.as_str())
-		&& let Ok(content) = pdu.get_content::<RoomMemberEventContent>()
-	{
-		return content.membership;
+	if let Some(membership) = pdu.membership_for(user_id) {
+		return membership;
 	}
 
 	let Ok(shortstatehash) = self
@@ -363,6 +365,10 @@ pub fn state_added(
 	&self,
 	shortstatehash: pair_of!(ShortStateHash),
 ) -> impl Stream<Item = (ShortStateKey, ShortEventId)> + Send + '_ {
+	if shortstatehash.0 == shortstatehash.1 {
+		return empty().left_stream();
+	}
+
 	let a = self.load_full_state(shortstatehash.0);
 	let b = self.load_full_state(shortstatehash.1);
 	try_join(a, b)
@@ -371,6 +377,7 @@ pub fn state_added(
 		.try_flatten_stream()
 		.ignore_err()
 		.map(parse_compressed_state_event)
+		.right_stream()
 }
 
 /// Streams resolvable keyed events from a state snapshot.
@@ -459,9 +466,25 @@ pub fn state_full_ids_strict(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<(ShortStateKey, OwnedEventId)>> + Send + '_ {
+	self.state_full_ids_complete(shortstatehash)
+		.map_ok(Vec::into_iter)
+		.map_ok(IterStream::try_stream)
+		.try_flatten_stream()
+}
+
+/// Loads a complete short-state-key to event-ID map for a snapshot.
+///
+/// Snapshot and reverse-mapping failures are returned instead of a partial
+/// map. Pairs keep the snapshot's order; [`Self::state_full_ids_strict`]
+/// streams the same pairs.
+#[implement(super::Service)]
+pub async fn state_full_ids_complete(
+	&self,
+	shortstatehash: ShortStateHash,
+) -> Result<Vec<(ShortStateKey, OwnedEventId)>> {
 	self.state_full_shortids(shortstatehash)
-		.try_unzip::<Vec<_>, Vec<_>>()
-		.and_then(async move |(shortstatekeys, shorteventids)| {
+		.try_unzip()
+		.and_then(async move |(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
 			self.services
 				.short
 				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
@@ -469,12 +492,10 @@ pub fn state_full_ids_strict(
 				.map(|(event_id, shortstatekey)| {
 					event_id.map(|event_id| (shortstatekey, event_id))
 				})
-				.try_collect::<Vec<_>>()
+				.try_collect()
 				.await
 		})
-		.map_ok(Vec::into_iter)
-		.map_ok(IterStream::try_stream)
-		.try_flatten_stream()
+		.await
 }
 
 /// Streams every compressed `(short state key, short event ID)` pair.

@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use std::{
 	cmp::Reverse,
 	time::{Duration, SystemTime},
@@ -9,7 +12,9 @@ use tuwunel_core::{
 	Error, error,
 	error::error_chain,
 	implement, trace,
-	utils::{exponential_backoff_remaining_secs, rand::secs as rand_secs},
+	utils::{
+		BoolExt, exponential_backoff_remaining_secs, rand::secs as rand_secs, time::now_secs,
+	},
 	warn,
 };
 
@@ -20,6 +25,8 @@ use crate::{
 };
 
 const PUSH_FAILURE_STREAK: u32 = 4;
+const APPSERVICE_RETRY_BASE: u64 = 2;
+const APPSERVICE_RETRY_MAX_SECS: u64 = 512;
 const WAKE_OVERFLOW_DELAY: Duration = Duration::from_hours(365 * 24);
 
 #[implement(Service)]
@@ -53,7 +60,10 @@ async fn handle_wake<'a>(
 ) {
 	let status = statuses.get(&dest);
 
-	if matches!(status, Some(TransactionStatus::Running | TransactionStatus::RunningForceRetry)) {
+	if matches!(
+		status,
+		Some(TransactionStatus::Running { .. } | TransactionStatus::RunningForceRetry { .. })
+	) {
 		return;
 	}
 
@@ -67,10 +77,7 @@ async fn handle_wake<'a>(
 
 	if let (Destination::Push(..), Some(remaining)) = (&dest, self.push_backoff_remaining(status))
 	{
-		if wakes
-			.iter()
-			.any(|Reverse((_, armed_dest))| armed_dest == &dest)
-		{
+		if is_armed(wakes, &dest) {
 			trace!(?dest, "Dropping stale push wake");
 		} else {
 			trace!(?dest, ?remaining, "Re-arming early push wake");
@@ -81,14 +88,27 @@ async fn handle_wake<'a>(
 	}
 
 	match dest {
-		| Destination::Appservice(_) => {},
-		| dest @ Destination::Push(..) =>
-			self.handle_force_retry(dest, futures, statuses)
+		| dest @ (Destination::Appservice(_) | Destination::Push(..)) =>
+			self.handle_force_retry(dest, futures, statuses, wakes)
 				.await,
 		| Destination::Federation(server) =>
 			self.handle_federation_wake(server, futures, statuses, wakes)
 				.await,
 	}
+}
+
+pub(super) fn arm_appservice_wake(wakes: &mut WakeQueue, dest: Destination, tries: u32) {
+	if is_armed(wakes, &dest) {
+		return;
+	}
+
+	arm_wake_in(wakes, dest, appservice_delay(tries));
+}
+
+fn appservice_delay(tries: u32) -> Duration {
+	let exponent = tries.min(APPSERVICE_RETRY_MAX_SECS.ilog(APPSERVICE_RETRY_BASE));
+
+	Duration::from_secs(APPSERVICE_RETRY_BASE.pow(exponent))
 }
 
 #[implement(Service)]
@@ -116,20 +136,40 @@ async fn handle_federation_wake<'a>(
 				queue_id: Vec::new(),
 			};
 
-			self.handle_request(msg, futures, statuses).await;
+			self.handle_request(msg, futures, statuses, wakes)
+				.await;
 		},
 	}
 }
 
 #[implement(Service)]
-pub(super) async fn arm_federation_wake(&self, server: OwnedServerName, wakes: &mut WakeQueue) {
-	if let ShouldAttempt::No { earliest_retry } = self
+pub(super) async fn arm_federation_wake(
+	&self,
+	server: OwnedServerName,
+	tries: u32,
+	wakes: &mut WakeQueue,
+) {
+	let verdict = self
 		.services
 		.federation
 		.should_attempt(&server)
-		.await
-	{
-		arm_wake(wakes, Destination::Federation(server), earliest_retry);
+		.await;
+
+	let dest = Destination::Federation(server);
+
+	match verdict {
+		| ShouldAttempt::No { earliest_retry } => arm_wake(wakes, dest, earliest_retry),
+		| _ => {
+			let delay = exponential_backoff_remaining_secs(
+				self.server.config.sender_timeout,
+				self.server.config.sender_retry_backoff_limit,
+				Duration::ZERO,
+				tries,
+			)
+			.unwrap_or_default();
+
+			arm_wake_in(wakes, dest, delay);
+		},
 	}
 }
 
@@ -198,7 +238,38 @@ fn record_push_failure(dest: &Destination, error: &Error, tries: u32, retry_in: 
 	}
 }
 
-fn arm_wake(wakes: &mut WakeQueue, dest: Destination, earliest_retry: SystemTime) {
+/// Wake a destination holding only parked rooms when its earliest park expires.
+///
+/// Unlike a retry timer, it is not jittered, and it is skipped when a wake for
+/// the destination is already armed to fire no later.
+pub(super) fn arm_park_wake(wakes: &mut WakeQueue, dest: Destination, until: u64) {
+	let deadline = park_deadline(until);
+
+	if wakes
+		.iter()
+		.any(|Reverse((due, armed))| armed == &dest && *due <= deadline)
+		.is_false()
+	{
+		wakes.push(Reverse((deadline, dest)));
+	}
+}
+
+fn park_deadline(until: u64) -> Instant {
+	let now = Instant::now();
+	let delay = Duration::from_secs(until.saturating_sub(now_secs()));
+
+	now.checked_add(delay)
+		.or_else(|| now.checked_add(WAKE_OVERFLOW_DELAY))
+		.unwrap_or(now)
+}
+
+pub(super) fn is_armed(wakes: &WakeQueue, dest: &Destination) -> bool {
+	wakes
+		.iter()
+		.any(|Reverse((_, armed))| armed == dest)
+}
+
+pub(super) fn arm_wake(wakes: &mut WakeQueue, dest: Destination, earliest_retry: SystemTime) {
 	let delay = earliest_retry
 		.duration_since(SystemTime::now())
 		.unwrap_or_default();
@@ -206,7 +277,7 @@ fn arm_wake(wakes: &mut WakeQueue, dest: Destination, earliest_retry: SystemTime
 	arm_wake_in(wakes, dest, delay);
 }
 
-fn arm_wake_in(wakes: &mut WakeQueue, dest: Destination, delay: Duration) {
+pub(super) fn arm_wake_in(wakes: &mut WakeQueue, dest: Destination, delay: Duration) {
 	let (deadline, _) = wake_deadline(delay);
 
 	wakes.push(Reverse((deadline, dest)));

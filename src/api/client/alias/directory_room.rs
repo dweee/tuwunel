@@ -19,6 +19,12 @@ pub(crate) async fn create_alias_route(
 	body: Ruma<create_alias::v3::Request>,
 ) -> Result<create_alias::v3::Response> {
 	let sender_user = body.sender_user();
+
+	services
+		.alias
+		.creation_check(sender_user, body.appservice_info.as_ref())
+		.await?;
+
 	services
 		.alias
 		.appservice_checks(&body.room_alias, &body.appservice_info)

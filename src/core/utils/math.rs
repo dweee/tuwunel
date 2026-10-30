@@ -3,7 +3,12 @@
 //! Exported macros separate recoverable, expected, and prevalidated arithmetic.
 //! Conversion helpers centralize errors, panics, and deliberate truncation.
 
-use std::num::NonZeroUsize;
+use std::{
+	num::NonZeroUsize,
+	sync::atomic::{AtomicU64, Ordering},
+};
+
+use ruma::UInt;
 
 mod expect_into;
 mod expected;
@@ -150,7 +155,7 @@ pub fn usize_from_f64(val: f64) -> Result<usize, Error> {
 /// `usize` range.
 #[inline]
 #[must_use]
-pub fn usize_from_ruma(val: ruma::UInt) -> usize {
+pub fn usize_from_ruma(val: UInt) -> usize {
 	usize::try_from(val).expect("failed conversion from ruma::UInt to usize")
 }
 
@@ -160,28 +165,39 @@ pub fn usize_from_ruma(val: ruma::UInt) -> usize {
 /// either conversion path.
 #[inline]
 #[must_use]
-pub fn usize_from_ruma_bounded(val: ruma::UInt, fallback: usize, max: usize) -> usize {
+pub fn usize_from_ruma_bounded(val: UInt, fallback: usize, max: usize) -> usize {
 	usize::try_from(val).unwrap_or(fallback).min(max)
 }
 
 /// Converts a `u64` to a Matrix unsigned integer.
 ///
 /// The conversion is exact. It panics if the value exceeds the range supported
-/// by [`ruma::UInt`].
+/// by [`UInt`].
 #[inline]
 #[must_use]
-pub fn ruma_from_u64(val: u64) -> ruma::UInt {
-	ruma::UInt::try_from(val).expect("failed conversion from u64 to ruma::UInt")
+pub fn ruma_from_u64(val: u64) -> UInt {
+	UInt::try_from(val).expect("failed conversion from u64 to ruma::UInt")
 }
 
 /// Converts a `usize` to a Matrix unsigned integer.
 ///
 /// The conversion is exact. It panics if the value exceeds the range supported
-/// by [`ruma::UInt`].
+/// by [`UInt`].
 #[inline]
 #[must_use]
-pub fn ruma_from_usize(val: usize) -> ruma::UInt {
-	ruma::UInt::try_from(val).expect("failed conversion from usize to ruma::UInt")
+pub fn ruma_from_usize(val: usize) -> UInt {
+	UInt::try_from(val).expect("failed conversion from usize to ruma::UInt")
+}
+
+/// Converts a `usize` to a Matrix unsigned integer, saturating at the largest
+/// value [`UInt`] supports.
+///
+/// Suits a wire limit taken from a local count, where an oversized value means
+/// as many as the protocol allows rather than an error.
+#[inline]
+#[must_use]
+pub fn ruma_from_usize_saturating(val: usize) -> UInt {
+	UInt::new_saturating(u64_from_usize_saturating(val))
 }
 
 /// Converts a `u64` to `usize` with deliberate truncation when necessary.
@@ -192,6 +208,30 @@ pub fn ruma_from_usize(val: usize) -> ruma::UInt {
 #[must_use]
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
 pub fn usize_from_u64_truncated(val: u64) -> usize { val as usize }
+
+/// Converts a `usize` to `u64`, saturating at `u64::MAX`.
+///
+/// The conversion is exact wherever `usize` is at most 64 bits wide.
+#[inline]
+#[must_use]
+pub fn u64_from_usize_saturating(val: usize) -> u64 { val.try_into().unwrap_or(u64::MAX) }
+
+/// Converts a `u128` to `u64`, saturating at `u64::MAX`.
+///
+/// Suits whole-unit `Duration` reads such as `as_millis()`, where clamping an
+/// out-of-range value beats failing on it.
+#[inline]
+#[must_use]
+pub fn u64_from_u128_saturating(val: u128) -> u64 { val.try_into().unwrap_or(u64::MAX) }
+
+/// Adds a `usize` count to an atomic `u64` counter, saturating the count at
+/// `u64::MAX`.
+///
+/// Returns the previous value; the counter itself wraps as `fetch_add` does.
+#[inline]
+pub fn fetch_add_usize(counter: &AtomicU64, count: usize, order: Ordering) -> u64 {
+	counter.fetch_add(u64_from_usize_saturating(count), order)
+}
 
 /// Converts a value with [`TryFrom`] and panics if conversion fails.
 ///
