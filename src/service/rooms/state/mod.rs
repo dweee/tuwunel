@@ -28,14 +28,18 @@ use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId, UserId,
 	events::{
 		AnyStrippedStateEvent, StateEventType, TimelineEventType,
-		room::member::{MembershipState, RoomMemberEventContent},
+		room::{
+			create::RoomCreateEventContent,
+			member::{MembershipState, RoomMemberEventContent},
+		},
 	},
 	room_version_rules::AuthorizationRules,
 	serde::Raw,
 };
+use serde::Deserialize;
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Event, PduEvent, Result, err,
+	Error, Event, PduEvent, Result, err,
 	error::inspect_debug_log,
 	implement,
 	matrix::{PduCount, RoomVersionRules, StateKey, TypeStateKey, room_version},
@@ -91,6 +95,11 @@ type RoomMutexMap = MutexMap<OwnedRoomId, ()>;
 pub type RoomMutexGuard = MutexMapGuard<OwnedRoomId, ()>;
 type ForwardExtremities = SmallVec<[OwnedEventId; 1]>;
 
+#[derive(Deserialize)]
+struct CreateEvent {
+	content: RoomCreateEventContent,
+}
+
 #[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
@@ -140,6 +149,27 @@ pub async fn force_state(
 	_statediffremoved: Arc<CompressedState>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	self.prepare_force_state(room_id, &statediffnew, state_lock)
+		.await?;
+
+	self.install_force_state(room_id, shortstatehash, state_lock);
+
+	Ok(())
+}
+
+/// Replays membership additions before installing a forced state snapshot.
+///
+/// Lookup failures are skipped; membership-effect errors propagate before
+/// joined counts are refreshed. The caller retains the room state guard
+/// through preparation and installation.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn prepare_force_state(
+	&self,
+	room_id: &RoomId,
+	statediffnew: &CompressedState,
+	_state_lock: &RoomMutexGuard,
+) -> Result {
 	statediffnew
 		.iter()
 		.stream()
@@ -172,12 +202,22 @@ pub async fn force_state(
 		.update_joined_count(room_id)
 		.await;
 
-	self.set_room_state(room_id, shortstatehash, state_lock);
-
-	// Forced state may change this room's cached hierarchy summary.
-	self.services.spaces.cache_evict(room_id);
-
 	Ok(())
+}
+
+/// Installs a prepared state snapshot and invalidates its hierarchy summary.
+///
+/// Preparation and any required timeline append must have succeeded under
+/// the same room state guard before installation.
+#[implement(Service)]
+pub(crate) fn install_force_state(
+	&self,
+	room_id: &RoomId,
+	shortstatehash: u64,
+	state_lock: &RoomMutexGuard,
+) {
+	self.set_room_state(room_id, shortstatehash, state_lock);
+	self.services.spaces.cache_evict(room_id);
 }
 
 /// Record the membership transition a replayed `m.room.member` event carries.
@@ -670,16 +710,38 @@ pub async fn get_room_version_rules(&self, room_id: &RoomId) -> Result<RoomVersi
 )]
 /// Returns the room version declared by the room's create event.
 ///
-/// Missing or malformed create-event content is reported to the caller.
+/// Only the event's content is decoded, so a create event stored without its
+/// room ID still yields the version. An unreadable accepted event falls back
+/// to outlier storage. Transient storage errors are preserved when neither
+/// copy can be read.
 pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> {
 	self.services
 		.state_accessor
-		.room_state_get_content(room_id, &StateEventType::RoomCreate, "")
+		.room_state_get_id(room_id, &StateEventType::RoomCreate, "")
+		.and_then(async |create_id| {
+			let outlier = async |accepted: Error| {
+				self.services
+					.timeline
+					.get_outlier(&create_id)
+					.map_err(|outlier| match accepted {
+						| error if error.is_transient_io() => error,
+						| _ => outlier,
+					})
+					.await
+			};
+
+			self.services
+				.timeline
+				.get_non_outlier(&create_id)
+				.or_else(outlier)
+				.await
+		})
+		.map_ok(|create: CreateEvent| create.content.room_version)
+		.map_err(|error| match error {
+			| Error::Io(_) if !error.is_not_found() => error,
+			| error => err!(Request(NotFound("No create event found: {error:?}"))),
+		})
 		.await
-		.as_ref()
-		.map(room_version::from_create_content)
-		.cloned()
-		.map_err(|e| err!(Request(NotFound("No create event found: {e:?}"))))
 }
 
 #[implement(Service)]
@@ -827,9 +889,8 @@ pub fn get_forward_extremities<'a>(
 )]
 /// Replaces all stored forward extremities for a room.
 ///
-/// Existing rows are removed before the supplied IDs are inserted while the
-/// caller holds the state guard. The wipe and reinsertion are not transactional,
-/// and errors encountered while scanning old rows are ignored.
+/// Deletions and insertions commit in one write batch while the caller holds
+/// the state guard. Errors encountered while scanning old rows are ignored.
 pub async fn set_forward_extremities<'a, I>(
 	&'a self,
 	room_id: &'a RoomId,
@@ -839,17 +900,22 @@ pub async fn set_forward_extremities<'a, I>(
 	I: Iterator<Item = &'a EventId> + Send + 'a,
 {
 	let prefix = (room_id, Interfix);
-	self.db
-		.roomid_pduleaves
+	let leaves = &self.db.roomid_pduleaves;
+	let txn = leaves
 		.keys_prefix_raw(&prefix)
 		.ignore_err()
-		.ready_for_each(|key| self.db.roomid_pduleaves.remove(key))
+		.ready_fold(self.services.db.txn(), |mut txn, key| {
+			txn.del_raw(leaves, key);
+			txn
+		})
 		.await;
 
-	for event_id in event_ids {
-		let key = (room_id, event_id);
-		self.db.roomid_pduleaves.put_raw(key, event_id);
-	}
+	event_ids
+		.fold(txn, |mut txn, event_id| {
+			txn.put_raw(leaves, (room_id, event_id), event_id);
+			txn
+		})
+		.execute();
 }
 
 /// Deletes every stored forward extremity for a room.

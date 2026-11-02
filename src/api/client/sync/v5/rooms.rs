@@ -35,7 +35,7 @@ use tuwunel_core::{
 		hash::sha256::{
 			Digest as Sha256Digest, delimited as sha256_delimited, hash as sha256_hash,
 		},
-		math::usize_from_ruma,
+		math::usize_from_ruma_bounded,
 		result::FlatOk,
 		stream::{BroadbandExt, WidebandExt},
 	},
@@ -45,7 +45,10 @@ use tuwunel_service::{
 	sync::{RequiredState, Room, RoomConfig},
 };
 
-use self::{bump_stamp::room_bump_stamp, heroes::calculate_heroes};
+use self::{
+	bump_stamp::{knock_bump_stamp, room_bump_stamp},
+	heroes::calculate_heroes,
+};
 use super::{
 	super::{load_timeline_fallible, strip_prev_state},
 	Connection, ListIds, SyncInfo, WindowRoom,
@@ -62,6 +65,9 @@ type ThreadCounts = BTreeMap<OwnedEventId, (u64, u64)>;
 type EventTypeString = SmallString<[u8; 32]>;
 type TimelineMembers<'a> = SmallVec<[&'a str; 2]>;
 pub(super) type RoomDetails = (usize, HashSet<(StateEventType, StateKey)>);
+
+/// Most timeline events one room returns per response, as legacy sync allows.
+const TIMELINE_LIMIT_MAX: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StateMode {
@@ -113,7 +119,7 @@ pub(super) async fn handle_room(
 
 	let (timeline_limit, required_state) = room_details;
 
-	let timeline = is_invite.is_false().then_async(|| {
+	let timeline = membership_allows_required_state(membership.as_ref()).then_async(|| {
 		load_timeline_fallible(
 			services,
 			sender_user,
@@ -143,16 +149,23 @@ pub(super) async fn handle_room(
 		.as_ref()
 		.map(ToString::to_string);
 
-	let bump_stamp = room_bump_stamp(
-		services,
-		sender_user,
-		room_id,
-		PduCount::Normal(roomsince),
-		PduCount::from(conn.next_batch),
-		last_timeline_count,
-	)
-	.map_err(Failure::Timeline)
-	.await?;
+	let bump_stamp = match membership {
+		| Some(MembershipState::Knock) => {
+			// Redelivered rooms retain their own membership baseline even before roomsince.
+			knock_bump_stamp(window_room.event_count, conn.next_batch)
+		},
+		| _ =>
+			room_bump_stamp(
+				services,
+				sender_user,
+				room_id,
+				PduCount::Normal(roomsince),
+				PduCount::from(conn.next_batch),
+				last_timeline_count,
+			)
+			.map_err(Failure::Timeline)
+			.await?,
+	};
 
 	let mode = state_mode(roomsince, room.required_state.is_empty());
 	let state = StateSelection {
@@ -289,9 +302,18 @@ pub(super) fn merged_room_details(
 		.filter_map(|list_id| conn.lists.get(list_id))
 		.map(|list| &list.room_details)
 		.chain(conn.subscriptions.get(room_id))
-		.fold((0_usize, HashSet::new()), |(timeline_limit, mut required_state), config| {
-			required_state.extend(config.required_state.iter().cloned());
-			(timeline_limit.max(usize_from_ruma(config.timeline_limit)), required_state)
+		.fold((0_usize, HashSet::new()), |mut details, config| {
+			details.0 = details.0.max(usize_from_ruma_bounded(
+				config.timeline_limit,
+				TIMELINE_LIMIT_MAX,
+				TIMELINE_LIMIT_MAX,
+			));
+
+			details
+				.1
+				.extend(config.required_state.iter().cloned());
+
+			details
 		})
 }
 

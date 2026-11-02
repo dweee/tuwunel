@@ -22,8 +22,8 @@ use ruma::{
 use tuwunel_core::{
 	Err, Event, PduCount, Result, async_noinline, at, debug, debug_info, debug_warn, err,
 	implement, info,
-	matrix::event::gen_event_id,
-	pdu::{PduBuilder, PduEvent},
+	matrix::{event::gen_event_id, room_version::rules as room_version_rules},
+	pdu::{PduBuilder, PduEvent, from_incoming_federation},
 	trace, utils, warn,
 };
 
@@ -67,7 +67,7 @@ pub async fn knock<'a>(
 		.is_invited(sender_user, room_id)
 		.await
 	{
-		debug_warn!("{sender_user} is already invited in {room_id} but attempted to knock");
+		debug_warn!(%sender_user, %room_id, "Invited user attempted to knock.");
 		return Err!(Request(Forbidden(
 			"You cannot knock on a room you are already invited/accepted to."
 		)));
@@ -79,7 +79,7 @@ pub async fn knock<'a>(
 		.is_joined(sender_user, room_id)
 		.await
 	{
-		debug_warn!("{sender_user} is already joined in {room_id} but attempted to knock");
+		debug_warn!(%sender_user, %room_id, "Joined user attempted to knock.");
 		return Err!(Request(Forbidden("You cannot knock on a room you are already joined in.")));
 	}
 
@@ -97,17 +97,18 @@ pub async fn knock<'a>(
 			.is_knocked(sender_user, room_id)
 			.await
 	{
-		debug_warn!("{sender_user} is already knocked in {room_id}");
+		debug_warn!(%sender_user, %room_id, "User is already knocking.");
 		return Ok(());
 	}
 
-	if let Ok(membership) = self
+	if self
 		.services
 		.state_accessor
 		.get_member(room_id, sender_user)
-		.await && membership.membership == MembershipState::Ban
+		.await
+		.is_ok_and(|content| content.membership == MembershipState::Ban)
 	{
-		debug_warn!("{sender_user} is banned from {room_id} but attempted to knock");
+		debug_warn!(%sender_user, %room_id, "Banned user attempted to knock.");
 		return Err!(Request(Forbidden("You cannot knock on a room you are banned from.")));
 	}
 
@@ -550,25 +551,29 @@ async fn ingest_send_knock_state(
 				serde_json::from_str::<CanonicalJsonObject>(raw.json().get()).ok(),
 		});
 
+	let rules = room_version_rules(room_version_id)?;
+
 	let mut state_map: HashMap<u64, OwnedEventId> = HashMap::new();
 
 	for event in state {
 		let Some(state_key) = event.get("state_key") else {
-			debug_warn!("send_knock stripped state event missing state_key: {event:?}");
+			debug_warn!(?event, "Knock response state event lacks a state key.");
 			continue;
 		};
+
 		let Some(event_type) = event.get("type") else {
-			debug_warn!("send_knock stripped state event missing event type: {event:?}");
+			debug_warn!(?event, "Knock response state event lacks a type.");
 			continue;
 		};
 
 		let Ok(state_key) = serde_json::from_value::<String>(state_key.clone().into()) else {
-			debug_warn!("send_knock stripped state event has invalid state_key: {event:?}");
+			debug_warn!(?event, "Knock response state event has an invalid state key.");
 			continue;
 		};
+
 		let Ok(event_type) = serde_json::from_value::<StateEventType>(event_type.clone().into())
 		else {
-			debug_warn!("send_knock stripped state event has invalid event type: {event:?}");
+			debug_warn!(?event, "Knock response state event has an invalid type.");
 			continue;
 		};
 
@@ -578,12 +583,20 @@ async fn ingest_send_knock_state(
 			continue;
 		}
 
+		// These member events are unverified, and forcing state would replay
+		// them into the membership cache; the knock sets our user's membership.
+		if event_type == StateEventType::RoomMember {
+			continue;
+		}
+
 		let event_id = gen_event_id(&event, room_version_id)?;
 		let shortstatekey = self
 			.services
 			.short
 			.get_or_create_shortstatekey(&event_type, &state_key)
 			.await;
+
+		let event = from_incoming_federation(room_id, &event_id, event, &rules);
 
 		self.services
 			.timeline
@@ -695,3 +708,6 @@ async fn make_knock_request(
 
 	make_knock_response_and_server
 }
+
+#[cfg(test)]
+mod tests;

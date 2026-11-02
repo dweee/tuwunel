@@ -8,6 +8,7 @@ pub mod check;
 mod format;
 mod identity_provider_serde;
 pub mod ip_source;
+mod jwt;
 pub mod manager;
 mod net;
 pub mod proxy;
@@ -75,6 +76,9 @@ pub(crate) const ENV_PREFIXES: [&str; 3] = ["CONDUIT_", "CONDUWUIT_", "TUWUNEL_"
 /// allocation. Longer valid localparts spill transparently.
 pub type ServerUserLocalpart = SmallString<[u8; 32]>;
 
+/// Stores an object-storage bucket name inline in the common case.
+pub type StorageBucketName = SmallString<[u8; 64]>;
+
 /// All the config options for tuwunel.
 #[expect(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #[derive(Clone, Deserialize)]
@@ -99,8 +103,8 @@ pub type ServerUserLocalpart = SmallString<[u8; 32]>;
 ### For more information, see:
 ### https://tuwunel.chat/configuration.html
 "#,
-	ignore = "catchall well_known tls ldap jwt appservice identity_provider storage_provider \
-	          registration_terms smtp",
+	ignore = "catchall well_known tls rate_limiting ldap jwt appservice identity_provider \
+	          storage_provider registration_terms smtp",
 	hidden = "allow_invalid_tls_certificates resolve_state_locally_shadow",
 	forbidden = "database_restore_backup force_migration"
 )]
@@ -344,9 +348,9 @@ pub struct Config {
 	pub eventid_pdu_cache_capacity: u32,
 
 	/// Maximum number of entries in the RocksDB block cache for the
-	/// `eventid_backoff` column family: the recent fetch, auth, and upgrade
-	/// outcomes an event is rate-gated against, keyed by federation step,
-	/// event ID, and time bucket.
+	/// `eventid_backoff` column family: the recent fetch, auth, upgrade, and
+	/// delivery outcomes an event is rate-gated against, keyed by federation
+	/// step, event ID, and time bucket.
 	///
 	/// Same entry-count semantics as `pdu_cache_capacity`. A server working
 	/// through a large missing-ancestry gap reads this column heavily.
@@ -676,6 +680,18 @@ pub struct Config {
 	/// it increases recovery work; it is not a count of network requests.
 	#[serde(default = "default_max_fetch_prev_events")]
 	pub max_fetch_prev_events: u16,
+
+	/// Maximum relation rows examined while replacing a redacted latest thread
+	/// reply.
+	///
+	/// Missing, malformed, unrelated, and redacted events consume the
+	/// budget before event filtering. If no replacement is found, the thread
+	/// summary is omitted.
+	///
+	/// reloadable: yes
+	/// default: 1024
+	#[serde(default = "default_thread_latest_reply_search_limit")]
+	pub thread_latest_reply_search_limit: usize,
 
 	/// Simultaneous backward-extremity upgrades during incoming-event recovery.
 	///
@@ -1259,8 +1275,8 @@ pub struct Config {
 
 	/// Sets the default `m.federate` property for newly created rooms when the
 	/// client does not request one. If `allow_federation` is set to false at
-	/// the same this value is set to false it then always overrides the client
-	/// requested `m.federate` value to false.
+	/// the same time this value is set to false, it then always overrides the
+	/// client-requested `m.federate` value to false.
 	///
 	/// Rooms are fixed to the setting at the time of their creation and can
 	/// never be changed; changing this value only affects new rooms.
@@ -1291,6 +1307,59 @@ pub struct Config {
 	/// reloadable: yes
 	#[serde(default)]
 	pub require_auth_for_profile_requests: bool,
+
+	/// Maximum fields retained in a remote user's cached profile.
+	///
+	/// Includes displayname and avatar_url and must be greater than zero.
+	/// A refresh exceeding this count is rejected without changing the cache.
+	/// Lowering it leaves existing profiles intact; their refreshes must fit
+	/// the new limit.
+	///
+	/// reloadable: yes
+	/// default: 100
+	#[serde(default = "default_max_remote_profile_fields")]
+	pub max_remote_profile_fields: usize,
+
+	/// Maximum selected profile fields in a sync request or stored filter.
+	///
+	/// Counts raw selectors before duplicate removal for sliding and legacy sync
+	/// and must be greater than zero.
+	/// Requests exceeding this count or the 255-byte name limit are rejected.
+	/// Sliding sync retains normalized selections across omitted selectors;
+	/// after lowering the limit, an oversized selection requires replacement
+	/// or a restarted connection.
+	/// Unfiltered sliding sync profiles are not limited by this count.
+	///
+	/// reloadable: yes
+	/// default: 64
+	#[serde(default = "default_max_profile_fields_per_request")]
+	pub max_profile_fields_per_request: usize,
+
+	/// Allow standard users to set or clear their display names through the
+	/// client profile API.
+	///
+	/// Server admins and appservices are always allowed to change display
+	/// names.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub enable_set_displayname: bool,
+
+	/// Restrict client profile retrieval to the user themselves or users who
+	/// currently share a joined room.
+	///
+	/// Appservices are exempt, and other users are refused with 403
+	/// `M_FORBIDDEN`. The server refuses to start, or to reload its
+	/// configuration, with this enabled unless
+	/// `require_auth_for_profile_requests` is enabled too. Federation profile
+	/// lookups are unaffected; `allow_inbound_profile_lookup_federation_requests`
+	/// controls those.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub limit_profile_requests_to_users_who_share_rooms: bool,
 
 	/// Preserve per-room profile overrides during a global profile update.
 	///
@@ -1423,6 +1492,13 @@ pub struct Config {
 	/// reloadable: yes
 	#[serde(default = "true_fn")]
 	pub allow_room_creation: bool,
+
+	/// Allow standard users to create room aliases. Appservices and admins are
+	/// always allowed to create room aliases.
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub allow_room_alias_creation: bool,
 
 	/// Set to false to disable users from joining or creating room versions
 	/// that aren't officially supported by tuwunel. Unstable room versions may
@@ -1788,6 +1864,12 @@ pub struct Config {
 	#[serde(default = "true_fn")]
 	pub login_with_password: bool,
 
+	/// Configures request rate limits, one `[global.rate_limiting]` subsection
+	/// per kind of request.
+	// external structure; separate section
+	#[serde(default)]
+	pub rate_limiting: RateLimits,
+
 	/// Login token expiration/TTL in milliseconds.
 	///
 	/// These are short-lived tokens for the m.login.token endpoint.
@@ -1896,9 +1978,10 @@ pub struct Config {
 	/// When false (default), the OIDC server runs only to broker for a
 	/// configured `identity_provider`, redirecting users to that upstream IdP.
 	/// When true, an authorization request that selects no provider is served a
-	/// native login or registration page checked against local accounts;
-	/// `well_known.client` must be set. Native and external providers coexist;
-	/// a configured `identity_provider` still brokers as before. Registration
+	/// login or registration page; `well_known.client` must be set. The login
+	/// page offers local accounts and each configured identity provider (one
+	/// single sign-on entry under `single_sso` or `sso_custom_providers_page`),
+	/// and an explicit `idp_id` goes directly to that provider. Registration
 	/// here honors `allow_registration`, the registration token, and
 	/// `registration_terms` exactly as the client registration endpoint does.
 	///
@@ -3082,11 +3165,11 @@ pub struct Config {
 	/// To disable, set this to be an empty vector (`[]`).
 	///
 	/// Defaults to:
-	/// ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
+	/// ["127.0.0.0/8", "0.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
 	/// "192.168.0.0/16", "100.64.0.0/10", "192.0.0.0/24", "169.254.0.0/16",
 	/// "192.88.99.0/24", "198.18.0.0/15", "192.0.2.0/24", "198.51.100.0/24",
-	/// "203.0.113.0/24", "224.0.0.0/4", "::1/128", "fe80::/10", "fc00::/7",
-	/// "2001:db8::/32", "ff00::/8", "fec0::/10"]
+	/// "203.0.113.0/24", "224.0.0.0/4", "::1/128", "::/128", "fe80::/10",
+	/// "fc00::/7", "2001:db8::/32", "ff00::/8", "fec0::/10"]
 	#[serde(default = "default_ip_range_denylist")]
 	pub ip_range_denylist: Vec<String>,
 
@@ -3328,8 +3411,10 @@ pub struct Config {
 	pub max_join_attempts_per_join_request: usize,
 
 	/// Retry failed and incomplete messages to remote servers immediately upon
-	/// startup. This is called bursting. If this is disabled, said messages may
-	/// not be delivered until more messages are queued for that server. Do not
+	/// startup.
+	///
+	/// This is called bursting. If this is disabled, queued messages are retried
+	/// on a paced timer after startup instead of all at once. Do not
 	/// change this option unless server resources are extremely limited or the
 	/// scale of the server's deployment is huge. Do not disable this unless you
 	/// know what you are doing.
@@ -3398,14 +3483,17 @@ pub struct Config {
 	#[serde(default)]
 	pub enforce_stripped_state_pdu_validation: bool,
 
-	/// Allow admins to enter commands in rooms other than "#admins" (admin
-	/// room) by prefixing your message with "\!admin" or "\\!admin" followed up
-	/// a normal tuwunel admin command. The reply will be publicly visible to
-	/// the room, originating from the sender.
+	/// Allow admins to run commands outside the admin room ("#admins") by
+	/// prefixing a message with "\!admin" or "\\!admin" and a normal command.
+	///
+	/// The reply is publicly visible to the room, originating from the sender.
+	/// Disabled by default: the server cannot tell a command an admin typed
+	/// from one in a message the admin forwarded or a bot on their account
+	/// reposted. Message formatting can also hide the command from the admin.
 	///
 	/// reloadable: yes
 	/// example: \\!admin debug ping puppygock.gay
-	#[serde(default = "true_fn")]
+	#[serde(default)]
 	pub admin_escape_commands: bool,
 
 	/// Automatically activate the tuwunel admin room console / CLI on
@@ -4502,13 +4590,13 @@ pub struct JwtConfig {
 	#[serde(default, alias = "secret")]
 	pub key: String,
 
-	/// Format of the 'key'. Only HMAC, ECDSA, and B64HMAC are supported
-	/// Binary keys cannot be pasted into this config, so B64HMAC is an
-	/// alternative to HMAC for properly random secret strings.
-	/// - HMAC is a plaintext shared-secret private-key.
-	/// - B64HMAC is a base64-encoded version of HMAC.
-	/// - ECDSA is a PEM-encoded public-key.
-	/// - EDDSA is a PEM-encoded Ed25519 public-key.
+	/// Format of the 'key': HMAC, B64HMAC, ECDSA, or EDDSA, case-insensitive.
+	///
+	/// HMAC is a plaintext shared secret, and B64HMAC (also spelled HMACB64)
+	/// is the same secret base64-encoded in the standard alphabet with '='
+	/// padding, for random binary secrets that cannot be pasted as text.
+	/// ECDSA and EDDSA are PEM-encoded public keys, EDDSA for Ed25519.
+	/// Startup and reload both refuse an unknown format while JWT is enabled.
 	///
 	/// reloadable: yes
 	/// default: "HMAC"
@@ -4523,7 +4611,10 @@ pub struct JwtConfig {
 	#[serde(default = "true_fn")]
 	pub register_user: bool,
 
-	/// JWT algorithm
+	/// Signature algorithm for validating tokens.
+	///
+	/// The name must suit the key format: HS256, HS384, or HS512 for HMAC
+	/// and B64HMAC, ES256 or ES384 for ECDSA, and EdDSA for EDDSA.
 	///
 	/// reloadable: yes
 	/// default: "HS256"
@@ -4588,6 +4679,127 @@ pub struct JwtConfig {
 	pub validate_signature: bool,
 }
 
+/// Configures request rate limits.
+///
+/// Each subsection limits one kind of request, such as password sign-in.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.rate_limiting",
+	ignore = "login"
+)]
+pub struct RateLimits {
+	/// Limits password sign-in per account, in the `failed` and `account`
+	/// subsections.
+	// external structure; separate section
+	#[serde(default)]
+	pub login: LoginRateLimits,
+}
+
+/// Limits password sign-in per account on two axes.
+///
+/// Both mirror Synapse's `rc_login` limits of the same purpose and are keyed on
+/// the account rather than the client address.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.rate_limiting.login",
+	ignore = "failed account"
+)]
+pub struct LoginRateLimits {
+	/// Limits wrong passwords against one account.
+	// external structure; separate section
+	#[serde(default)]
+	pub failed: LoginFailedRateLimit,
+
+	/// Limits successful sign-ins to one account.
+	// external structure; separate section
+	#[serde(default)]
+	pub account: LoginAccountRateLimit,
+}
+
+/// Limits wrong passwords against one account.
+///
+/// A name that matches no account counts as a wrong password, so the limit
+/// does not reveal which accounts exist.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.rate_limiting.login.failed"
+)]
+pub struct LoginFailedRateLimit {
+	/// Token-bucket refill rate (failures per second) for wrong passwords
+	/// against one account.
+	///
+	/// Every password attempt takes a token before the password is checked,
+	/// and only a wrong password keeps it; once the bucket is empty, even the
+	/// owner's correct password is refused with `M_LIMIT_EXCEEDED`. Applies to
+	/// `/login` (but not to the LDAP binds it makes), the built-in OIDC login
+	/// page and password re-entry for sensitive actions (UIAA), keyed on the
+	/// account. Mirrors Synapse's `rc_login.failed_attempts` and its default:
+	/// `burst_count` failures, then about one attempt every six seconds, or
+	/// some 14,700 a day.
+	///
+	/// `0` disables this limit rather than making a bucket that never refills.
+	///
+	/// reloadable: yes
+	/// default: 0.17
+	#[serde(default = "default_login_failed_per_second")]
+	pub per_second: f64,
+
+	/// Token-bucket depth (burst size) for wrong passwords against one
+	/// account.
+	///
+	/// The number of failures allowed before `per_second` governs. `0`
+	/// disables this limit, as does a `0` rate. The default is Synapse's
+	/// `rc_login.failed_attempts.burst_count`.
+	///
+	/// reloadable: yes
+	/// default: 3
+	#[serde(default = "default_login_failed_burst_count")]
+	pub burst_count: u32,
+}
+
+/// Limits successful sign-ins to one account.
+///
+/// Only a sign-in by a verified password takes a token, so wrong guesses never
+/// lock the owner out on this axis.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.rate_limiting.login.account"
+)]
+pub struct LoginAccountRateLimit {
+	/// Token-bucket refill rate (sign-ins per second) for successful password
+	/// logins to one account.
+	///
+	/// Applies to `/login` with `m.login.password` (but not to the LDAP binds it
+	/// makes) and to the built-in OIDC login page, keyed on the account rather
+	/// than the client IP. Mirrors Synapse's `rc_login.account` and its default
+	/// of `burst_count` sign-ins, then about one every five and a half minutes;
+	/// once those are used up, a correct password is refused with
+	/// `M_LIMIT_EXCEEDED`.
+	///
+	/// `0` disables this limit rather than making a bucket that never refills.
+	///
+	/// reloadable: yes
+	/// default: 0.003
+	#[serde(default = "default_login_account_per_second")]
+	pub per_second: f64,
+
+	/// Token-bucket depth (burst size) for successful password logins to one
+	/// account.
+	///
+	/// The number of sign-ins allowed before `per_second` governs. `0` disables
+	/// this limit, as does a `0` rate. The default is Synapse's
+	/// `rc_login.account.burst_count`.
+	///
+	/// reloadable: yes
+	/// default: 5
+	#[serde(default = "default_login_account_burst_count")]
+	pub burst_count: u32,
+}
+
 /// Configures outbound email verification through SMTP.
 ///
 /// The connection URI and sender identify the relay and source mailbox.
@@ -4610,6 +4822,7 @@ pub struct SmtpConfig {
 	/// characters in the username or password are percent-encoded the same
 	/// way.
 	///
+	/// display: uri-userinfo
 	/// example: "smtps://user:pass@mail.example.com:465"
 	pub connection_uri: Option<String>,
 
@@ -4924,6 +5137,7 @@ impl IdentityProvider {
 	///
 	/// The identifier is the OAuth application's client ID. It is borrowed from
 	/// this configuration without allocation.
+	#[inline]
 	#[must_use]
 	pub fn id(&self) -> &str { self.client_id.as_str() }
 
@@ -4946,6 +5160,14 @@ impl IdentityProvider {
 	}
 }
 
+/// Returns the name shown to a user choosing between providers.
+///
+/// The configured name wins, and the brand stands in when none is set.
+#[implement(IdentityProvider)]
+#[inline]
+#[must_use]
+pub fn display_name(&self) -> &str { self.name.as_deref().unwrap_or(&self.brand) }
+
 /// Selects the backend for a named media storage provider.
 ///
 /// Local providers store objects beneath a filesystem path, while S3 providers
@@ -4966,6 +5188,16 @@ pub enum StorageProvider {
 	#[expect(non_camel_case_types)]
 	#[serde(rename = "s3", alias = "S3")]
 	s3(Box<StorageProviderS3>),
+
+	/// Selects a Google Cloud Storage backend.
+	///
+	/// The boxed settings configure the bucket and object prefix. Credentials
+	/// are resolved by the object-store client, which falls back to the
+	/// instance metadata server when none are configured; that is what allows
+	/// use from GKE Workload Identity without any exported key material.
+	#[expect(non_camel_case_types)]
+	#[serde(rename = "gcs", alias = "GCS")]
+	gcs(Box<StorageProviderGcs>),
 
 	/// Disables this storage provider entry.
 	///
@@ -5128,6 +5360,81 @@ pub struct StorageProviderS3 {
 	/// Only set this to false if you expect a provider to be down at startup or
 	/// for development/testing purposes; checks are disabled when the server
 	/// is started in '--maintenance' mode.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub startup_check: bool,
+}
+
+/// Configures a Google Cloud Storage provider.
+///
+/// Only the bucket and an optional object prefix are required. Credentials are
+/// resolved by the object-store client in this order: an explicit service
+/// account key, an application-credentials file, then the instance metadata
+/// server. On GKE the metadata-server fallback means Workload Identity works
+/// with no credential settings at all and no exported key material.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[config_example_generator(
+	filename = "tuwunel-example.toml",
+	section = "global.storage_provider.<ID>.gcs",
+	section_aliases = "GCS"
+)]
+pub struct StorageProviderGcs {
+	/// The name of the GCS bucket, e.g. "my-media-bucket". Required; an unset
+	/// bucket disables this provider.
+	///
+	/// A `gs://bucket/path` URL is intentionally not accepted here: the path
+	/// component would not be applied as an object prefix. Set `bucket` and
+	/// `base_path` separately instead.
+	pub bucket: Option<StorageBucketName>,
+
+	/// Optional path prefix within the bucket where all our operations will take
+	/// place.
+	#[serde(alias = "path")]
+	pub base_path: Option<String>,
+
+	/// (expert use) Path to a Google service account key file. Leave unset to
+	/// resolve credentials from the environment, which on GCE/GKE ends at the
+	/// instance metadata server; that is the keyless path and the recommended
+	/// configuration. Setting this requires exported key material.
+	pub service_account_path: Option<String>,
+
+	/// (expert use) Path to an application default credentials file. Leave unset
+	/// to resolve credentials from the environment. Only service-account and
+	/// authorized-user documents are recognised, not every
+	/// external-account/workload-identity-federation file format.
+	pub application_credentials_path: Option<String>,
+
+	/// (expert use) Threshold size for switching to multi-part uploads. This value
+	/// determines what a "large" upload is. The value is a parsed string allowing
+	/// SI or IEC units for convenience.
+	///
+	/// default: 100 MiB
+	#[serde(default = "default_multipart_threshold")]
+	pub multipart_threshold: ByteSize,
+
+	/// (expert use) Size of each individual part within a multi-part upload. Once
+	/// an upload exceeds `multipart_threshold` the payload is split into parts of
+	/// this size, each sent as a separate request. The value is a parsed string
+	/// allowing SI or IEC units for convenience.
+	///
+	/// default: 10 MiB
+	#[serde(default = "default_multipart_part_size")]
+	pub multipart_part_size: ByteSize,
+
+	/// (developer use) Allows skipping request signatures.
+	///
+	/// default: true
+	#[serde(default = "some_true_fn")]
+	pub use_signatures: Option<bool>,
+
+	/// (developer use) Enables checks performed at startup, such as probing the
+	/// provider. Failures are considered critical startup errors and abort
+	/// startup. When set to false, faulty providers are only discovered on first
+	/// use and will not be fatal errors.
+	///
+	/// The check is a listing probe: it requires `storage.objects.list`, proves
+	/// neither write nor delete permission, and passes on an empty bucket.
 	///
 	/// default: true
 	#[serde(default = "true_fn")]
@@ -5436,6 +5743,17 @@ pub fn password_hash_cost(&self) -> Cost {
 	}
 }
 
+/// Returns whether login screens list each identity provider by name.
+///
+/// `single_sso` and `sso_custom_providers_page` each replace that list with
+/// one single sign-on entry.
+#[implement(Config)]
+#[inline]
+#[must_use]
+pub fn lists_identity_providers(&self) -> bool {
+	!self.sso_custom_providers_page && !self.single_sso
+}
+
 impl TlsConfig {
 	/// Returns the configured TLS certificate and key paths together.
 	///
@@ -5456,6 +5774,24 @@ impl TlsConfig {
 	}
 }
 
+impl Default for LoginFailedRateLimit {
+	fn default() -> Self {
+		Self {
+			per_second: default_login_failed_per_second(),
+			burst_count: default_login_failed_burst_count(),
+		}
+	}
+}
+
+impl Default for LoginAccountRateLimit {
+	fn default() -> Self {
+		Self {
+			per_second: default_login_account_per_second(),
+			burst_count: default_login_account_burst_count(),
+		}
+	}
+}
+
 fn true_fn() -> bool { true }
 
 fn default_policy_server_request_timeout() -> u64 { 5 }
@@ -5469,6 +5805,16 @@ fn default_rendezvous_max_sessions() -> usize { 100 }
 fn default_rendezvous_rc_per_second() -> u32 { 10 }
 
 fn default_rendezvous_rc_burst_count() -> u32 { 20 }
+
+// Synapse's `rc_login` defaults, taken unchanged:
+// https://element-hq.github.io/synapse/latest/usage/configuration/config_documentation.html#rc_login
+fn default_login_failed_per_second() -> f64 { 0.17 }
+
+fn default_login_failed_burst_count() -> u32 { 3 }
+
+fn default_login_account_per_second() -> f64 { 0.003 }
+
+fn default_login_account_burst_count() -> u32 { 5 }
 
 fn some_true_fn() -> Option<bool> { Some(true) }
 
@@ -5528,7 +5874,7 @@ fn default_servernameevent_data_cache_capacity() -> u32 {
 }
 
 fn default_servername_status_cache_capacity() -> u32 {
-	parallelism_scaled_u32(10_000).saturating_add(100_000)
+	parallelism_scaled_u32(15_000).saturating_add(200_000)
 }
 
 fn default_resolver_cache_capacity() -> u32 {
@@ -5558,6 +5904,10 @@ fn default_ip_lookup_strategy() -> u8 { 5 }
 fn default_max_request_size() -> usize { 24 * 1024 * 1024 }
 
 fn default_max_response_size() -> usize { 256 * 1024 * 1024 }
+
+fn default_max_remote_profile_fields() -> usize { 100 }
+
+fn default_max_profile_fields_per_request() -> usize { 64 }
 
 fn default_max_pending_media_uploads() -> usize { 5 }
 
@@ -5620,6 +5970,8 @@ fn default_appservice_idle_timeout() -> u64 { 300 }
 fn default_pusher_idle_timeout() -> u64 { 15 }
 
 fn default_max_fetch_prev_events() -> u16 { 1024_u16 }
+
+fn default_thread_latest_reply_search_limit() -> usize { 1024 }
 
 fn default_prev_events_concurrency() -> u16 {
 	u16::try_from(MAX_PREV_EVENTS).expect("MAX_PREV_EVENTS exceeds u16")
@@ -5737,6 +6089,7 @@ pub fn default_default_room_version() -> RoomVersionId { RoomVersionId::V12 }
 fn default_ip_range_denylist() -> Vec<String> {
 	vec![
 		"127.0.0.0/8".to_owned(),
+		"0.0.0.0/8".to_owned(),
 		"10.0.0.0/8".to_owned(),
 		"172.16.0.0/12".to_owned(),
 		"192.168.0.0/16".to_owned(),
@@ -5750,6 +6103,7 @@ fn default_ip_range_denylist() -> Vec<String> {
 		"203.0.113.0/24".to_owned(),
 		"224.0.0.0/4".to_owned(),
 		"::1/128".to_owned(),
+		"::/128".to_owned(),
 		"fe80::/10".to_owned(),
 		"fc00::/7".to_owned(),
 		"2001:db8::/32".to_owned(),
