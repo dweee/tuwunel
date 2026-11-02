@@ -105,7 +105,7 @@ class TransferSafetyTests(unittest.TestCase):
             with self.subTest(workflow=path.name):
                 sections = re.split(r'(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):\n', path.read_text().split('\njobs:\n', 1)[1])[1:]
                 jobs = dict(zip(sections[::2], sections[1::2]))
-                self.assertEqual(set(jobs), {'plan', 'dependencies', 'publish-dependencies', 'build', 'publish'})
+                self.assertEqual(set(jobs), {'plan', 'dependencies', 'publish-dependencies', 'build', 'publish', 'test'})
                 for name, job in jobs.items():
                     if name not in {'publish', 'publish-dependencies'}:
                         lines = job.splitlines()
