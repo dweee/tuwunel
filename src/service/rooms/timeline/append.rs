@@ -19,21 +19,24 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Result, err, error, implement,
+	Result, debug_warn, err, error, implement,
 	matrix::{
 		event::Event,
 		pdu::{PduCount, PduEvent, PduId, RawPduId},
 		room_version,
 	},
 	smallvec::SmallVec,
-	utils::{self, result::LogErr},
+	utils::result::{LogErr, NotFound},
 };
 use tuwunel_database::Json;
 
 use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard, bias_count};
-use crate::rooms::{
-	read_receipt::PrivateRead, short::ShortRoomId, state_accessor::plain_text_topic,
-	state_cache::MembershipUpdate, state_compressor::CompressedState,
+use crate::{
+	admin::CommandInput,
+	rooms::{
+		read_receipt::PrivateRead, short::ShortRoomId, state_accessor::plain_text_topic,
+		state_cache::MembershipUpdate, state_compressor::CompressedState,
+	},
 };
 
 type Band<'a> = SmallVec<[&'a EventId; 1]>;
@@ -140,36 +143,8 @@ where
 			.entry("unsigned".into())
 			.or_insert_with(|| CanonicalJsonValue::Object(BTreeMap::default()))
 		{
-			if let Ok(shortstatehash) = self
-				.services
-				.state
-				.pdu_shortstatehash(pdu.event_id())
-				.await && let Ok(prev_state) = self
-				.services
-				.state_accessor
-				.state_get(shortstatehash, &pdu.kind().to_string().into(), state_key)
-				.await
-			{
-				unsigned.insert(
-					"prev_content".into(),
-					CanonicalJsonValue::Object(
-						utils::to_canonical_object(prev_state.get_content_as_value()).map_err(
-							|e| {
-								err!(Database(error!(
-									"Failed to convert prev_state to canonical JSON: {e}",
-								)))
-							},
-						)?,
-					),
-				);
-				unsigned.insert(
-					"prev_sender".into(),
-					CanonicalJsonValue::String(prev_state.sender().to_string()),
-				);
-				unsigned.insert(
-					"replaces_state".into(),
-					CanonicalJsonValue::String(prev_state.event_id().to_string()),
-				);
+			if let Some(prev_state) = self.prev_state(pdu, state_key).await {
+				unsigned.extend(prev_state_unsigned(&prev_state)?);
 			}
 		} else {
 			error!("Invalid unsigned type in pdu.");
@@ -255,6 +230,54 @@ where
 }
 
 #[implement(super::Service)]
+async fn prev_state(&self, pdu: &PduEvent, state_key: &str) -> Option<PduEvent> {
+	let event_id = pdu.event_id();
+	let shortstatehash = self
+		.services
+		.state
+		.pdu_shortstatehash(event_id)
+		.await
+		.optional()
+		.inspect_err(|error| debug_warn!(%event_id, %error, "State snapshot read failed."))
+		.ok()
+		.flatten()?;
+
+	let event_type = pdu.kind().to_cow_str().into();
+
+	self.services
+		.state_accessor
+		.state_get(shortstatehash, &event_type, state_key)
+		.await
+		.optional()
+		.inspect_err(|error| debug_warn!(%event_id, %error, "Replaced state read failed."))
+		.ok()
+		.flatten()
+}
+
+fn prev_state_unsigned(prev_state: &PduEvent) -> Result<CanonicalJsonObject> {
+	let prev_content = prev_state
+		.get_content::<CanonicalJsonObject>()
+		.map_err(|e| {
+			err!(Database(error!("Failed to convert prev_state to canonical JSON: {e}")))
+		})?;
+
+	let unsigned = [
+		("prev_content".into(), CanonicalJsonValue::Object(prev_content)),
+		(
+			"prev_sender".into(),
+			CanonicalJsonValue::String(prev_state.sender().to_string()),
+		),
+		(
+			"replaces_state".into(),
+			CanonicalJsonValue::String(prev_state.event_id().to_string()),
+		),
+	]
+	.into();
+
+	Ok(unsigned)
+}
+
+#[implement(super::Service)]
 async fn append_pdu_effects(
 	&self,
 	pdu_id: RawPduId,
@@ -287,26 +310,9 @@ async fn append_pdu_effects(
 			}
 		},
 		| TimelineEventType::RoomMember => self.append_member_effects(pdu, count).await?,
-		| TimelineEventType::RoomMessage => {
-			let content: ExtractBody = pdu.get_content()?;
-			if let Some(body) = content.body {
-				self.services
-					.search
-					.index_pdu(shortroomid, &pdu_id, &body);
-
-				if self
-					.services
-					.admin
-					.is_admin_command(pdu, &body)
-					.await
-				{
-					self.services
-						.admin
-						.command(body, Some((pdu.event_id()).into()))
-						.await?;
-				}
-			}
-		},
+		| TimelineEventType::RoomMessage =>
+			self.append_message_effects(&pdu_id, pdu, shortroomid)
+				.await?,
 		| TimelineEventType::RoomTopic =>
 			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
 				self.services
@@ -423,6 +429,46 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 		self.services
 			.membership
 			.auto_accept(pdu.room_id(), &user_id, pdu.sender(), is_direct);
+	}
+
+	Ok(())
+}
+
+/// Index an `m.room.message` event's body, and queue it when it is an admin
+/// command.
+///
+/// The queued command carries the event's sender, so a handler can tell who
+/// issued it, and the event's id, which its response replies to.
+#[implement(super::Service)]
+async fn append_message_effects(
+	&self,
+	pdu_id: &RawPduId,
+	pdu: &PduEvent,
+	shortroomid: ShortRoomId,
+) -> Result {
+	let content: ExtractBody = pdu.get_content()?;
+	let Some(body) = content.body else {
+		return Ok(());
+	};
+
+	self.services
+		.search
+		.index_pdu(shortroomid, pdu_id, &body);
+
+	if self
+		.services
+		.admin
+		.is_admin_command(pdu, &body)
+		.await
+	{
+		self.services
+			.admin
+			.command(CommandInput {
+				command: body,
+				reply_id: Some(pdu.event_id().into()),
+				sender: Some(pdu.sender().into()),
+			})
+			.await?;
 	}
 
 	Ok(())

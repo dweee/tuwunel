@@ -1,6 +1,7 @@
 use axum::extract::State;
 use futures::StreamExt;
 use ruma::{
+	UserId,
 	api::client::profile::{
 		PropagateTo, delete_profile_field, get_profile,
 		get_profile_field::{self, v3::Response as GetProfileFieldResponse},
@@ -8,10 +9,10 @@ use ruma::{
 	},
 	profile::{ProfileFieldName, ProfileFieldValue},
 };
-use tuwunel_core::{Err, Result, err};
-use tuwunel_service::{presence::Ping, profile::Propagation};
+use tuwunel_core::{Err, Result, err, utils::BoolExt};
+use tuwunel_service::{Services, presence::Ping, profile::Propagation};
 
-use crate::{ClientIp, Ruma};
+use crate::{ClientIp, Ruma, client::utils::may_set_displayname};
 
 /// Resolve a `PropagateTo` request value against the server default.
 ///
@@ -35,6 +36,8 @@ pub(crate) async fn get_profile_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_profile::v3::Request>,
 ) -> Result<get_profile::v3::Response> {
+	shared_rooms_check(&services, &body, &body.user_id).await?;
+
 	if !services.globals.user_is_local(&body.user_id) {
 		services
 			.profile
@@ -69,6 +72,8 @@ pub(crate) async fn get_profile_field_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_profile_field::v3::Request>,
 ) -> Result<GetProfileFieldResponse> {
+	shared_rooms_check(&services, &body, &body.user_id).await?;
+
 	if !services.globals.user_is_local(&body.user_id) {
 		services
 			.profile
@@ -121,6 +126,9 @@ pub(crate) async fn set_profile_field_route(
 	body: Ruma<set_profile_field::v3::Request>,
 ) -> Result<set_profile_field::v3::Response> {
 	let sender_user = body.sender_user();
+	let field = body.value.field_name();
+
+	displayname_check(&services, &body, &field).await?;
 
 	if *sender_user != body.user_id
 		&& !body
@@ -137,7 +145,7 @@ pub(crate) async fn set_profile_field_route(
 		.profile
 		.set_profile_keys(
 			&body.user_id,
-			&[(body.value.field_name(), Some(body.value.value().into_owned()))],
+			&[(field, Some(body.value.value().into_owned()))],
 			Some(propagation),
 		)
 		.await?;
@@ -170,6 +178,8 @@ pub(crate) async fn delete_profile_field_route(
 ) -> Result<delete_profile_field::v3::Response> {
 	let sender_user = body.sender_user();
 
+	displayname_check(&services, &body, &body.field).await?;
+
 	if *sender_user != body.user_id
 		&& !body
 			.appservice_info
@@ -200,4 +210,60 @@ pub(crate) async fn delete_profile_field_route(
 		.await?;
 
 	Ok(delete_profile_field::v3::Response {})
+}
+
+/// Refuses a profile read withheld by
+/// `limit_profile_requests_to_users_who_share_rooms`.
+///
+/// Appservices and a user reading their own profile are exempt. The refusal
+/// precedes the existence check, so it discloses nothing about the profile.
+async fn shared_rooms_check<T>(services: &Services, body: &Ruma<T>, user_id: &UserId) -> Result
+where
+	T: Sync,
+{
+	if services
+		.config
+		.limit_profile_requests_to_users_who_share_rooms
+		.is_false()
+		|| body.appservice_info.is_some()
+	{
+		return Ok(());
+	}
+
+	let visible = match body.sender_user.as_deref() {
+		| None => false,
+		| Some(sender_user) if sender_user == user_id => true,
+		| Some(sender_user) =>
+			services
+				.state_cache
+				.user_sees_user(sender_user, user_id)
+				.await,
+	};
+
+	visible
+		.into_option()
+		.ok_or_else(|| err!(Request(Forbidden("Profile isn't available."))))
+}
+
+/// Refuses a display name change withheld by `enable_set_displayname`.
+///
+/// Only display name writes are gated; `may_set_displayname` decides who is
+/// exempt.
+async fn displayname_check<T>(
+	services: &Services,
+	body: &Ruma<T>,
+	field: &ProfileFieldName,
+) -> Result
+where
+	T: Sync,
+{
+	let is_admin = || services.admin.user_is_admin(body.sender_user());
+
+	if *field != ProfileFieldName::DisplayName
+		|| may_set_displayname(services, body, is_admin).await
+	{
+		return Ok(());
+	}
+
+	Err!(Request(Forbidden("Setting display names has been disabled.")))
 }

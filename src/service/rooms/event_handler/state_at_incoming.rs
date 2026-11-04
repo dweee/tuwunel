@@ -7,11 +7,13 @@ use futures::{
 use ruma::{EventId, OwnedEventId, RoomId, RoomVersionId};
 use tuwunel_core::{
 	Error, Result, debug, debug_warn, err, implement,
+	itertools::Itertools,
 	matrix::Event,
+	pdu::check_room_id,
 	ref_at, trace,
 	utils::{
 		option::OptionExt,
-		stream::{BroadbandExt, IterStream, TryBroadbandExt, WidebandExt},
+		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt, WidebandExt},
 	},
 };
 
@@ -50,7 +52,7 @@ where
 		.services
 		.state
 		.pdu_shortstatehash(prev_event_id)
-		.inspect_err(|e| debug_warn!(?prev_event_id, "Missing state at prev_event: {e}"))
+		.inspect_err(|e| debug_warn!(?prev_event_id, %e, "Missing state at prev_event."))
 		.await
 	else {
 		return Ok(None);
@@ -84,6 +86,9 @@ where
 		.map(Ok);
 
 	let (prev_event, state) = try_join(prev_event, state).await?;
+
+	check_room_id(&prev_event, incoming_pdu.room_id())?;
+
 	let Some(mut state) = state else {
 		return Ok(None);
 	};
@@ -142,7 +147,7 @@ where
 	);
 
 	trace!("Calculating extremity statehashes...");
-	let Ok(extremity_sstatehashes) = incoming_pdu
+	let Ok(prevs) = incoming_pdu
 		.prev_events()
 		.try_stream()
 		.broad_and_then(|prev_event_id| {
@@ -154,18 +159,24 @@ where
 			let prev_event = self.services.timeline.get_pdu(prev_event_id);
 
 			try_join(sstatehash, prev_event).inspect_err(move |e| {
-				debug_warn!(?prev_event_id, "Missing state at prev_event: {e}");
+				debug_warn!(?prev_event_id, %e, "Missing state at prev_event.");
 			})
 		})
-		.try_collect::<HashMap<_, _>>()
+		.try_collect::<Vec<_>>()
 		.await
 	else {
 		return Ok(None);
 	};
 
 	trace!("Calculating fork states...");
-	let forks = extremity_sstatehashes
+	prevs
+		.iter()
+		.try_for_each(|(_, pdu)| check_room_id(pdu, room_id))?;
+
+	let forks = prevs
 		.into_iter()
+		.sorted_unstable_by(|a, b| fork_identity(a).cmp(&fork_identity(b)))
+		.dedup_by(|a, b| fork_identity(a) == fork_identity(b))
 		.stream()
 		.wide_then(|(sstatehash, prev_event)| {
 			self.state_at_incoming_fork(room_id, room_version, sstatehash, prev_event)
@@ -178,23 +189,14 @@ where
 		.try_collect::<Vec<_>>()
 		.await?;
 
-	let mut state_error = None;
-	let mut complete_forks = Vec::with_capacity(forks.len());
-	for fork in forks {
-		match fork {
-			| Ok(fork) => complete_forks.push(fork),
-			| Err(error) => {
-				state_error.get_or_insert(error);
-			},
-		}
-	}
-
-	if let Some(error) = state_error {
-		debug_warn!(%error, "Failed to materialize sibling fork state.");
+	let Ok((fork_states, auth_chain_sets)): Result<(Vec<_>, Vec<_>)> = forks
+		.into_iter()
+		.process_results(|complete| complete.unzip())
+		.inspect_err(|error| debug_warn!(%error, "Failed to materialize sibling fork state."))
+	else {
 		return Ok(None);
-	}
+	};
 
-	let (fork_states, auth_chain_sets): (Vec<_>, Vec<_>) = complete_forks.into_iter().unzip();
 	let fork_states = fork_states.into_iter().stream();
 	let auth_chain_sets = auth_chain_sets.into_iter().stream();
 
@@ -222,6 +224,24 @@ where
 		.map(Some)
 		.map(Ok)
 		.await
+}
+
+/// The fork a prev event contributes to resolution.
+///
+/// A prev's snapshot is the state before it, so a state prev also carries its
+/// own event; siblings sharing a snapshot share a fork only when neither sets
+/// state.
+fn fork_identity<Pdu>(
+	(sstatehash, prev_event): &(ShortStateHash, Pdu),
+) -> (ShortStateHash, Option<&EventId>)
+where
+	Pdu: Event,
+{
+	let leaf = prev_event
+		.state_key()
+		.map(|_| prev_event.event_id());
+
+	(*sstatehash, leaf)
 }
 
 #[implement(super::Service)]
@@ -262,14 +282,20 @@ where
 			(shortstatekey, event_id.to_owned())
 		});
 
-	let leaf_state_after_event: Vec<_> = self
+	let snapshot = self
 		.services
 		.state_accessor
-		.state_full_ids_strict(sstatehash)
-		.chain(leaf.map(Ok))
-		.try_collect()
-		.await
-		.map_err(ForkError::State)?;
+		.state_full_ids_complete(sstatehash)
+		.map_err(ForkError::State)
+		.await?;
+
+	// The leaf goes last so `fork_state` lets it replace the snapshot's entry.
+	let leaf_state_after_event = leaf
+		.ready_fold(snapshot, |mut state, entry| {
+			state.push(entry);
+			state
+		})
+		.await;
 
 	trace!(
 		prev_event = ?prev_event.event_id(),
@@ -323,8 +349,8 @@ where
 
 /// Collects the full auth chain for one fork branch.
 ///
-/// The ids are distinct as [`AuthSet::from_distinct`] requires: the chain
-/// walk dedups short ids and the short-to-event-id mapping is injective.
+/// The chain walk dedups short ids, so the ids are distinct unless a damaged
+/// short-id mapping repeats one, which the auth difference counts once.
 /// Iteration order is arbitrary.
 #[implement(super::Service)]
 pub(super) async fn fork_chain<'a, Events>(
