@@ -2,7 +2,7 @@ name: Tuwunel Linux
 'on':
   push:
     branches:
-    - flakey
+      - flakey
   pull_request: null
   workflow_dispatch:
     inputs:
@@ -25,24 +25,24 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       dependencies: ${{ steps.matrix.outputs.dependencies }}
     steps:
-    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      with:
-        persist-credentials: false
-    - name: Check Attic publication handling without credentials
-      run: |
-        python3 ci/test-push-attic.py
-        python3 ci/test-transfer-attic.py
-        python3 ci/test-public-closure.py
-        python3 ci/test-configure-attic-read.py
-    - id: matrix
-      env:
-        SELECTED_PACKAGE: ${{ inputs.package || 'all' }}
-      run: |
-        case "$SELECTED_PACKAGE" in all|matrix-tuwunel|tuwunel-deps) ;; *) exit 2 ;; esac
-        matrix=$(python3 ci/matrix.py others --package matrix-tuwunel)
-        dependencies=$(python3 ci/matrix.py others --package tuwunel-deps)
-        echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-        echo "dependencies=$dependencies" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Check Attic publication handling without credentials
+        run: |
+          python3 ci/test-push-attic.py
+          python3 ci/test-transfer-attic.py
+          python3 ci/test-public-closure.py
+          python3 ci/test-configure-attic-read.py
+      - id: matrix
+        env:
+          SELECTED_PACKAGE: ${{ inputs.package || 'all' }}
+        run: |
+          case "$SELECTED_PACKAGE" in all|matrix-tuwunel|tuwunel-deps) ;; *) exit 2 ;; esac
+          matrix=$(python3 ci/matrix.py others --package matrix-tuwunel)
+          dependencies=$(python3 ci/matrix.py others --package tuwunel-deps)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "dependencies=$dependencies" >> "$GITHUB_OUTPUT"
   dependencies:
     needs: plan
     name: Dependencies (${{ matrix.system }})
@@ -53,77 +53,77 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.dependencies) }}
     steps:
-    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      with:
-        persist-credentials: false
-        submodules: recursive
-    - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
-      with:
-        source-tag: v3.24.1
-        summarize: false
-        kvm: false
-        extra-conf: |
-          experimental-features = nix-command flakes parallel-eval
-          eval-cores = 2
-          accept-flake-config = false
-          substituters = https://cache.nixos.org/
-          extra-substituters =
-          extra-trusted-public-keys = flakey:mDx4DiNpH5w1Pl8OAKFFWq1ZsypA9lbaFKNiRWhqYE8=
-          max-jobs = 1
-          cores = 2
-    - name: Verify Determinate client and daemon
-      run: |
-        nix --version | grep -F 'Determinate Nix 3.24.1'
-        nix store info --store daemon --json
-    - name: Configure authenticated private cache reads for trusted builds
-      if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}',
-        github.event.repository.default_branch) }}
-      env:
-        ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
-      run: python3 ci/configure-attic-read.py
-    - name: Evaluate and build the selected native package
-      env:
-        TARGET_SYSTEM: ${{ matrix.system }}
-        TARGET_PACKAGE: ${{ matrix.package }}
-      run: |
-        set -euo pipefail
-        test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "$TARGET_SYSTEM"
-        target=".#packages.$TARGET_SYSTEM.$TARGET_PACKAGE"
-        python3 ci/public-closure.py "$target"
-        SECONDS=0
-        nix build "$target" --no-update-lock-file --no-write-lock-file --no-link --print-out-paths -L > outputs.txt
-        {
-          echo "Built $TARGET_PACKAGE for $TARGET_SYSTEM"
-          echo "Package build: ${SECONDS}s"
-          cat outputs.txt
-        } >> "$GITHUB_STEP_SUMMARY"
-    - name: Report closure transfer size without listing paths
-      shell: bash
-      run: |
-        set -euo pipefail
-        mapfile -t outputs < outputs.txt
-        df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print "Workspace available bytes:", $4 * 1024}'
-        nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
-    - name: Save selected runtime closures independently of cache publication
-      timeout-minutes: 15
-      env:
-        ATTIC_MAX_CLOSURE_MIB: '6144'
-      run: python3 ci/transfer-attic.py export --directory attic-transfer
-    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-      with:
-        name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
-        path: attic-transfer/
-        retention-days: 1
-        compression-level: 0
-        if-no-files-found: error
-        overwrite: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
+        with:
+          source-tag: v3.24.1
+          summarize: false
+          kvm: false
+          extra-conf: |
+            experimental-features = nix-command flakes parallel-eval
+            eval-cores = 2
+            accept-flake-config = false
+            substituters = https://cache.nixos.org/
+            extra-substituters =
+            extra-trusted-public-keys = flakey:mDx4DiNpH5w1Pl8OAKFFWq1ZsypA9lbaFKNiRWhqYE8=
+            max-jobs = 1
+            cores = 2
+      - name: Verify Determinate client and daemon
+        run: |
+          nix --version | grep -F 'Determinate Nix 3.24.1'
+          nix store info --store daemon --json
+      - name: Configure authenticated private cache reads for trusted builds
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}',
+          github.event.repository.default_branch) }}
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: python3 ci/configure-attic-read.py
+      - name: Evaluate and build the selected native package
+        env:
+          TARGET_SYSTEM: ${{ matrix.system }}
+          TARGET_PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "$TARGET_SYSTEM"
+          target=".#packages.$TARGET_SYSTEM.$TARGET_PACKAGE"
+          python3 ci/public-closure.py "$target"
+          SECONDS=0
+          nix build "$target" --no-update-lock-file --no-write-lock-file --no-link --print-out-paths -L > outputs.txt
+          {
+            echo "Built $TARGET_PACKAGE for $TARGET_SYSTEM"
+            echo "Package build: ${SECONDS}s"
+            cat outputs.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report closure transfer size without listing paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < outputs.txt
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print "Workspace available bytes:", $4 * 1024}'
+          nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
+      - name: Save selected runtime closures independently of cache publication
+        timeout-minutes: 15
+        env:
+          ATTIC_MAX_CLOSURE_MIB: "6144"
+        run: python3 ci/transfer-attic.py export --directory attic-transfer
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
+          path: attic-transfer/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false
   publish-dependencies:
-    needs:
-    - plan
-    - dependencies
-    if: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && (vars.ATTIC_PUSH_ENABLED
-      == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && github.ref == format('refs/heads/{0}',
-      github.event.repository.default_branch)) }}
+    permissions:
+      contents: read
+      id-token: write
+    needs: [plan, dependencies]
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && vars.ATTIC_PUSH_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name
+      == 'push') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     name: Cache dependencies (${{ matrix.system }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -132,61 +132,55 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.dependencies) }}
     steps:
-    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      with:
-        persist-credentials: false
-    - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
-      with:
-        source-tag: v3.24.1
-        summarize: false
-        kvm: false
-        extra-conf: |
-          experimental-features = nix-command flakes parallel-eval
-          eval-cores = 2
-          accept-flake-config = false
-          substituters = https://cache.nixos.org/
-          extra-substituters =
-    - name: Verify Determinate client and daemon
-      run: |
-        nix --version | grep -F 'Determinate Nix 3.24.1'
-        nix store info --store daemon --json
-    - name: Install the trusted pinned Attic client before importing build data
-      id: attic
-      timeout-minutes: 15
-      run: |
-        set -euo pipefail
-        client=$(nix build --inputs-from . 'nixpkgs#attic-client' --no-update-lock-file --no-write-lock-file --no-link --print-out-paths --max-jobs 0 --builders "")
-        test -x "$client/bin/attic"
-        echo "binary=$client/bin/attic" >> "$GITHUB_OUTPUT"
-    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-      with:
-        name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
-        path: attic-transfer
-    - name: Install pinned Niks3 publisher
-      run: bash ci/install-niks3.sh
-    - name: Import data without running any package programs
-      timeout-minutes: 15
-      env:
-        ATTIC_MAX_CLOSURE_MIB: '6144'
-      run: python3 ci/transfer-attic.py import --directory attic-transfer
-    - name: Publish imported package outputs to Attic
-      timeout-minutes: 30
-      env:
-        ATTIC_BIN: ${{ steps.attic.outputs.binary }}
-        ATTIC_ENDPOINT: https://attic.monke.fail
-        ATTIC_CACHE: flakey
-        ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
-      run: python3 ci/push-attic.py --outputs attic-transfer/outputs.txt
-    - name: Publish to Niks3 with GitHub OIDC and verify S3 integrity
-      run: python3 ci/push-niks3.py --outputs attic-transfer/outputs.txt
-    permissions:
-      contents: read
-      id-token: write
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
+        with:
+          source-tag: v3.24.1
+          summarize: false
+          kvm: false
+          extra-conf: |
+            experimental-features = nix-command flakes parallel-eval
+            eval-cores = 2
+            accept-flake-config = false
+            substituters = https://cache.nixos.org/
+            extra-substituters =
+      - name: Verify Determinate client and daemon
+        run: |
+          nix --version | grep -F 'Determinate Nix 3.24.1'
+          nix store info --store daemon --json
+      - name: Install the trusted pinned Attic client before importing build data
+        id: attic
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          client=$(nix build --inputs-from . 'nixpkgs#attic-client' --no-update-lock-file --no-write-lock-file --no-link --print-out-paths --max-jobs 0 --builders "")
+          test -x "$client/bin/attic"
+          echo "binary=$client/bin/attic" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
+          path: attic-transfer
+      - name: Install pinned Niks3 publisher
+        run: bash ci/install-niks3.sh
+      - name: Import data without running any package programs
+        timeout-minutes: 15
+        env:
+          ATTIC_MAX_CLOSURE_MIB: "6144"
+        run: python3 ci/transfer-attic.py import --directory attic-transfer
+      - name: Publish imported package outputs to Attic
+        timeout-minutes: 30
+        env:
+          ATTIC_BIN: ${{ steps.attic.outputs.binary }}
+          ATTIC_ENDPOINT: https://attic.monke.fail
+          ATTIC_CACHE: flakey
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: python3 ci/push-attic.py --outputs attic-transfer/outputs.txt
+      - name: Publish to Niks3 with GitHub OIDC and verify S3 integrity
+        run: python3 ci/push-niks3.py --outputs attic-transfer/outputs.txt
   build:
-    needs:
-    - plan
-    - dependencies
-    - publish-dependencies
+    needs: [plan, dependencies, publish-dependencies]
     name: ${{ matrix.package }} (${{ matrix.system }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -195,79 +189,79 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      with:
-        persist-credentials: false
-        submodules: recursive
-    - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
-      with:
-        source-tag: v3.24.1
-        summarize: false
-        kvm: false
-        extra-conf: |
-          experimental-features = nix-command flakes parallel-eval
-          eval-cores = 2
-          accept-flake-config = false
-          substituters = https://cache.nixos.org/
-          extra-substituters =
-          extra-trusted-public-keys = flakey:mDx4DiNpH5w1Pl8OAKFFWq1ZsypA9lbaFKNiRWhqYE8=
-          max-jobs = 1
-          cores = 2
-    - name: Verify Determinate client and daemon
-      run: |
-        nix --version | grep -F 'Determinate Nix 3.24.1'
-        nix store info --store daemon --json
-    - name: Configure authenticated private cache reads for trusted builds
-      if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}',
-        github.event.repository.default_branch) }}
-      env:
-        ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
-      run: python3 ci/configure-attic-read.py
-    - name: Evaluate and build the selected native package
-      env:
-        TARGET_SYSTEM: ${{ matrix.system }}
-        TARGET_PACKAGE: ${{ matrix.package }}
-      run: |
-        set -euo pipefail
-        test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "$TARGET_SYSTEM"
-        target=".#packages.$TARGET_SYSTEM.$TARGET_PACKAGE"
-        python3 ci/public-closure.py "$target"
-        SECONDS=0
-        nix build "$target" --no-update-lock-file --no-write-lock-file --no-link --print-out-paths -L > outputs.txt
-        {
-          echo "Built $TARGET_PACKAGE for $TARGET_SYSTEM"
-          echo "Package build: ${SECONDS}s"
-          cat outputs.txt
-        } >> "$GITHUB_STEP_SUMMARY"
-    - name: Report closure transfer size without listing paths
-      shell: bash
-      run: |
-        set -euo pipefail
-        mapfile -t outputs < outputs.txt
-        df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print "Workspace available bytes:", $4 * 1024}'
-        nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
-    - name: Save selected runtime closures independently of cache publication
-      timeout-minutes: 15
-      env:
-        ATTIC_MAX_CLOSURE_MIB: '6144'
-      run: python3 ci/transfer-attic.py export --directory attic-transfer
-    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-      with:
-        name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
-        path: attic-transfer/
-        retention-days: 1
-        compression-level: 0
-        if-no-files-found: error
-        overwrite: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
+        with:
+          source-tag: v3.24.1
+          summarize: false
+          kvm: false
+          extra-conf: |
+            experimental-features = nix-command flakes parallel-eval
+            eval-cores = 2
+            accept-flake-config = false
+            substituters = https://cache.nixos.org/
+            extra-substituters =
+            extra-trusted-public-keys = flakey:mDx4DiNpH5w1Pl8OAKFFWq1ZsypA9lbaFKNiRWhqYE8=
+            max-jobs = 1
+            cores = 2
+      - name: Verify Determinate client and daemon
+        run: |
+          nix --version | grep -F 'Determinate Nix 3.24.1'
+          nix store info --store daemon --json
+      - name: Configure authenticated private cache reads for trusted builds
+        if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == format('refs/heads/{0}',
+          github.event.repository.default_branch) }}
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: python3 ci/configure-attic-read.py
+      - name: Evaluate and build the selected native package
+        env:
+          TARGET_SYSTEM: ${{ matrix.system }}
+          TARGET_PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "$TARGET_SYSTEM"
+          target=".#packages.$TARGET_SYSTEM.$TARGET_PACKAGE"
+          python3 ci/public-closure.py "$target"
+          SECONDS=0
+          nix build "$target" --no-update-lock-file --no-write-lock-file --no-link --print-out-paths -L > outputs.txt
+          {
+            echo "Built $TARGET_PACKAGE for $TARGET_SYSTEM"
+            echo "Package build: ${SECONDS}s"
+            cat outputs.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report closure transfer size without listing paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < outputs.txt
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print "Workspace available bytes:", $4 * 1024}'
+          nix path-info --recursive --json "${outputs[@]}" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.values() if isinstance(d,dict) else d; print("Runtime closure NAR bytes:", sum(int(x["narSize"]) for x in rows))'
+      - name: Save selected runtime closures independently of cache publication
+        timeout-minutes: 15
+        env:
+          ATTIC_MAX_CLOSURE_MIB: "6144"
+        run: python3 ci/transfer-attic.py export --directory attic-transfer
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
+          path: attic-transfer/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false
     if: ${{ always() && needs.plan.result == 'success' && needs.dependencies.result == 'success' && (needs.publish-dependencies.result
       == 'success' || needs.publish-dependencies.result == 'skipped') && inputs.package != 'tuwunel-deps' }}
   publish:
-    needs:
-    - plan
-    - build
-    if: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && (vars.ATTIC_PUSH_ENABLED
-      == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push') && github.ref == format('refs/heads/{0}',
-      github.event.repository.default_branch)) }}
+    permissions:
+      contents: read
+      id-token: write
+    needs: [plan, build]
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && vars.ATTIC_PUSH_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name
+      == 'push') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     name: Publish ${{ matrix.package }} (${{ matrix.system }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -276,71 +270,65 @@ jobs:
       max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      with:
-        persist-credentials: false
-    - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
-      with:
-        source-tag: v3.24.1
-        summarize: false
-        kvm: false
-        extra-conf: |
-          experimental-features = nix-command flakes parallel-eval
-          eval-cores = 2
-          accept-flake-config = false
-          substituters = https://cache.nixos.org/
-          extra-substituters =
-    - name: Verify Determinate client and daemon
-      run: |
-        nix --version | grep -F 'Determinate Nix 3.24.1'
-        nix store info --store daemon --json
-    - name: Install the trusted pinned Attic client before importing build data
-      id: attic
-      timeout-minutes: 15
-      run: |
-        set -euo pipefail
-        client=$(nix build --inputs-from . 'nixpkgs#attic-client' --no-update-lock-file --no-write-lock-file --no-link --print-out-paths --max-jobs 0 --builders "")
-        test -x "$client/bin/attic"
-        echo "binary=$client/bin/attic" >> "$GITHUB_OUTPUT"
-    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-      with:
-        name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
-        path: attic-transfer
-    - name: Install pinned Niks3 publisher
-      run: bash ci/install-niks3.sh
-    - name: Import data without running any package programs
-      timeout-minutes: 15
-      env:
-        ATTIC_MAX_CLOSURE_MIB: '6144'
-      run: python3 ci/transfer-attic.py import --directory attic-transfer
-    - name: Publish imported package outputs to Attic
-      timeout-minutes: 30
-      env:
-        ATTIC_BIN: ${{ steps.attic.outputs.binary }}
-        ATTIC_ENDPOINT: https://attic.monke.fail
-        ATTIC_CACHE: flakey
-        ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
-      run: python3 ci/push-attic.py --outputs attic-transfer/outputs.txt
-    - name: Publish to Niks3 with GitHub OIDC and verify S3 integrity
-      run: python3 ci/push-niks3.py --outputs attic-transfer/outputs.txt
-    permissions:
-      contents: read
-      id-token: write
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/determinate-nix-action@92957199488000b908fdad19f63711000965d8f3
+        with:
+          source-tag: v3.24.1
+          summarize: false
+          kvm: false
+          extra-conf: |
+            experimental-features = nix-command flakes parallel-eval
+            eval-cores = 2
+            accept-flake-config = false
+            substituters = https://cache.nixos.org/
+            extra-substituters =
+      - name: Verify Determinate client and daemon
+        run: |
+          nix --version | grep -F 'Determinate Nix 3.24.1'
+          nix store info --store daemon --json
+      - name: Install the trusted pinned Attic client before importing build data
+        id: attic
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          client=$(nix build --inputs-from . 'nixpkgs#attic-client' --no-update-lock-file --no-write-lock-file --no-link --print-out-paths --max-jobs 0 --builders "")
+          test -x "$client/bin/attic"
+          echo "binary=$client/bin/attic" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
+          path: attic-transfer
+      - name: Install pinned Niks3 publisher
+        run: bash ci/install-niks3.sh
+      - name: Import data without running any package programs
+        timeout-minutes: 15
+        env:
+          ATTIC_MAX_CLOSURE_MIB: "6144"
+        run: python3 ci/transfer-attic.py import --directory attic-transfer
+      - name: Publish imported package outputs to Attic
+        timeout-minutes: 30
+        env:
+          ATTIC_BIN: ${{ steps.attic.outputs.binary }}
+          ATTIC_ENDPOINT: https://attic.monke.fail
+          ATTIC_CACHE: flakey
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: python3 ci/push-attic.py --outputs attic-transfer/outputs.txt
+
+  # Stable, always-running aggregate: the required status check for this repository.
+      - name: Publish to Niks3 with GitHub OIDC and verify S3 integrity
+        run: python3 ci/push-niks3.py --outputs attic-transfer/outputs.txt
   test:
     name: test
     if: ${{ always() }}
-    needs:
-    - plan
-    - dependencies
-    - publish-dependencies
-    - build
-    - publish
+    needs: [plan, dependencies, publish-dependencies, build, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-    - name: Require every job in this workflow to have passed or been skipped
-      env:
-        RESULTS: ${{ toJSON(needs) }}
-      run: |
-        echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-        echo "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null
+      - name: Require every job in this workflow to have passed or been skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null
