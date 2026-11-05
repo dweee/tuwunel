@@ -7,18 +7,18 @@ jobs:
       actions: write
       checks: read
       statuses: write
-    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@24458be597bead9a750f3e1aea4998e50375849b
+    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@6f4272f3fad36ebbe28dc00b57c5e318dde4924a
     with:
       tool-repository: dweee/dave-fork-ci
-      tool-revision: 24458be597bead9a750f3e1aea4998e50375849b
+      tool-revision: 6f4272f3fad36ebbe28dc00b57c5e318dde4924a
       auto-merge: ${{ vars.FORK_CI_AUTO_MERGE == 'true' && vars.ATTIC_PUSH_ENABLED == 'true' }}
       cache: false
       check-workflow: linux-actions.yml
     if: ${{ vars.GUARDED_UPSTREAM_SYNC_ENABLED == 'true' }}
 'on':
   schedule:
-    - cron: 17 */6 * * *
+  - cron: 17 */6 * * *
   workflow_dispatch: null
   repository_dispatch:
     types:
-      - upstream-updated
+    - upstream-updated
