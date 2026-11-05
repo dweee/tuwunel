@@ -64,6 +64,31 @@ variable "rust_targets" {
     default = "[\"x86_64-unknown-linux-gnu\"]"
 }
 
+variable "llvm_cc" {
+    default = "/usr/bin/clang"
+}
+variable "llvm_cxx" {
+    default = "/usr/bin/clang++"
+}
+variable "llvm_ar" {
+    default = "/usr/bin/llvm-ar"
+}
+variable "llvm_ranlib" {
+    default = "/usr/bin/llvm-ranlib"
+}
+variable "lld_threads" {
+    default = 2
+}
+variable "lto_jobs" {
+    default = 2
+}
+variable "lto_cache_dir" {
+    default = "/var/cache/tuwunel/thinlto"
+}
+variable "lto_cache_policy" {
+    default = "cache_size=0%:cache_size_bytes=10g:prune_after=168h"
+}
+
 variable "sys_names" {
     default = "[\"debian\"]"
 }
@@ -425,9 +450,11 @@ target "complement-testee-valgrind" {
         complement-tester = elem("target:complement-tester-valgrind", [sys_name, sys_version, sys_target])
     }
     args = {
-        # Leave the valgrind testee on the default policy: it is already
-        # serialized by valgrind, and a realtime class would only interfere.
+        # Leave the valgrind testee on the default policy and unpinned: it is
+        # already serialized by valgrind, and a realtime class would only
+        # interfere.
         sched_policy = ""
+        sched_cpus = ""
     }
 }
 
@@ -456,8 +483,11 @@ target "complement-testee" {
         # timing-sensitive job under --fifo; the debug testee is an ordinary
         # test under --rr. Realtime needs CAP_SYS_NICE, which the Complement
         # runner grants the testee container; sched_wrap.sh degrades otherwise.
+        # The bench testee holds only the performance cores, as the unit and
+        # integ benches do.
         sched_policy = (cargo_profile == "test"? "--rr": "--fifo")
         sched_prio = (cargo_profile == "test"? 1: 2)
+        sched_cpus = (cargo_profile == "bench"? "pcores": "")
     }
 }
 
@@ -760,6 +790,14 @@ variable "valgrind_max_workers" {
     default = 16
 }
 
+variable "valgrind_worker_threads" {
+    default = 8
+}
+
+variable "valgrind_build_jobs" {
+    default = "default"
+}
+
 variable "valgrind_flags" {
     default = "--error-exitcode=1 --exit-on-first-error=yes --undef-value-errors=no --leak-check=no"
 }
@@ -851,10 +889,19 @@ target "integ-valgrind" {
         VALGRIND_MAX_WORKERS = "${valgrind_max_workers}"
         VALGRINDFLAGS = "${valgrind_flags}"
         cargo_cmd = "valgrind test"
+        cargo_flags = "-j ${valgrind_build_jobs}"
         cargo_args = "--test=*"
 
-        # valgrind already serializes; keep it off the realtime class integ now grants
+        # valgrind already serializes; keep it off the realtime class and the
+        # bench pinning integ now grants
         sched_policy = ""
+        sched_cpus = ""
+
+        # valgrind runs many times slower than the deadline integ sets
+        cargo_test_timeout = ""
+
+        # tokio workers per server boot, independent of the host's cores
+        tokio_worker_threads = "${valgrind_worker_threads}"
     }
 }
 
@@ -878,8 +925,18 @@ target "integ" {
             "--no-fail-fast --bench=*": "--no-fail-fast --test=*"
         )
 
+        # A hung test binary fails at this deadline instead of holding the
+        # runner until the job ceiling; the slowest take well under a minute.
+        # Benches have no measured baseline yet and stay uncapped.
+        cargo_test_timeout = (cargo_profile == "bench"? "": "10m")
+
+        # The realtime class is for running the test and bench binaries, never
+        # for compiling them: scope it to cargo's runner. Benches hold only the
+        # performance cores so the efficiency cores keep the host responsive.
         sched_policy = (cargo_profile == "bench"? "--fifo": "--rr")
         sched_prio = (cargo_profile == "bench"? 3: 1)
+        sched_scope = "runner"
+        sched_cpus = (cargo_profile == "bench"? "pcores": "")
     }
 }
 
@@ -1006,8 +1063,13 @@ target "unit-valgrind" {
         cargo_cmd = "valgrind test"
         cargo_args = "--lib --bins"
 
-        # valgrind already serializes; keep it off the realtime class unit now grants
+        # valgrind already serializes; keep it off the realtime class and the
+        # bench pinning unit now grants
         sched_policy = ""
+        sched_cpus = ""
+
+        # valgrind runs many times slower than the deadline unit sets
+        cargo_test_timeout = ""
     }
 }
 
@@ -1032,8 +1094,18 @@ target "unit" {
             "--no-fail-fast --lib": "--no-fail-fast --lib --bins"
         )
 
+        # A hung test binary fails at this deadline instead of holding the
+        # runner until the job ceiling; the slowest take well under a minute.
+        # Benches have no measured baseline yet and stay uncapped.
+        cargo_test_timeout = (cargo_profile == "bench"? "": "10m")
+
+        # The realtime class is for running the test and bench binaries, never
+        # for compiling them: scope it to cargo's runner. Benches hold only the
+        # performance cores so the efficiency cores keep the host responsive.
         sched_policy = (cargo_profile == "bench"? "--fifo": "--rr")
         sched_prio = (cargo_profile == "bench"? 3: 1)
+        sched_scope = "runner"
+        sched_cpus = (cargo_profile == "bench"? "pcores": "")
     }
 }
 
@@ -1326,7 +1398,7 @@ target "deb-install" {
         elem("deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
     ]
     contexts = {
-        input = elem("target:runtime", [feat_set, sys_name, sys_version, sys_target])
+        input = elem("target:base", [sys_name, sys_version, sys_target])
         deb = elem("target:deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
     }
 }
@@ -1356,10 +1428,10 @@ target "build-deb" {
     dockerfile = "${docker_dir}/Dockerfile.cargo.deb"
     matrix = cargo_rust_feat_sys
     inherits = [
-        elem("build-bins", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
+        elem("build-bins-deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
     ]
     contexts = {
-        input = elem("target:build-bins", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
+        input = elem("target:build-bins-deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
         source = elem("target:source", [sys_name, sys_version, sys_target]),
     }
     args = {
@@ -1475,6 +1547,23 @@ target "build-bins" {
         cargo_cmd = "build"
         cargo_args = "--bins"
         cargo_target_prune = "bins"
+    }
+}
+
+target "build-bins-deb" {
+    name = elem("build-bins-deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
+    tags = [
+        elem_tag("build-bins-deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
+    ]
+    matrix = cargo_rust_feat_sys
+    inherits = [
+        elem("build-bins", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
+    ]
+    contexts = {
+        input = elem("target:deps-build-bins-deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
+    }
+    args = {
+        CARGO_BUILD_RUSTFLAGS = debian_package_rustflags(cargo_profile, rust_toolchain, feat_set, sys_target)
     }
 }
 
@@ -1677,6 +1766,20 @@ target "deps-build-bins" {
     }
 }
 
+target "deps-build-bins-deb" {
+    name = elem("deps-build-bins-deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
+    tags = [
+        elem_tag("deps-build-bins-deb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
+    ]
+    matrix = cargo_rust_feat_sys
+    inherits = [
+        elem("deps-build-bins", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
+    ]
+    args = {
+        CARGO_BUILD_RUSTFLAGS = debian_package_rustflags(cargo_profile, rust_toolchain, feat_set, sys_target)
+    }
+}
+
 target "deps-build-tests" {
     name = elem("deps-build-tests", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
     tags = [
@@ -1769,6 +1872,7 @@ target "deps-base" {
 
         # Base path
         CARGO_TARGET_DIR = "${cargo_tgt_dir_base}"
+        LTO_CACHE_DIR = lto_cache_dir
         # cased name of profile subdir within target complex
         cargo_target_profile = (
             (cargo_profile == "dev" || cargo_profile == "test")? "debug":
@@ -1783,6 +1887,12 @@ target "deps-base" {
         CARGO_PROFILE_RELEASE_LTO = "thin"
         CARGO_PROFILE_RELEASE_DEBUGINFO_DEBUG = "limited"
         CARGO_PROFILE_RELEASE_DEBUGINFO_LTO = "off"
+        CARGO_PROFILE_RELEASE_NATIVE_LTO = "thin"
+
+        CC = llvm_cc
+        CXX = llvm_cxx
+        AR = llvm_ar
+        RANLIB = llvm_ranlib
 
         CARGO_BUILD_RUSTFLAGS = (
             cargo_profile == "release-native"?
@@ -1792,15 +1902,8 @@ target "deps-base" {
                     join(" ", static_rustflags),
                     join(" ", static_nightly_rustflags),
                     join(" ", native_rustflags),
-                    "-C link-arg=-L/usr/lib/gcc/${sys_target_triple(sys_target)}/15", #FIXME
-                    contains(split(",", cargo_feat_sets[feat_set]), "bzip2_compression")?
-                        "-C link-arg=-l:libbz2.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "lz4_compression")?
-                        "-C link-arg=-l:liblz4.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "zstd_compression")?
-                        "-C link-arg=-l:libzstd.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "io_uring")?
-                        "-C link-arg=-l:liburing.a": "",
+                    interprocedural_rustflags(cargo_profile),
+                    static_library_rustflags(feat_set, sys_target),
                     join(" ", static_libs),
                     sys_target_triple(sys_target) == "aarch64-linux-gnu"?
                         "-C link-arg=-l:libgcc.a": "",
@@ -1812,17 +1915,10 @@ target "deps-base" {
                     join(" ", nightly_rustflags),
                     join(" ", static_rustflags),
                     join(" ", static_nightly_rustflags),
+                    interprocedural_rustflags(cargo_profile),
                     sys_target_triple(sys_target) == "x86_64-linux-gnu"?
                         "-C target-cpu=${sys_target_isa(sys_target)}": "",
-                    "-C link-arg=-L/usr/lib/gcc/${sys_target_triple(sys_target)}/15", #FIXME
-                    contains(split(",", cargo_feat_sets[feat_set]), "bzip2_compression")?
-                        "-C link-arg=-l:libbz2.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "lz4_compression")?
-                        "-C link-arg=-l:liblz4.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "zstd_compression")?
-                        "-C link-arg=-l:libzstd.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "io_uring")?
-                        "-C link-arg=-l:liburing.a": "",
+                    static_library_rustflags(feat_set, sys_target),
                     join(" ", static_libs),
                     sys_target_triple(sys_target) == "aarch64-linux-gnu"?
                         "-C link-arg=-l:libgcc.a": "",
@@ -1832,17 +1928,10 @@ target "deps-base" {
                 join(" ", [
                     join(" ", rustflags),
                     join(" ", static_rustflags),
+                    interprocedural_rustflags(cargo_profile),
                     sys_target_triple(sys_target) == "x86_64-linux-gnu"?
                         "-C target-cpu=${sys_target_isa(sys_target)}": "",
-                    "-C link-arg=-L/usr/lib/gcc/${sys_target_triple(sys_target)}/15", #FIXME
-                    contains(split(",", cargo_feat_sets[feat_set]), "bzip2_compression")?
-                        "-C link-arg=-l:libbz2.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "lz4_compression")?
-                        "-C link-arg=-l:liblz4.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "zstd_compression")?
-                        "-C link-arg=-l:libzstd.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "io_uring")?
-                        "-C link-arg=-l:liburing.a": "",
+                    static_library_rustflags(feat_set, sys_target),
                     join(" ", static_libs),
                     sys_target_triple(sys_target) == "aarch64-linux-gnu"?
                         "-C link-arg=-l:libgcc.a": "",
@@ -1852,17 +1941,10 @@ target "deps-base" {
                 join(" ", [
                     join(" ", rustflags),
                     join(" ", static_rustflags),
+                    interprocedural_rustflags(cargo_profile),
                     sys_target_triple(sys_target) == "x86_64-linux-gnu"?
                         "-C target-cpu=${sys_target_isa(sys_target)}": "",
-                    "-C link-arg=-L/usr/lib/gcc/${sys_target_triple(sys_target)}/15", #FIXME
-                    contains(split(",", cargo_feat_sets[feat_set]), "bzip2_compression")?
-                        "-C link-arg=-l:libbz2.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "lz4_compression")?
-                        "-C link-arg=-l:liblz4.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "zstd_compression")?
-                        "-C link-arg=-l:libzstd.a": "",
-                    contains(split(",", cargo_feat_sets[feat_set]), "io_uring")?
-                        "-C link-arg=-l:liburing.a": "",
+                    static_library_rustflags(feat_set, sys_target),
                     join(" ", static_libs),
                     sys_target_triple(sys_target) == "aarch64-linux-gnu"?
                         "-C link-arg=-l:libgcc.a": "",
@@ -1893,6 +1975,56 @@ target "deps-base" {
             ])
         )
     }
+}
+
+function "static_library_rustflags" {
+    params = [features, target]
+    result = join(" ", [
+        "-C link-arg=-L/usr/lib/gcc/${sys_target_triple(target)}/15", #FIXME
+        contains(split(",", cargo_feat_sets[features]), "bzip2_compression")?
+            "-C link-arg=-l:libbz2.a": "",
+        contains(split(",", cargo_feat_sets[features]), "lz4_compression")?
+            "-C link-arg=-l:liblz4.a": "",
+        contains(split(",", cargo_feat_sets[features]), "zstd_compression")?
+            "-C link-arg=-l:libzstd.a": "",
+        contains(split(",", cargo_feat_sets[features]), "io_uring")?
+            "-C link-arg=-l:liburing.a": "",
+    ])
+}
+
+function "debian_package_rustflags" {
+    params = [profile, toolchain, features, target]
+    result = join(" ", [
+        join(" ", rustflags),
+        substr(toolchain, 0, 7) == "nightly"? join(" ", nightly_rustflags): "",
+        join(" ", dynamic_rustflags),
+        substr(toolchain, 0, 7) == "nightly"? join(" ", dynamic_nightly_rustflags): "",
+        interprocedural_rustflags(profile),
+        sys_target_triple(target) == "x86_64-linux-gnu"?
+            "-C target-cpu=${sys_target_isa(target)}": "",
+        static_library_rustflags(features, target),
+        "-C link-arg=-l:libstdc++.a",
+        "-C link-arg=-lc",
+        "-C link-arg=-lm",
+        sys_target_triple(target) == "aarch64-linux-gnu"?
+            "-C link-arg=-l:libgcc.a": "",
+    ])
+}
+
+function "interprocedural_rustflags" {
+    params = [profile]
+    result = (
+        contains(["release-native", "release", "bench"], profile)?
+            join(" ", [
+                "-C linker=${llvm_cc}",
+                "-C linker-plugin-lto",
+                "-C link-arg=-fuse-ld=lld",
+                "-C link-arg=-Wl,--threads=${lld_threads}",
+                "-C link-arg=-Wl,--thinlto-jobs=${lto_jobs}",
+                "-C link-arg=-Wl,--thinlto-cache-dir=${lto_cache_dir}",
+                "-C link-arg=-Wl,--thinlto-cache-policy=${lto_cache_policy}",
+            ]): ""
+    )
 }
 
 #
@@ -1927,6 +2059,10 @@ target "rocksdb-build" {
         input = elem("target:kitchen", [feat_set, sys_name, sys_version, sys_target])
     }
     args = {
+        CC = llvm_cc
+        CXX = llvm_cxx
+        AR = llvm_ar
+        RANLIB = llvm_ranlib
         rocksdb_bz2 = contains(split(",", cargo_feat_sets[feat_set]), "bzip2_compression")? 1: 0
         rocksdb_lz4 = contains(split(",", cargo_feat_sets[feat_set]), "lz4_compression")? 1: 0
         rocksdb_zstd = contains(split(",", cargo_feat_sets[feat_set]), "zstd_compression")? 1: 0
@@ -2205,6 +2341,7 @@ kitchen_packages = [
     "clang",
     "cmake",
     "curl",
+    "dpkg-dev",
     "gawk",
     "git",
     "golang-go",
@@ -2215,6 +2352,7 @@ kitchen_packages = [
     "libnuma-dev",
     "libssl-dev",
     "libsqlite3-dev",
+    "llvm",
     "make",
     "nix-bin",
     "openssl",

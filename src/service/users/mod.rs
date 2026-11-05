@@ -6,12 +6,14 @@ mod keys;
 mod ldap;
 mod register;
 mod server_user;
+#[cfg(test)]
+mod tests;
 
-use std::sync::Arc;
+use std::{future::ready, sync::Arc};
 
 use futures::{Stream, StreamExt, TryFutureExt};
 use ruma::{
-	MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
+	MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
 	events::{
 		GlobalAccountDataEventType,
@@ -20,14 +22,20 @@ use ruma::{
 };
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
-	Err, Result, debug_warn, err, is_equal_to,
+	Err, Result, debug_warn, err, implement, is_equal_to,
 	matrix::pdu::PduCount,
+	smallstr::SmallString,
 	trace,
 	utils::{
-		self, BoolExt, MutexMap, ReadyExt, hash::password as hash_password, stream::TryIgnore,
+		self, BoolExt, MutexMap, ReadyExt, hash::password as hash_password, result::NotFound,
+		stream::TryIgnore,
 	},
+	warn,
 };
 use tuwunel_database::{Deserialized, Json, Map};
+
+pub type LoginProviderId = SmallString<[u8; 32]>;
+type LoginTokenId = SmallString<[u8; 48]>;
 
 pub use self::{
 	dehydrated_device::DehydratedDevice,
@@ -49,10 +57,25 @@ pub struct Moderation {
 	pub by: OwnedUserId,
 }
 
+/// An authenticated login-token owner and the provider that authenticated it.
+///
+/// Native and password authentication carry no provider. SSO tokens preserve
+/// the provider verified by the server-side SSO session.
+pub struct LoginToken {
+	/// The local user authenticated by the token.
+	pub user_id: OwnedUserId,
+	/// The SSO provider that authenticated the user, if any.
+	pub idp_id: Option<LoginProviderId>,
+}
+
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
 	device_list_mutex: MutexMap<OwnedUserId, ()>,
+	login_token_mutex: MutexMap<LoginTokenId, ()>,
+	changing_password: MutexMap<OwnedUserId, ()>,
+	// Entries live only while claims for a user/device hold or await the lock.
+	claiming_one_time_keys: MutexMap<(OwnedUserId, OwnedDeviceId), ()>,
 }
 
 struct Data {
@@ -92,6 +115,9 @@ impl crate::Service for Service {
 		Ok(Arc::new(Self {
 			services: args.services.clone(),
 			device_list_mutex: MutexMap::new(),
+			login_token_mutex: MutexMap::new(),
+			changing_password: MutexMap::new(),
+			claiming_one_time_keys: MutexMap::new(),
 			db: Data {
 				keychangeid_devicechange: args.db["keychangeid_devicechange"].clone(),
 				keychangeid_userid: args.db["keychangeid_userid"].clone(),
@@ -168,6 +194,10 @@ impl Service {
 		password: Option<&str>,
 		origin: Option<&str>,
 	) -> Result {
+		let _password_guard = self.changing_password.lock(user_id).await;
+
+		self.check_creation(user_id).await?;
+
 		let origin = origin.unwrap_or("password");
 
 		if password.is_none() {
@@ -176,16 +206,55 @@ impl Service {
 		}
 
 		self.db.userid_origin.insert(user_id, origin);
-		self.set_password(user_id, password).await
+		self.set_password_locked(user_id, password).await
+	}
+
+	/// Refuses a local user ID that once joined the admin room but has no account.
+	///
+	/// Refusals return `M_USER_IN_USE` and log the user ID without changing account
+	/// or membership state. Existing accounts and the server user remain eligible.
+	pub async fn check_creation(&self, user_id: &UserId) -> Result {
+		if self.services.globals.user_is_local(user_id)
+			&& user_id != self.services.globals.server_user
+			&& let Some(admin_room) = self
+				.services
+				.alias
+				.resolve_local_alias(&self.services.admin.admin_alias)
+				.await
+				.optional()?
+			&& self
+				.services
+				.state_cache
+				.once_joined(user_id, &admin_room)
+				.await
+			&& !self.exists(user_id).await
+		{
+			warn!(%user_id, "Refusing a name previously joined to the admin room");
+			return Err!(Request(UserInUse("User ID is not available.")));
+		}
+
+		Ok(())
 	}
 
 	/// Deactivate account
 	pub async fn deactivate_account(&self, user_id: &UserId) -> Result {
-		// Revoke any SSO authorizations
-		self.services
-			.oauth
-			.revoke_user_tokens(user_id)
-			.await;
+		// Held until the password is cleared; see `lock_admin_room`.
+		let admin_lock = self.services.admin.lock_admin_room().await;
+
+		// Nobody would be left to reactivate this account or any other. Every
+		// deactivation path reaches here first, while the admins room refuses the
+		// last admin's departure only after the account is already deactivated.
+		if self
+			.services
+			.admin
+			.user_is_last_admin(user_id)
+			.await
+		{
+			return Err!(Request(Forbidden(
+				"Cannot deactivate the last admin of this server. Make another user an admin \
+				 first."
+			)));
+		}
 
 		// Remove all associated devices
 		self.all_device_ids(user_id)
@@ -197,6 +266,14 @@ impl Service {
 		// Systems like changing the password without logging in should check if the
 		// account is deactivated.
 		self.set_password(user_id, None).await?;
+		drop(admin_lock);
+
+		// Revoke any SSO authorizations, outside the lock since each is a request
+		// to the identity provider.
+		self.services
+			.oauth
+			.revoke_user_tokens(user_id)
+			.await;
 
 		// TODO: Unhook 3PID
 		Ok(())
@@ -235,10 +312,24 @@ impl Service {
 	/// however their account was created, and a localpart with no local
 	/// account passes on its way to registration.
 	pub async fn check_ldap_login(&self, user_id: &UserId) -> Result {
-		self.is_deactivated(user_id)
-			.unwrap_or_else(|_| false)
+		self.deactivated_check(user_id).await
+	}
+
+	/// Reject a deactivated account with 403 `M_USER_DEACTIVATED`.
+	///
+	/// An account that does not exist is not deactivated, as in Synapse. One
+	/// created without a password, as an appservice's users often are, reads
+	/// as deactivated, since both store an empty password.
+	pub async fn deactivated_check(&self, user_id: &UserId) -> Result {
+		self.db
+			.userid_password
+			.get(user_id)
+			.map_ok(|password| password.is_empty())
 			.await
+			.optional()?
+			.unwrap_or_default()
 			.is_false()
+			.into_option()
 			.ok_or_else(|| err!(Request(UserDeactivated("This user has been deactivated."))))
 	}
 
@@ -254,8 +345,8 @@ impl Service {
 	/// MSC3939: reject a request from a locked account.
 	///
 	/// The rejection maps to 401 `M_USER_LOCKED` with `soft_logout: true`, so
-	/// the client retains its session and polls for the unlock. The login
-	/// route and the request middleware share this gate.
+	/// the client retains its session and polls for the unlock. The login and
+	/// refresh routes and the request middleware share this gate.
 	pub async fn locked_check(&self, user_id: &UserId) -> Result {
 		self.is_locked(user_id)
 			.await
@@ -396,7 +487,7 @@ impl Service {
 	/// registrations setting a sentinel password will return false here.
 	pub async fn has_password(&self, user_id: &UserId) -> Result<bool> {
 		self.password_hash(user_id)
-			.map_ok(|value| value != PASSWORD_DISABLED && value != PASSWORD_SENTINEL)
+			.map_ok(|value| is_password_hash(&value))
 			.await
 	}
 
@@ -416,48 +507,22 @@ impl Service {
 	/// sentinel is stored verbatim; neither is hashed. Changing the password of
 	/// an account whose origin is neither password nor SSO is rejected.
 	pub async fn set_password(&self, user_id: &UserId, password: Option<&str>) -> Result {
-		// Cannot change the password of a LDAP user. There are two special cases :
-		// - a `None` password can be used to deactivate a LDAP user
-		// - a "*" password is used as the default password of an active LDAP user
-		//
-		// The above now applies to all non-password origin users by default unless an
-		// exception is made for that origin in the condition below. Note that users
-		// with no origin are also password-origin users.
-		let allowed_origins = ["password", "sso"];
-		if password.is_some() && password != Some(PASSWORD_SENTINEL) {
-			let origin = self.origin(user_id).await;
-			let origin = origin.as_deref().unwrap_or("password");
+		let _password_guard = self.changing_password.lock(user_id).await;
 
-			if !allowed_origins.iter().any(is_equal_to!(&origin)) {
-				return Err!(Request(InvalidParam(
-					"Cannot change password of an {origin:?} user."
-				)));
-			}
-		}
+		self.set_password_locked(user_id, password).await
+	}
 
-		match password {
-			| None => {
-				self.db
-					.userid_password
-					.insert(user_id, PASSWORD_DISABLED);
-			},
-			| Some(PASSWORD_SENTINEL) => {
-				self.db
-					.userid_password
-					.insert(user_id, PASSWORD_SENTINEL);
-			},
-			| Some(password) => {
-				let cost = self.services.config.password_hash_cost();
-				let hash = hash_password(password, cost).map_err(|e| {
-					err!(Request(InvalidParam("Password does not meet the requirements: {e}")))
-				})?;
-
-				self.db.userid_password.insert(user_id, hash);
-				self.db.userid_origin.insert(user_id, "password");
-			},
-		}
-
-		Ok(())
+	/// Changes the password only while the account is active.
+	///
+	/// The active-state check and password write are serialized with account
+	/// deactivation for this user.
+	pub async fn set_password_if_active(
+		&self,
+		user_id: &UserId,
+		password: Option<&str>,
+	) -> Result {
+		self.set_password_if_active_after(user_id, password, ready(()))
+			.await
 	}
 
 	/// Creates a new sync filter. Returns the filter id.
@@ -539,12 +604,27 @@ impl Service {
 	/// `m.login.token` mechanism.
 	#[must_use]
 	pub fn create_login_token(&self, user_id: &UserId, token: &str) -> u64 {
+		self.create_login_token_with_provider(user_id, token, None)
+	}
+
+	/// Creates a short-lived login token carrying authenticated SSO provenance.
+	///
+	/// Native authentication passes no provider. SSO callers preserve the
+	/// provider selected in the server-side SSO session.
+	#[must_use]
+	pub fn create_login_token_with_provider(
+		&self,
+		user_id: &UserId,
+		token: &str,
+		idp_id: Option<&str>,
+	) -> u64 {
 		use std::num::Saturating as Sat;
 
 		let expires_in = self.services.server.config.login_token_ttl;
 		let expires_at = Sat(utils::millis_since_unix_epoch()) + Sat(expires_in);
 
-		let value = (expires_at.0, user_id);
+		// A trailing Option is additive under the workspace KV codec evolution rule.
+		let value = (expires_at.0, user_id, idp_id);
 		self.db
 			.logintoken_expiresatuserid
 			.raw_put(token, value);
@@ -556,6 +636,15 @@ impl Service {
 	/// Unlike `find_from_login_token`, the token remains in the database
 	/// after this call and can still be consumed later.
 	pub async fn peek_login_token(&self, token: &str) -> Result<OwnedUserId> {
+		self.peek_login_token_with_provider(token)
+			.map_ok(|login| login.user_id)
+			.await
+	}
+
+	/// Verify a login token and its provider without consuming it.
+	///
+	/// The token remains available for the later consent submission.
+	pub async fn peek_login_token_with_provider(&self, token: &str) -> Result<LoginToken> {
 		let Ok(value) = self
 			.db
 			.logintoken_expiresatuserid
@@ -564,7 +653,9 @@ impl Service {
 		else {
 			return Err!(Request(Forbidden("Login token is unrecognised")));
 		};
-		let (expires_at, user_id): (u64, OwnedUserId) = value.deserialized()?;
+
+		let (expires_at, user_id, idp_id): (u64, OwnedUserId, Option<LoginProviderId>) =
+			value.deserialized()?;
 
 		if expires_at < utils::millis_since_unix_epoch() {
 			trace!(?user_id, ?token, "Removing expired login token");
@@ -572,12 +663,24 @@ impl Service {
 			return Err!(Request(Forbidden("Login token is expired")));
 		}
 
-		Ok(user_id)
+		Ok(LoginToken { user_id, idp_id })
 	}
 
 	/// Find out which user a login token belongs to.
 	/// Removes the token to prevent double-use attacks.
 	pub async fn find_from_login_token(&self, token: &str) -> Result<OwnedUserId> {
+		self.find_login_token_with_provider(token)
+			.map_ok(|login| login.user_id)
+			.await
+	}
+
+	/// Consume a login token and return its owner and authenticated provider.
+	///
+	/// The token is removed before its authenticated identity is returned.
+	pub async fn find_login_token_with_provider(&self, token: &str) -> Result<LoginToken> {
+		let token_id: LoginTokenId = token.into();
+		let _lock = self.login_token_mutex.lock(&token_id).await;
+
 		let Ok(value) = self
 			.db
 			.logintoken_expiresatuserid
@@ -586,7 +689,9 @@ impl Service {
 		else {
 			return Err!(Request(Forbidden("Login token is unrecognised")));
 		};
-		let (expires_at, user_id): (u64, OwnedUserId) = value.deserialized()?;
+
+		let (expires_at, user_id, idp_id): (u64, OwnedUserId, Option<LoginProviderId>) =
+			value.deserialized()?;
 
 		if expires_at < utils::millis_since_unix_epoch() {
 			trace!(?user_id, ?token, "Removing expired login token");
@@ -598,7 +703,7 @@ impl Service {
 
 		self.db.logintoken_expiresatuserid.remove(token);
 
-		Ok(user_id)
+		Ok(LoginToken { user_id, idp_id })
 	}
 
 	#[cfg(not(feature = "ldap"))]
@@ -616,4 +721,65 @@ impl Service {
 	#[cfg(not(feature = "ldap"))]
 	#[must_use]
 	pub fn ldap_bind_dn(&self, _localpart: &str) -> Option<String> { None }
+}
+
+#[implement(Service)]
+async fn set_password_if_active_after(
+	&self,
+	user_id: &UserId,
+	password: Option<&str>,
+	after_check: impl Future<Output = ()>,
+) -> Result {
+	let _password_guard = self.changing_password.lock(user_id).await;
+
+	self.deactivated_check(user_id).await?;
+	after_check.await;
+	self.set_password_locked(user_id, password).await
+}
+
+#[implement(Service)]
+async fn set_password_locked(&self, user_id: &UserId, password: Option<&str>) -> Result {
+	// Non-password origins may only be disabled or assigned the active sentinel.
+	let allowed_origins = ["password", "sso"];
+
+	if password.is_some() && password != Some(PASSWORD_SENTINEL) {
+		let origin = self.origin(user_id).await;
+		let origin = origin.as_deref().unwrap_or("password");
+
+		if !allowed_origins.iter().any(is_equal_to!(&origin)) {
+			return Err!(Request(InvalidParam("Cannot change password of an {origin:?} user.")));
+		}
+	}
+
+	match password {
+		| None => {
+			self.db
+				.userid_password
+				.insert(user_id, PASSWORD_DISABLED);
+		},
+		| Some(PASSWORD_SENTINEL) => {
+			self.db
+				.userid_password
+				.insert(user_id, PASSWORD_SENTINEL);
+		},
+		| Some(password) => {
+			let cost = self.services.config.password_hash_cost();
+			let hash = hash_password(password, cost).map_err(|e| {
+				err!(Request(InvalidParam("Password does not meet the requirements: {e}")))
+			})?;
+
+			self.db.userid_password.insert(user_id, hash);
+			self.db.userid_origin.insert(user_id, "password");
+		},
+	}
+
+	Ok(())
+}
+
+/// Whether a stored password value is a real hash rather than a marker.
+///
+/// The disabled marker and the sentinel hold no password to check against.
+#[must_use]
+pub fn is_password_hash(value: &str) -> bool {
+	value != PASSWORD_DISABLED && value != PASSWORD_SENTINEL
 }
