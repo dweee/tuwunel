@@ -20,9 +20,17 @@ use crate::rooms::state::RoomMutexGuard;
 
 /// Invite the user to the tuwunel admin room.
 ///
-/// This is equivalent to granting server admin privileges.
+/// This is equivalent to granting server admin privileges. A local user must
+/// already hold an account, or the grant would wait for whoever registers the
+/// name.
 #[implement(super::Service)]
 pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
+	let is_local = self.services.globals.user_is_local(user_id);
+
+	if is_local && !self.services.users.exists(user_id).await {
+		return Err!(Request(NotFound("User {user_id} does not exist on this server.")));
+	}
+
 	let Ok(room_id) = self.get_admin_room().await else {
 		debug_warn!(
 			"make_user_admin was called without an admin room being available or created"
@@ -280,9 +288,16 @@ async fn invite_new_admin(
 }
 
 /// Demote an admin, removing its rights.
+///
+/// The server user is refused, since the admin room exists only while the
+/// server user stays joined.
 #[implement(super::Service)]
 pub async fn revoke_admin(&self, user_id: &UserId) -> Result {
 	use MembershipState::{Invite, Join, Knock, Leave};
+
+	if user_id == self.services.globals.server_user {
+		return Err!(Request(InvalidParam("The server user's admin rights cannot be revoked.")));
+	}
 
 	let Ok(room_id) = self.get_admin_room().await else {
 		return Err!(error!("No admin room available or created."));

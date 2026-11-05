@@ -297,6 +297,7 @@ where
 	let result = match result {
 		| Err(fault) => Err(fault),
 		| Ok(response) => {
+			let response = retain_origin_users(&origin, response);
 			let keys =
 				process_federation_response(services, sender_user, allowed_signatures, response)
 					.await;
@@ -306,6 +307,29 @@ where
 	};
 
 	Outcome { origin, elapsed, result }
+}
+
+/// Drops the keys of users who do not belong to the server that answered.
+///
+/// A server is only authoritative for its own users; any other entry, local
+/// users included, would otherwise be stored or served as that user's keys.
+fn retain_origin_users(
+	origin: &ServerName,
+	mut response: FederationResponse,
+) -> FederationResponse {
+	response
+		.device_keys
+		.retain(|user, _| user.server_name().eq(origin));
+
+	response
+		.master_keys
+		.retain(|user, _| user.server_name().eq(origin));
+
+	response
+		.self_signing_keys
+		.retain(|user, _| user.server_name().eq(origin));
+
+	response
 }
 
 async fn process_federation_response<F>(
@@ -431,5 +455,32 @@ fn into_response(self) -> get_keys::v3::Response {
 		master_keys: self.master_keys,
 		self_signing_keys: self.self_signing_keys,
 		user_signing_keys: self.user_signing_keys,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::{server_name, user_id};
+	use serde_json::json;
+
+	use super::*;
+
+	#[test]
+	fn drops_keys_of_users_on_other_servers() {
+		let remote = user_id!("@bob:remote.example");
+		let users = [remote, user_id!("@alice:local.example"), user_id!("@carol:third.example")];
+		let devices = |user: &UserId| (user.to_owned(), BTreeMap::new());
+		let key = |user: &UserId| (user.to_owned(), Raw::from_json_value(&json!({})));
+		let response = FederationResponse {
+			device_keys: users.map(devices).into(),
+			master_keys: users.map(key).into(),
+			self_signing_keys: users.map(key).into(),
+		};
+
+		let response = retain_origin_users(server_name!("remote.example"), response);
+
+		assert!(response.device_keys.keys().eq([remote]));
+		assert!(response.master_keys.keys().eq([remote]));
+		assert!(response.self_signing_keys.keys().eq([remote]));
 	}
 }

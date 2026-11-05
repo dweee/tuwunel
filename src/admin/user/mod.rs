@@ -19,11 +19,15 @@ mod list_users;
 mod make_user_admin;
 mod put_room_tag;
 mod redact_event;
+mod redact_recent;
 mod refresh_profile;
 mod reject_invites;
 mod reset_password;
+mod revoke_admin;
 mod set_profile_key;
 mod unerase;
+
+use std::num::NonZeroUsize;
 
 use clap::{ArgGroup, Subcommand, ValueEnum};
 use futures::FutureExt;
@@ -200,6 +204,11 @@ pub(super) enum UserCommand {
 		user_id: String,
 	},
 
+	/// - Revoke server-admin privileges from a user.
+	RevokeAdmin {
+		user_id: String,
+	},
+
 	/// - Set a user profile key (display name, avatar url, etc) to a value
 	#[command(group(
 		ArgGroup::new("value_or_clear")
@@ -267,6 +276,16 @@ pub(super) enum UserCommand {
 	/// This is only valid for local users
 	RedactEvent {
 		event_id: OwnedEventId,
+	},
+
+	/// - Redact a local user's most recent unredacted messages in a room.
+	///
+	/// Counts plaintext and encrypted messages, excluding state events.
+	/// Redactions are sent as the original sender, newest first.
+	RedactRecent {
+		user_id: String,
+		room_id: OwnedRoomOrAliasId,
+		count: NonZeroUsize,
 	},
 
 	/// - Force joins a specified list of local users to join the specified

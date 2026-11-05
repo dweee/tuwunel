@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use futures::{
 	FutureExt, StreamExt, TryFutureExt,
 	future::{join, ready},
-	pin_mut,
 };
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedServerName, RoomId, UserId,
@@ -53,15 +52,6 @@ pub async fn leave<'a>(
 		blurhash: None,
 	};
 
-	let is_banned = self.services.metadata.is_banned(room_id);
-	let is_disabled = self.services.metadata.is_disabled(room_id);
-	pin_mut!(is_banned, is_disabled);
-	if is_banned.or(is_disabled).await {
-		return self
-			.clear_local_leave(user_id, room_id, leave_content, None)
-			.await;
-	}
-
 	let member_event = self
 		.services
 		.state_accessor
@@ -102,6 +92,15 @@ async fn leave_via_remote(
 	reason: Option<String>,
 	leave_content: RoomMemberEventContent,
 ) -> Result {
+	let is_banned = self.services.metadata.is_banned(room_id);
+	let is_disabled = self.services.metadata.is_disabled(room_id);
+
+	if is_banned.or(is_disabled).await {
+		return self
+			.clear_local_leave(user_id, room_id, leave_content, None)
+			.await;
+	}
+
 	if let Err(e) = self
 		.remote_leave(user_id, room_id, reason)
 		.boxed()
@@ -234,6 +233,18 @@ async fn clear_local_leave(
 	leave_content: RoomMemberEventContent,
 	last_state: Option<Vec<Raw<AnyStrippedStateEvent>>>,
 ) -> Result {
+	// Preserve the departure position used for history visibility.
+	if self
+		.services
+		.state_cache
+		.user_membership(user_id, room_id)
+		.map(|membership| membership.as_ref().is_some_and(is_leaveable))
+		.is_false()
+		.await
+	{
+		return Ok(());
+	}
+
 	let count = self.services.globals.next_count();
 	self.services
 		.state_cache

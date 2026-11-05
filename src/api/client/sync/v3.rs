@@ -7,7 +7,6 @@ use axum::extract::State;
 use futures::{
 	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
 	future::{join, join3, join4, join5, try_join},
-	pin_mut,
 };
 use ruma::{
 	DeviceId, EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
@@ -77,7 +76,10 @@ use super::{
 };
 use crate::{
 	ClientIp, Ruma,
-	client::{ignored_filter, is_empty_account_data_event, with_membership},
+	client::{
+		ignored_filter, is_empty_account_data_event, utils::normalize_profile_fields,
+		with_membership,
+	},
 };
 
 struct SyncParams<'a> {
@@ -286,6 +288,12 @@ pub(crate) async fn sync_events_route(
 		.note_sync(sender_user, body.appservice_info.as_ref());
 
 	let (filter, ..) = join3(filter, ping_presence, note_sync).await;
+
+	services
+		.profile
+		.check_requested_fields(&filter.profile_fields.ids)?;
+
+	let filter = normalize_profile_fields(filter);
 
 	let mut since = body
 		.body
@@ -831,8 +839,7 @@ async fn handle_left_room(
 
 	let is_banned = services.metadata.is_banned(room_id);
 
-	pin_mut!(is_not_found, is_disabled, is_banned);
-	if is_not_found.or(is_disabled).or(is_banned).await {
+	if is_not_found.or2(is_disabled, is_banned).await {
 		// For rejected invites, deleted, missing, or broken room state this is the last
 		// resort to convey a the minimum of information to the client.
 		let event = PduEvent {
@@ -2003,7 +2010,7 @@ fn compute_notification_gates<F: Fn(u64) -> bool>(
 
 	// A cursor newer than since means the client may still cache the pre-reset
 	// count, so allow an explicit zero to reconcile it.
-	let send_notification_resets = last_notification_read.is_some_and(&after_since)
+	let send_notification_resets = last_notification_read.is_some_and(after_since)
 		|| thread_last_reads
 			.values()
 			.copied()

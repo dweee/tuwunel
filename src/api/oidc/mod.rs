@@ -15,10 +15,10 @@ use std::fmt::Write;
 
 use axum::{Json, body::Body, response::IntoResponse};
 use http::{Response, StatusCode};
-use ruma::OwnedUserId;
+use ruma::{OwnedUserId, UserId};
 use serde_json::json;
 use tuwunel_core::{Result, err};
-use tuwunel_service::Services;
+use tuwunel_service::{Services, users::LoginToken};
 use url::Url;
 
 pub(super) use self::{
@@ -50,12 +50,31 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response<B
 	(status, Json(body)).into_response()
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
+async fn require_account_usable(services: &Services, user_id: &UserId) -> Result {
+	services.users.deactivated_check(user_id).await?;
+	services.users.locked_check(user_id).await
+}
+
 async fn consume_login_token(services: &Services, token: Option<&str>) -> Result<OwnedUserId> {
 	let token = token.ok_or_else(|| err!(Request(Forbidden("Missing login token"))))?;
 
 	services
 		.users
 		.find_from_login_token(token)
+		.await
+		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
+}
+
+async fn consume_login_token_with_provider(
+	services: &Services,
+	token: Option<&str>,
+) -> Result<LoginToken> {
+	let token = token.ok_or_else(|| err!(Request(Forbidden("Missing login token"))))?;
+
+	services
+		.users
+		.find_login_token_with_provider(token)
 		.await
 		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
 }
@@ -72,6 +91,19 @@ async fn peek_login_token(services: &Services, token: Option<&str>) -> Result<Ow
 		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
 }
 
+async fn peek_login_token_with_provider(
+	services: &Services,
+	token: Option<&str>,
+) -> Result<LoginToken> {
+	let token = token.ok_or_else(|| err!(Request(Forbidden("Missing login token"))))?;
+
+	services
+		.users
+		.peek_login_token_with_provider(token)
+		.await
+		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
+}
+
 /// Whether a redirect URI is covered by the operator's redirect allowlist.
 ///
 /// A URI carrying a host matches an allowlist entry naming that host. A
@@ -79,7 +111,7 @@ async fn peek_login_token(services: &Services, token: Option<&str>) -> Result<Ow
 /// `io.element.android:/callback`), so it matches an entry naming the scheme
 /// instead, which is what lets one list cover both a web and a mobile client.
 /// Either way the comparison ignores case.
-fn redirect_allowlisted(allowed: &[String], uri: &str) -> bool {
+pub(crate) fn redirect_allowlisted(allowed: &[String], uri: &str) -> bool {
 	Url::parse(uri).is_ok_and(|url| {
 		let name = url.host_str().unwrap_or_else(|| url.scheme());
 
@@ -87,6 +119,20 @@ fn redirect_allowlisted(allowed: &[String], uri: &str) -> bool {
 			.iter()
 			.any(|entry| entry.eq_ignore_ascii_case(name))
 	})
+}
+
+/// Build the upstream SSO redirect URL for a pending authorization request.
+///
+/// The provider hands the browser back to the completion route carrying the
+/// request id, where the authorization code is minted. A trailing slash on the
+/// issuer is ignored.
+fn authorization_sso_url(issuer: &str, idp_id: &str, req_id: &str) -> Result<Url> {
+	let base = issuer.trim_end_matches('/');
+	let complete = format!("{base}/_tuwunel/oidc/_complete");
+	let callback = Url::parse_with_params(&complete, [("oidc_req_id", req_id)])
+		.map_err(|_| err!(error!("Failed to build complete URL")))?;
+
+	sso_redirect_url(base, idp_id, &callback)
 }
 
 fn sso_redirect_url(base: &str, idp_id: &str, callback: &Url) -> Result<Url> {

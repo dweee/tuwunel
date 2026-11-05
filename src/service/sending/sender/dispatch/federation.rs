@@ -6,14 +6,19 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	extract_variant, implement,
-	utils::{IterStream, calculate_hash, future::TryExtExt, stream::WidebandExt},
+	debug_warn, extract_variant, implement,
+	utils::{IterStream, budget, calculate_hash, future::TryExtExt, stream::WidebandExt},
 	warn,
 };
 
 use super::SendingResult;
-use crate::sending::{Destination, EduBuf, SendingEvent, Service};
+use crate::sending::{Destination, EduBuf, SendingEvent, Service, sender::EDU_BYTES_LIMIT};
 
+/// Send a federation transaction, reporting whether one went out at all.
+///
+/// Rows that all fail to load leave nothing to send; they still succeed, so
+/// their keys are acknowledged. EDUs past `EDU_BYTES_LIMIT` are left out and
+/// acknowledged the same way.
 #[implement(Service)]
 #[tracing::instrument(
 	name = "federation",
@@ -27,7 +32,7 @@ pub(super) async fn send_events_dest_federation(
 	&self,
 	server: OwnedServerName,
 	events: Vec<SendingEvent>,
-) -> SendingResult {
+) -> (SendingResult, bool) {
 	let pdus: Vec<_> = events
 		.iter()
 		.filter_map(|event| extract_variant!(event, SendingEvent::Pdu))
@@ -51,16 +56,24 @@ pub(super) async fn send_events_dest_federation(
 		.collect()
 		.await;
 
-	let edus: Vec<Raw<Edu>> = events
+	let edus = events
 		.iter()
 		.filter_map(|event| extract_variant!(event, SendingEvent::Edu))
 		.map(EduBuf::as_slice)
 		.map(serde_json::from_slice)
-		.filter_map(Result::ok)
+		.filter_map(Result::ok);
+
+	let size = |edu: &Raw<Edu>| edu.json().get().len();
+	let dropped = |edu: &Raw<Edu>| {
+		debug_warn!(%server, len = size(edu), "Dropping an EDU past the transaction budget.");
+	};
+
+	let edus: Vec<_> = budget(edus, EDU_BYTES_LIMIT, size)
+		.filter_map(|edu| edu.inspect_err(dropped).ok())
 		.collect();
 
 	if pdus.is_empty() && edus.is_empty() {
-		return Ok(Destination::Federation(server));
+		return (Ok(Destination::Federation(server)), false);
 	}
 
 	let preimage = pdus
@@ -97,8 +110,10 @@ pub(super) async fn send_events_dest_federation(
 			warn!(%txn_id, %server, %event_id, %error, "error sending PDU to remote server");
 		});
 
-	match result {
+	let result = match result {
 		| Ok(_) => Ok(Destination::Federation(server)),
 		| Err(error) => Err((Destination::Federation(server), error)),
-	}
+	};
+
+	(result, true)
 }

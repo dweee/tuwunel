@@ -85,6 +85,63 @@ secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 | `use_https` | `true` | Require HTTPS. Set `false` only for local development with HTTP-only test endpoints. |
 | `startup_check` | `true` | Ping the bucket at startup to confirm connectivity. Failure aborts startup. Set `false` if the provider may be unavailable during startup. |
 
+### Google Cloud Storage
+
+```toml
+[global]
+media_storage_providers = ["media_on_gcs"]
+
+[global.storage_provider.media_on_gcs.gcs]
+bucket = "my-matrix-media"
+```
+
+This selects GCS for media storage. Credentials resolve from the environment and
+fall back to the instance metadata server, so on Google Kubernetes Engine or
+Compute Engine the server can authenticate as the attached service account with
+no exported key material. Grant that service account
+`roles/storage.objectAdmin` on the bucket, or equivalent object permissions.
+
+Use this rather than pointing the `s3` provider at
+`https://storage.googleapis.com`. The S3-interoperability endpoint accepts only
+HMAC keys, which are service-account keys, so it cannot use an attached service
+account. The `constraints/iam.disableServiceAccountKeyCreation` policy prevents
+creating the new service-account keys that this setup would require.
+
+An object prefix is set separately, with `base_path`:
+
+```toml
+[global.storage_provider.media_on_gcs.gcs]
+bucket    = "my-matrix-media"
+base_path = "prefix"
+```
+
+A `gs://bucket/path` URL is not accepted here, because the path component would
+not be applied as a prefix.
+
+#### GCS configuration reference
+
+| Option | Default | Description |
+|---|---|---|
+| `bucket` | None | Bucket name. Required; an unset bucket disables the provider. |
+| `base_path` | None | Object prefix within the bucket. Alias: `path`. |
+| `service_account_path` | None | Path to a service account key file. Leave unset to use the environment, which on GCE/GKE ends at the metadata server, the keyless and recommended configuration. |
+| `application_credentials_path` | None | Path to an application default credentials file. Only service-account and authorized-user documents are recognised. |
+| `multipart_threshold` | 100 MiB | Upload size above which multipart upload is used. |
+| `multipart_part_size` | 10 MiB | Size of each part within a multipart upload. |
+| `startup_check` | true | Ping the provider at startup; failures abort startup. The probe is a listing operation, so it requires `storage.objects.list`, passes on an empty bucket, and proves neither write nor delete. |
+
+Credential file settings are applied to the environment-derived builder. Do not
+combine `service_account_path` with `GOOGLE_SERVICE_ACCOUNT_KEY`; the underlying
+client rejects simultaneous service-account path and inline-key credentials.
+Environment service-account credentials take priority over
+`application_credentials_path`.
+
+Media redirects (`media_allow_redirect`) work without a key as well: with no
+private key configured, signing goes through the IAM `signBlob` API, where
+Google holds the key. That path additionally needs the IAM Service Account
+Credentials API enabled and `iam.serviceAccounts.signBlob` on the service
+account.
+
 #### Self-hosted S3-compatible services
 
 For MinIO, DigitalOcean Spaces, Cloudflare R2, and similar services, set the
@@ -130,6 +187,14 @@ TUWUNEL_STORAGE_PROVIDER__MEDIA_ON_S3__S3__REGION="us-east-1"
 TUWUNEL_STORAGE_PROVIDER__MEDIA_ON_S3__S3__KEY="AKIAIOSFODNN7EXAMPLE"
 TUWUNEL_STORAGE_PROVIDER__MEDIA_ON_S3__S3__SECRET="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 ```
+
+#### GCS example
+
+```env
+TUWUNEL_STORAGE_PROVIDER__MEDIA_ON_GCS__GCS__BUCKET="my-matrix-media"
+```
+
+No credential variables: on GCE/GKE the attached service account is used.
 
 #### Self-hosted S3-compatible example
 
