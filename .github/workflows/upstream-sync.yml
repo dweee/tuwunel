@@ -8,10 +8,10 @@ jobs:
       actions: write
       checks: read
       statuses: write
-    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@02e78310f956195865c00ca4a887cc96b959d69e
+    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@02d38fe80b2fecb41503a90943fd04000174b955
     with:
       tool-repository: dweee/dave-fork-ci
-      tool-revision: 02e78310f956195865c00ca4a887cc96b959d69e
+      tool-revision: 02d38fe80b2fecb41503a90943fd04000174b955
       auto-merge: ${{ vars.FORK_CI_AUTO_MERGE == 'true' && vars.ATTIC_PUSH_ENABLED == 'true' }}
       cache: false
       check-workflow: linux-actions.yml
