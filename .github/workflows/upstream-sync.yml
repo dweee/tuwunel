@@ -3,14 +3,15 @@ permissions: {}
 jobs:
   upstream:
     permissions:
+      id-token: write
       contents: write
       actions: write
       checks: read
       statuses: write
-    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@24458be597bead9a750f3e1aea4998e50375849b
+    uses: dweee/dave-fork-ci/.github/workflows/upstream-sync.yml@02e78310f956195865c00ca4a887cc96b959d69e
     with:
       tool-repository: dweee/dave-fork-ci
-      tool-revision: 24458be597bead9a750f3e1aea4998e50375849b
+      tool-revision: 02e78310f956195865c00ca4a887cc96b959d69e
       auto-merge: ${{ vars.FORK_CI_AUTO_MERGE == 'true' && vars.ATTIC_PUSH_ENABLED == 'true' }}
       cache: false
       check-workflow: linux-actions.yml

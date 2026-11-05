@@ -118,8 +118,11 @@ jobs:
           if-no-files-found: error
           overwrite: false
   publish-dependencies:
+    permissions:
+      contents: read
+      id-token: write
     needs: [plan, dependencies]
-    if: ${{ vars.ATTIC_PUSH_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && vars.ATTIC_PUSH_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name
       == 'push') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     name: Cache dependencies (${{ matrix.system }})
     runs-on: ubuntu-24.04
@@ -159,6 +162,8 @@ jobs:
         with:
           name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
           path: attic-transfer
+      - name: Install pinned Niks3 publisher
+        run: bash ci/install-niks3.sh
       - name: Import data without running any package programs
         timeout-minutes: 15
         env:
@@ -172,6 +177,8 @@ jobs:
           ATTIC_CACHE: flakey
           ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
         run: python3 ci/push-attic.py --outputs attic-transfer/outputs.txt
+      - name: Publish to Niks3 with GitHub OIDC and verify S3 integrity
+        run: python3 ci/push-niks3.py --outputs attic-transfer/outputs.txt
   build:
     needs: [plan, dependencies, publish-dependencies]
     name: ${{ matrix.package }} (${{ matrix.system }})
@@ -249,8 +256,11 @@ jobs:
     if: ${{ always() && needs.plan.result == 'success' && needs.dependencies.result == 'success' && (needs.publish-dependencies.result
       == 'success' || needs.publish-dependencies.result == 'skipped') && inputs.package != 'tuwunel-deps' }}
   publish:
+    permissions:
+      contents: read
+      id-token: write
     needs: [plan, build]
-    if: ${{ vars.ATTIC_PUSH_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name
+    if: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && vars.ATTIC_PUSH_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name
       == 'push') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     name: Publish ${{ matrix.package }} (${{ matrix.system }})
     runs-on: ubuntu-24.04
@@ -290,6 +300,8 @@ jobs:
         with:
           name: nix-${{ matrix.system }}-${{ matrix.package }}-${{ github.sha }}
           path: attic-transfer
+      - name: Install pinned Niks3 publisher
+        run: bash ci/install-niks3.sh
       - name: Import data without running any package programs
         timeout-minutes: 15
         env:
@@ -305,6 +317,8 @@ jobs:
         run: python3 ci/push-attic.py --outputs attic-transfer/outputs.txt
 
   # Stable, always-running aggregate: the required status check for this repository.
+      - name: Publish to Niks3 with GitHub OIDC and verify S3 integrity
+        run: python3 ci/push-niks3.py --outputs attic-transfer/outputs.txt
   test:
     name: test
     if: ${{ always() }}
