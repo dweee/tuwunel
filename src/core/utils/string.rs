@@ -17,10 +17,12 @@ mod unquote;
 mod unquoted;
 
 use std::{
+	borrow::Cow,
 	fmt::{self, write},
 	io,
 	mem::replace,
-	ops::Range,
+	ops::{Range, RangeInclusive},
+	str::from_utf8,
 };
 
 pub use self::{
@@ -33,6 +35,8 @@ use crate::{Result, arrayvec::ArrayString, smallstr::SmallString};
 /// The value has static lifetime and is suitable for default or fallback
 /// references. It is identical to the empty string literal.
 pub const EMPTY: &str = "";
+
+const OPAQUE_ID_LENGTHS: RangeInclusive<usize> = 1..=255;
 
 /// Formats arguments into a small string with an inline byte capacity.
 ///
@@ -182,6 +186,37 @@ pub fn common_prefix<T: AsRef<str>>(choice: &[T]) -> &str {
 	})
 }
 
+/// Reports whether `haystack` contains any of the non-empty `needles`.
+///
+/// An empty needle is skipped rather than matching every haystack, so an
+/// empty list or a list of empty strings matches nothing.
+#[must_use]
+pub fn contains_any<Needles>(haystack: &str, needles: Needles) -> bool
+where
+	Needles: IntoIterator,
+	Needles::Item: AsRef<str>,
+{
+	needles
+		.into_iter()
+		.filter(|needle| !needle.as_ref().is_empty())
+		.any(|needle| haystack.contains(needle.as_ref()))
+}
+
+/// Reports whether any of `candidates` equals `item`.
+///
+/// Unlike a slice's `contains`, the candidates need not share the type of
+/// `item`, so a list of `String` is searched for a `&str` without allocating.
+#[must_use]
+pub fn equals_any<Candidates>(item: &str, candidates: Candidates) -> bool
+where
+	Candidates: IntoIterator,
+	Candidates::Item: AsRef<str>,
+{
+	candidates
+		.into_iter()
+		.any(|candidate| candidate.as_ref() == item)
+}
+
 /// Returns a deterministic prefix selected from the string contents.
 ///
 /// The candidate index is the wrapping sum of input bytes modulo the byte
@@ -209,6 +244,18 @@ pub fn truncate_deterministic(str: &str, range: Option<Range<usize>>) -> &str {
 		.nth(len)
 		.map(|(i, _)| str.split_at(i).0)
 		.unwrap_or(str)
+}
+
+/// Shortens a string to at most `max` characters.
+///
+/// Characters are Unicode scalar values, so the cut never splits one. A string
+/// already within the limit is returned whole.
+#[inline]
+#[must_use]
+pub fn truncate_chars(str: &str, max: usize) -> &str {
+	str.char_indices()
+		.nth(max)
+		.map_or(str, |(i, _)| str.split_at(i).0)
 }
 
 /// Displays a value into a small string with an inline byte capacity.
@@ -303,4 +350,86 @@ pub fn string_from_bytes(bytes: &[u8]) -> Result<String> {
 /// Valid input is returned without allocation. Invalid UTF-8 is returned as an
 /// error.
 #[inline]
-pub fn str_from_bytes(bytes: &[u8]) -> Result<&str> { Ok(std::str::from_utf8(bytes)?) }
+pub fn str_from_bytes(bytes: &[u8]) -> Result<&str> { Ok(from_utf8(bytes)?) }
+
+/// Escapes a value for one markdown table cell.
+///
+/// Backslashes and pipes are escaped, and control characters and Unicode line
+/// or paragraph separators become spaces, so the value cannot end its cell or
+/// row. A value needing no change is borrowed.
+#[must_use]
+pub fn markdown_cell(value: &str) -> Cow<'_, str> {
+	let breaks_cell = |character: char| {
+		character.is_control() || matches!(character, '\\' | '|' | '\u{2028}' | '\u{2029}')
+	};
+
+	let escape = |mut escaped: String, character: char| {
+		match character {
+			| '\\' => escaped.push_str("\\\\"),
+			| '|' => escaped.push_str("\\|"),
+			| _ if breaks_cell(character) => escaped.push(' '),
+			| _ => escaped.push(character),
+		}
+
+		escaped
+	};
+
+	value
+		.contains(breaks_cell)
+		.then(|| {
+			value
+				.chars()
+				.fold(String::with_capacity(value.len()), escape)
+		})
+		.map_or(Cow::Borrowed(value), Cow::Owned)
+}
+
+/// Replaces control characters and Unicode line separators with spaces.
+///
+/// Each replaced character becomes one space, keeping the value on one line.
+/// Values that need no replacements are borrowed without allocation.
+#[must_use]
+pub fn single_line(value: &str) -> Cow<'_, str> {
+	let breaks_line =
+		|character: char| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}');
+
+	value
+		.contains(breaks_line)
+		.then(|| value.replace(breaks_line, " "))
+		.map_or(Cow::Borrowed(value), Cow::Owned)
+}
+
+/// Picks the singular or plural form of a noun for a count.
+///
+/// Only a count of exactly one takes the singular, so zero reads as plural.
+#[inline]
+#[must_use]
+pub fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
+	match count {
+		| 1 => one,
+		| _ => many,
+	}
+}
+
+/// Reports whether a string is a Matrix opaque identifier.
+///
+/// The grammar allows 1 to 255 characters, all of them unreserved.
+#[must_use]
+pub fn is_opaque_id(value: &str) -> bool {
+	OPAQUE_ID_LENGTHS.contains(&value.len()) && is_unreserved(value)
+}
+
+/// Reports whether every byte of a string is unreserved.
+///
+/// An empty string passes, so a grammar with a minimum length checks it apart.
+#[must_use]
+pub fn is_unreserved(value: &str) -> bool { value.bytes().all(is_unreserved_byte) }
+
+/// Reports whether a byte is an RFC 3986 unreserved character.
+///
+/// The set is `[0-9A-Za-z._~-]`, which a URL component carries unescaped.
+#[inline]
+#[must_use]
+pub const fn is_unreserved_byte(byte: u8) -> bool {
+	byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}

@@ -1,7 +1,14 @@
 use std::collections::BTreeMap;
 
 use axum::extract::State;
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::join};
+use futures::{
+	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
+	future::{
+		Either::{Left, Right},
+		join,
+	},
+};
+use itertools::Itertools;
 use ruma::{
 	OwnedRoomId, RoomId, UInt, UserId,
 	api::client::search::search_events::{
@@ -17,7 +24,6 @@ use ruma::{
 use search_events::v3::{Request, Response};
 use tuwunel_core::{
 	Err, Result, at, is_true,
-	matrix::Event,
 	utils::{
 		IterStream,
 		math::usize_from_ruma_bounded,
@@ -25,12 +31,14 @@ use tuwunel_core::{
 		stream::{ReadyExt, TryIgnore, WidebandExt},
 	},
 };
+use tuwunel_matrix::{Event, PduCount};
 use tuwunel_service::{
 	Services,
 	rooms::{search::RoomQuery, timeline::PdusIterItem},
 };
 
-use crate::{Ruma, client::message::visibility_filter};
+use super::visibility_filter;
+use crate::Ruma;
 
 type RoomStates = BTreeMap<OwnedRoomId, RoomState>;
 type RoomState = Vec<Raw<AnyStateEvent>>;
@@ -38,7 +46,6 @@ type RoomState = Vec<Raw<AnyStateEvent>>;
 const LIMIT_DEFAULT: usize = 10;
 const LIMIT_MAX: usize = 100;
 const CONTEXT_MAX: usize = 20;
-const BATCH_MAX: usize = 20;
 
 /// # `POST /_matrix/client/r0/search`
 ///
@@ -80,24 +87,21 @@ async fn category_room_events(
 		.limit
 		.map_or(LIMIT_DEFAULT, |limit| usize_from_ruma_bounded(limit, LIMIT_DEFAULT, LIMIT_MAX));
 
-	let next_batch: usize = next_batch
-		.map(str::parse)
-		.transpose()?
-		.unwrap_or(0)
-		.min(limit.saturating_mul(BATCH_MAX));
+	let before: Option<PduCount> = next_batch.map(str::parse).transpose()?;
 
 	let rooms = filter
 		.rooms
 		.clone()
 		.map(IntoIterator::into_iter)
 		.map(IterStream::stream)
-		.map(StreamExt::boxed)
+		.map(Left)
 		.unwrap_or_else(|| {
-			services
+			let joined = services
 				.state_cache
 				.rooms_joined(sender_user)
-				.map(ToOwned::to_owned)
-				.boxed()
+				.map(ToOwned::to_owned);
+
+			Right(joined)
 		});
 
 	let results: Vec<_> = rooms
@@ -112,7 +116,7 @@ async fn category_room_events(
 				room_id: &room_id,
 				user_id: Some(sender_user),
 				criteria,
-				skip: next_batch,
+				before,
 				limit,
 			};
 
@@ -137,7 +141,7 @@ async fn category_room_events(
 		.stream()
 		.ready_filter(|_| criteria.include_state.is_some_and(is_true!()))
 		.filter_map(async |(room_id, ..)| {
-			procure_room_state(services, room_id)
+			procure_room_state(services, sender_user, room_id)
 				.map_ok(|state| (room_id.clone(), state))
 				.await
 				.ok()
@@ -145,10 +149,21 @@ async fn category_room_events(
 		.collect()
 		.await;
 
-	let results: Vec<SearchResult> = results
+	let page: Vec<_> = results
 		.into_iter()
 		.map(at!(2))
-		.flatten()
+		.kmerge_by(|(a, _), (b, _)| a > b)
+		.take(limit)
+		.collect();
+
+	let next_batch = page
+		.last()
+		.filter(|_| page.len() >= limit)
+		.map(|(count, _)| count.to_string());
+
+	let results: Vec<SearchResult> = page
+		.into_iter()
+		.map(at!(1))
 		.stream()
 		.map(Event::into_pdu)
 		.wide_then(async |pdu| {
@@ -174,11 +189,6 @@ async fn category_room_events(
 		.split_terminator(|c: char| !c.is_alphanumeric())
 		.map(str::to_lowercase)
 		.collect();
-
-	let next_batch = (results.len() >= limit)
-		.then_some(next_batch.saturating_add(results.len()))
-		.as_ref()
-		.map(ToString::to_string);
 
 	Ok(ResultRoomEvents {
 		count: Some(total),
@@ -296,10 +306,16 @@ where
 		.await
 }
 
-async fn procure_room_state(services: &Services, room_id: &RoomId) -> Result<RoomState> {
+async fn procure_room_state(
+	services: &Services,
+	sender_user: &UserId,
+	room_id: &RoomId,
+) -> Result<RoomState> {
 	let state = services
 		.state_accessor
 		.room_state_full_pdus(room_id)
+		.map_ok(Event::into_pdu)
+		.map_ok(|pdu| pdu.without_private_unless_sender(Some(sender_user)))
 		.map_ok(Event::into_format)
 		.try_collect()
 		.await?;

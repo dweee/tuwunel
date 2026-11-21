@@ -1,7 +1,7 @@
 use axum::extract::State;
 use futures::{
 	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
-	future::{OptionFuture, join, join3, try_join3},
+	future::{OptionFuture, join, join3, try_join},
 };
 use ruma::{
 	DeviceId, EventId, OwnedEventId, RoomId, UInt, UserId,
@@ -10,9 +10,7 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Err, Event, Result, at, debug_warn, err,
-	matrix::pdu::{PduEvent, RawPduId},
-	ref_at,
+	Err, Result, at, debug_warn, err, ref_at,
 	utils::{
 		BoolExt, IterStream,
 		future::TryExtExt,
@@ -20,24 +18,25 @@ use tuwunel_core::{
 		stream::{BroadbandExt, ReadyExt, TryIgnore, WidebandExt},
 	},
 };
+use tuwunel_matrix::{
+	Event,
+	pdu::{PduEvent, RawPduId},
+};
 use tuwunel_service::{
 	Services,
 	rooms::{
 		lazy_loading,
 		lazy_loading::{Options, Witness},
-		short::{ShortRoomId, ShortStateKey},
+		short::{ShortRoomId, ShortStateHash, ShortStateKey},
 		timeline::PdusIterItem,
 	},
 };
 
 use crate::{
-	Ruma,
-	client::{
-		is_ignored_pdu,
-		message::{
-			add_membership_unsigned, event_filter, event_filters, ignored_filter,
-			lazy_loading_witness, related_by_filter, with_membership,
-		},
+	Ruma, is_ignored_pdu,
+	message::{
+		add_membership_unsigned, event_filter, event_filters, ignored_filter,
+		lazy_loading_witness, related_by_filter, with_membership,
 	},
 };
 
@@ -68,23 +67,36 @@ pub(crate) async fn get_context_route(
 
 /// Shared inputs for [`event_context`], the core behind both the client-server
 /// `/context` route and the admin room-context endpoint.
-pub(crate) struct ContextArgs<'a> {
+pub struct ContextArgs<'a> {
+	/// Room containing the requested event.
 	pub room_id: &'a RoomId,
+
+	/// Event at the center of the timeline window.
 	pub event_id: &'a EventId,
+
+	/// User requesting the event context.
 	pub sender_user: &'a UserId,
+
+	/// Requesting device used for lazy-loading membership state.
 	pub sender_device: Option<&'a DeviceId>,
+
+	/// Filter for timeline events and membership state.
 	pub filter: &'a RoomEventFilter,
+
+	/// Requested maximum number of surrounding timeline events.
 	pub limit: Option<UInt>,
 
-	/// Skip the base-event visibility and ignore checks and the surrounding
-	/// halves' visibility and ignore filters, for admin callers.
+	/// Skip the visibility and ignore checks on the base event and both halves,
+	/// and the room-state check on an anchor without state, for admin callers.
 	pub bypass_visibility: bool,
 }
 
 /// Loads the timeline window around an event with its state and aggregations,
 /// applying (unless `bypass_visibility`) the per-user visibility and ignore
-/// checks. Powers the client-server `/context` route and its admin bypass twin.
-pub(crate) async fn event_context(
+/// checks.
+///
+/// Powers the client-server `/context` route and its admin bypass twin.
+pub async fn event_context(
 	services: &Services,
 	args: ContextArgs<'_>,
 ) -> Result<get_context::v3::Response> {
@@ -154,7 +166,7 @@ pub(crate) async fn event_context(
 
 	let (base_event, events_before, events_after): (_, Vec<_>, Vec<_>) =
 		join3(base_event, events_before, events_after)
-			.boxed()
+			.boxed() // size firewall
 			.await;
 
 	let lazy_loading_context = lazy_loading::Context {
@@ -181,10 +193,11 @@ pub(crate) async fn event_context(
 	let state_at = events_after
 		.last()
 		.map(ref_at!(1))
-		.map_or_else(|| event_id, |pdu| pdu.event_id.as_ref());
+		.map_or(event_id, Event::event_id);
 
-	let (lazy_loading_witnessed, state_ids) =
-		join(lazy_loading_witnessed, load_state_ids(services, room_id, state_at)).await;
+	let state_ids = load_state_ids(services, room_id, state_at, sender_user, bypass_visibility);
+
+	let (lazy_loading_witnessed, state_ids) = join(lazy_loading_witnessed, state_ids).await;
 
 	let state = build_state_response(
 		services,
@@ -257,20 +270,17 @@ async fn resolve_base_event(
 			.get_pdu(event_id)
 			.map_err(|_| err!(Request(NotFound("Base event not found."))));
 
-		let visible = services
-			.state_accessor
-			.user_can_see_event(sender_user, room_id, event_id)
-			.map(Ok);
-
-		try_join3(base_id, base_pdu, visible)
+		try_join(base_id, base_pdu)
 	};
 
 	let resolve_remote = services
 		.config
-		.fetch_unreceived_contexts_over_federation
-		&& services.config.allow_federation;
+		.federation
+		.history
+		.fetch_unreceived_contexts
+		&& services.config.federation.enable;
 
-	let (base_id, base_pdu, visible) = match lookup().await {
+	let (base_id, base_pdu) = match lookup().await {
 		| Ok(found) => found,
 		| Err(e) if !resolve_remote => return Err(e),
 		| Err(_) => {
@@ -288,10 +298,15 @@ async fn resolve_base_event(
 		return Err!(Request(NotFound("Base event not found.")));
 	}
 
-	if !bypass_visibility && !visible {
+	if !bypass_visibility
+		&& !services
+			.state_accessor
+			.user_can_see_event(sender_user, &base_pdu)
+			.await
+	{
 		debug_warn!(
-			req_evt = ?event_id, ?base_id, ?room_id,
-			"Event requested by {sender_user} but is not allowed to see it."
+			req_evt = ?event_id, ?base_id, ?room_id, %sender_user,
+			"Event requested but the requester is not allowed to see it."
 		);
 
 		return Err!(Request(NotFound("Event not found.")));
@@ -305,7 +320,7 @@ async fn resolve_base_event(
 		}));
 	}
 
-	Ok((base_id, base_pdu))
+	Ok((base_id, base_pdu.without_private_unless_sender(Some(sender_user))))
 }
 
 /// Shared inputs for the two [`collect_timeline_half`] calls assembling the
@@ -355,26 +370,78 @@ where
 		.await
 }
 
+/// Loads the room state at the event that anchors the response's state.
+///
+/// An anchor without recorded state, such as a room's create event or a
+/// backfilled event, falls back to the state `fallback_shortstatehash` selects
+/// for the requester, which may be none.
 async fn load_state_ids(
 	services: &Services,
 	room_id: &RoomId,
 	state_at: &EventId,
+	sender_user: &UserId,
+	bypass_visibility: bool,
 ) -> Result<Vec<(ShortStateKey, OwnedEventId)>> {
+	let state_full_ids = |shortstatehash| {
+		services
+			.state_accessor
+			.state_full_ids(shortstatehash)
+	};
+
 	services
 		.state
 		.pdu_shortstatehash(state_at)
-		.or_else(|_| services.state.get_room_shortstatehash(room_id))
+		.map_ok(Some)
+		.or_else(|_| fallback_shortstatehash(services, room_id, sender_user, bypass_visibility))
 		.map_ok(|shortstatehash| {
-			services
-				.state_accessor
-				.state_full_ids(shortstatehash)
+			shortstatehash
+				.into_iter()
+				.stream()
+				.flat_map(state_full_ids)
 				.map(Ok)
 		})
 		.map_err(|e| err!(Database("State not found: {e}")))
 		.try_flatten_stream()
 		.try_collect()
-		.boxed()
+		.boxed() // Send generality
 		.await
+}
+
+/// Selects the state a requester reads in place of an event's missing state.
+///
+/// Admitted requesters reach the selection, which checks access again; departed
+/// members read their departure snapshot, admins included. Only an admin may
+/// read current state when the selection admits none.
+async fn fallback_shortstatehash(
+	services: &Services,
+	room_id: &RoomId,
+	sender_user: &UserId,
+	bypass_visibility: bool,
+) -> Result<Option<ShortStateHash>> {
+	let admitted = bypass_visibility
+		|| services
+			.state_accessor
+			.user_can_see_state_events(sender_user, room_id)
+			.await;
+
+	match admitted
+		.then_async(|| {
+			services
+				.state_accessor
+				.user_visible_shortstatehash(sender_user, room_id, None)
+		})
+		.await
+		.transpose()?
+		.flatten()
+	{
+		| None if bypass_visibility =>
+			services
+				.state
+				.get_room_shortstatehash(room_id)
+				.map_ok(Some)
+				.await,
+		| shortstatehash => Ok(shortstatehash),
+	}
 }
 
 async fn build_state_response(
@@ -409,6 +476,7 @@ async fn build_state_response(
 		.broad_filter_map(|event_id: &OwnedEventId| {
 			services.timeline.get_pdu(event_id.as_ref()).ok()
 		})
+		.map(|pdu| pdu.without_private_unless_sender(Some(sender_user)))
 		.broad_then(|pdu| with_membership(services, pdu, sender_user, encrypted))
 		.map(Event::into_format)
 		.collect()

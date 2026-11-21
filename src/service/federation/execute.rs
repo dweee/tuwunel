@@ -6,14 +6,13 @@
 use std::{fmt::Debug, mem, time::Duration};
 
 use bytes::Bytes;
-use ipaddress::IPAddress;
-use reqwest::{Client, Method, Request, Response, Url};
+use reqwest::{Method, Request, Response, Url};
 use ruma::{
 	ServerName,
 	api::{
 		EndpointError, IncomingResponse, MatrixVersion, OutgoingRequest, OutgoingRequestExt,
 		SupportedVersions,
-		error::{Error as RumaError, ErrorBody},
+		error::{Error as RumaError, ErrorBody, ErrorKind},
 	},
 };
 use tokio::time::timeout;
@@ -27,13 +26,17 @@ use super::{
 	peer::classify_error,
 	scheme::{FedAuth, FedPath},
 };
-use crate::{client::read_response_capped, resolver::actual::ActualDest};
+use crate::{
+	client::{Federation, read_response_capped},
+	resolver::actual::ActualDest,
+};
 
 /// Sends a federation request with the standard federation client.
 ///
 /// The destination is validated and resolved before the request is signed and
-/// sent. Success clears peer failures and classifiable errors record a failure;
-/// this entry point does not itself consult peer backoff.
+/// sent. Success clears peer failures and classifiable errors record a failure,
+/// except a local refusal; this entry point does not itself consult peer
+/// backoff.
 #[implement(super::Service)]
 #[tracing::instrument(skip_all, name = "request", level = "debug")]
 pub async fn execute<T>(&self, dest: &ServerName, request: T) -> Result<T::IncomingResponse>
@@ -64,12 +67,15 @@ where
 		return Err!("{dest} is in federation backoff; skipping key lookup");
 	}
 
-	let timeout_dur = Duration::from_secs(
-		self.services
-			.server
-			.config
-			.federation_keys_timeout,
-	);
+	let timeout_secs = self
+		.services
+		.server
+		.config
+		.federation
+		.transport
+		.keys_timeout;
+
+	let timeout_dur = Duration::from_secs(timeout_secs);
 
 	let client = &self.services.client.federation;
 
@@ -101,13 +107,15 @@ where
 
 /// Sends through a supplied client and records the peer outcome.
 ///
+/// The destination's resolved route picks the direct or SRV half of the client.
 /// A successful response clears every stored failure row for the destination.
-/// Only errors classified as peer failures are recorded, and no backoff gate is
-/// consulted before sending.
+/// A request refused because federation is disabled or the server is forbidden
+/// records nothing; other errors are recorded only when classified as peer
+/// failures, and no backoff gate is consulted before sending.
 #[implement(super::Service)]
 pub async fn execute_on<T>(
 	&self,
-	client: &Client,
+	client: &Federation,
 	dest: &ServerName,
 	request: T,
 ) -> Result<T::IncomingResponse>
@@ -120,25 +128,40 @@ where
 		.execute_uncounted(client, dest, request)
 		.await;
 
-	match &result {
-		| Ok(_) => self.record_success(dest).await,
-		| Err(error) =>
-			if let Some(class) = classify_error(error) {
-				self.record_failure(dest, class);
-			},
-	}
+	self.record_outcome(dest, result.as_ref().err())
+		.await;
 
 	result
+}
+
+#[implement(super::Service)]
+async fn record_outcome(&self, dest: &ServerName, error: Option<&Error>) {
+	if error.is_some_and(is_local_refusal) {
+		return;
+	}
+
+	match error.map(classify_error) {
+		| None => self.record_success(dest).await,
+		| Some(Some(class)) => self.record_failure(dest, class),
+		| Some(None) => {},
+	}
+}
+
+// Only `require_remote_permitted` raises this on the send path; a peer's 403 is `Federation`.
+fn is_local_refusal(error: &Error) -> bool {
+	matches!(error, Error::Request(ErrorKind::Forbidden, ..))
 }
 
 /// Executes one Feds request while permitting only this server as a
 /// self-destination and preserving ordinary peer-status recording.
 ///
-/// Other federation entry points retain the configured loopback gate.
+/// Other federation entry points retain the configured loopback gate. A request
+/// refused because federation is disabled or the server is forbidden records
+/// nothing.
 #[implement(super::Service)]
 pub(super) async fn execute_on_allow_self<T>(
 	&self,
-	client: &Client,
+	client: &Federation,
 	dest: &ServerName,
 	request: T,
 ) -> Result<T::IncomingResponse>
@@ -151,13 +174,8 @@ where
 		.execute_uncounted_allow_self(client, dest, request)
 		.await;
 
-	match &result {
-		| Ok(_) => self.record_success(dest).await,
-		| Err(error) =>
-			if let Some(class) = classify_error(error) {
-				self.record_failure(dest, class);
-			},
-	}
+	self.record_outcome(dest, result.as_ref().err())
+		.await;
 
 	result
 }
@@ -174,7 +192,7 @@ where
 )]
 pub(super) async fn execute_uncounted<T>(
 	&self,
-	client: &Client,
+	client: &Federation,
 	dest: &ServerName,
 	request: T,
 ) -> Result<T::IncomingResponse>
@@ -203,7 +221,7 @@ where
 #[tracing::instrument(name = "fed", level = "debug", skip(self, client, request))]
 pub(super) async fn execute_uncounted_allow_self<T>(
 	&self,
-	client: &Client,
+	client: &Federation,
 	dest: &ServerName,
 	request: T,
 ) -> Result<T::IncomingResponse>
@@ -226,20 +244,10 @@ where
 
 #[implement(super::Service)]
 fn validate_request_destination(&self, dest: &ServerName) -> Result {
-	if !self.services.server.config.allow_federation {
-		return Err!(Config("allow_federation", "Federation is disabled."));
-	}
-
-	if self
-		.services
+	self.services
 		.server
 		.config
-		.is_forbidden_remote_server_name(dest)
-	{
-		return Err!(Request(Forbidden(debug_warn!("Federation with {dest} is not allowed."))));
-	}
-
-	Ok(())
+		.require_remote_permitted(dest)
 }
 
 #[implement(super::Service)]
@@ -248,7 +256,7 @@ async fn perform<T>(
 	actual: &ActualDest,
 	dest: &ServerName,
 	request: Request,
-	client: &Client,
+	client: &Federation,
 ) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Send,
@@ -259,9 +267,15 @@ where
 	let method = request.method().clone();
 
 	debug!(?method, ?url, "Sending request");
-	let limit = self.services.server.config.max_response_size;
+	let limit = self
+		.services
+		.server
+		.config
+		.network
+		.http
+		.max_response_size;
 
-	match client.execute(request).await {
+	match client.for_srv(actual.srv).execute(request).await {
 		| Ok(response) => handle_response::<T>(actual, dest, &method, &url, response, limit)
 			.await
 			.inspect_err(|error| self.evict_misrouted(dest, actual, error)),
@@ -272,7 +286,12 @@ where
 }
 
 #[implement(super::Service)]
-fn prepare<T>(&self, actual: &ActualDest, dest: &ServerName, request: T) -> Result<Request>
+pub(super) fn prepare<T>(
+	&self,
+	actual: &ActualDest,
+	dest: &ServerName,
+	request: T,
+) -> Result<Request>
 where
 	T: OutgoingRequest + Send,
 	T::Authentication: FedAuth,
@@ -287,12 +306,9 @@ where
 }
 
 #[implement(super::Service)]
-fn validate_url(&self, url: &Url) -> Result {
-	if let Some(url_host) = url.host_str()
-		&& let Ok(ip) = IPAddress::parse(url_host)
-	{
-		trace!("Checking request URL IP {ip:?}");
-		self.services.resolver.validate_ip(&ip)?;
+pub(super) fn validate_url(&self, url: &Url) -> Result {
+	if !self.services.client.valid_cidr_range_url(url) {
+		return Err!(BadServerResponse("Not allowed to send requests to this IP"));
 	}
 
 	Ok(())
@@ -407,15 +423,16 @@ fn evict_misrouted(&self, dest: &ServerName, actual: &ActualDest, error: &Error)
 	}
 }
 
-// Overrides are keyed by the resolved (delegated/SRV) hostname, so evict under
-// the key resolution wrote (`actual.dest.hostname()`), not the origin name.
+// Only an SRV route resolves through an override, keyed by the hostname it was
+// written under (`actual.dest.hostname()`), not the origin name.
 #[implement(super::Service)]
 fn evict_route(&self, dest: &ServerName, actual: &ActualDest) {
-	self.services.resolver.cache.del_destination(dest);
-	self.services
-		.resolver
-		.cache
-		.del_override(&actual.dest.hostname());
+	let cache = &self.services.resolver.cache;
+
+	cache.del_destination(dest);
+	if actual.srv {
+		cache.del_override(&actual.dest.hostname());
+	}
 }
 
 #[implement(super::Service)]

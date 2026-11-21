@@ -42,7 +42,8 @@ where
 		let push_path = self
 			.services
 			.config
-			.notification_push_path
+			.push
+			.notification_path
 			.trim_end_matches('/');
 
 		let dest = dest.trim_end_matches('/');
@@ -123,7 +124,13 @@ where
 			.expect("http::response::Builder is usable"),
 	);
 
-	let limit = self.services.config.max_response_size;
+	let limit = self
+		.services
+		.config
+		.network
+		.http
+		.max_response_size;
+
 	let body = read_response_capped(response, limit).await?;
 
 	if !status.is_success() {

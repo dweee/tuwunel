@@ -59,6 +59,7 @@ mod unsupported {
 	pub(super) fn unbound() -> io::Result<Self> { Err(unavailable()) }
 
 	#[implement(UnixDatagram)]
+	#[expect(clippy::unused_self)]
 	pub(super) fn send_to(&self, _payload: &[u8], _path: &str) -> io::Result<usize> {
 		Err(unavailable())
 	}
@@ -152,7 +153,7 @@ impl Journal {
 
 		journal
 			.send(&[])
-			.map_err(|e| err!(Config("log_journald", "{SOCKET}: {e}.")))?;
+			.map_err(|e| err!(Config("logging.journald", "{SOCKET}: {e}.")))?;
 
 		Ok(journal)
 	}
@@ -273,9 +274,11 @@ impl<L> Fields<L> {
 	pub fn new(inner: L, config: &Config) -> Self { Self { inner, submit: enabled(config) } }
 }
 
-/// Whether events are submitted to journald rather than written to the
-/// console, which journald otherwise captures at a single fixed priority.
-pub(super) fn enabled(config: &Config) -> bool { config.log_journald && is_systemd_mode() }
+/// Reports whether events are submitted directly to journald.
+///
+/// Requires `logging.journald` and systemd mode. Console output is otherwise
+/// captured by journald at a single fixed priority.
+pub(super) fn enabled(config: &Config) -> bool { config.logging.journald && is_systemd_mode() }
 
 impl<S, L> Layer<S> for Fields<L>
 where

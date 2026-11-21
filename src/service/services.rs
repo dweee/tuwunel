@@ -9,15 +9,15 @@ use tuwunel_database::Database;
 
 pub(crate) use crate::OnceServices;
 use crate::{
-	account_data, admin, appservice, client, config, deactivate, emergency, federation, fetcher,
-	globals, key_backups,
+	account_data, admin, appservice, client, config, deactivate, delayed_events, emergency,
+	federation, fetcher, globals, key_backups, login_ratelimit,
 	manager::Manager,
 	media, membership, oauth, presence, profile, pusher, registration_tokens, rendezvous,
 	resolver,
 	rooms::{self, retention},
 	sending, sendmail, server_keys,
 	service::{Args, Service},
-	storage, sync, tasks, threepid, transaction_ids, uiaa, users,
+	storage, sync, tasks, threepid, transaction_ids, turn, uiaa, users,
 };
 
 pub struct Services {
@@ -30,6 +30,7 @@ pub struct Services {
 	pub fetcher: Arc<fetcher::Service>,
 	pub globals: Arc<globals::Service>,
 	pub key_backups: Arc<key_backups::Service>,
+	pub login_ratelimit: Arc<login_ratelimit::Service>,
 	pub media: Arc<media::Service>,
 	pub presence: Arc<presence::Service>,
 	pub pusher: Arc<pusher::Service>,
@@ -64,6 +65,8 @@ pub struct Services {
 	pub users: Arc<users::Service>,
 	pub membership: Arc<membership::Service>,
 	pub deactivate: Arc<deactivate::Service>,
+	/// Events clients scheduled to be sent later (MSC4140).
+	pub delayed_events: Arc<delayed_events::Service>,
 	pub oauth: Arc<oauth::Service>,
 	pub retention: Arc<retention::Service>,
 	pub registration_tokens: Arc<registration_tokens::Service>,
@@ -71,6 +74,8 @@ pub struct Services {
 	pub sendmail: Arc<sendmail::Service>,
 	pub threepid: Arc<threepid::Service>,
 	pub profile: Arc<profile::Service>,
+	/// TURN credentials from an external provider, shared by all users.
+	pub turn: Arc<turn::Service>,
 
 	manager: Mutex<Option<Arc<Manager>>>,
 	pub server: Arc<Server>,
@@ -127,10 +132,12 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		sync: sync::Service::build(&args)?,
 		tasks: tasks::Service::build(&args)?,
 		transaction_ids: transaction_ids::Service::build(&args)?,
+		login_ratelimit: login_ratelimit::Service::build(&args)?,
 		uiaa: uiaa::Service::build(&args)?,
 		users: users::Service::build(&args)?,
 		membership: membership::Service::build(&args)?,
 		deactivate: deactivate::Service::build(&args)?,
+		delayed_events: delayed_events::Service::build(&args)?,
 		oauth: oauth::Service::build(&args)?,
 		retention: retention::Service::build(&args)?,
 		registration_tokens: registration_tokens::Service::build(&args)?,
@@ -138,6 +145,7 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		sendmail: sendmail::Service::build(&args)?,
 		threepid: threepid::Service::build(&args)?,
 		profile: profile::Service::build(&args)?,
+		turn: turn::Service::build(&args)?,
 
 		manager: Mutex::new(None),
 		server,
@@ -199,11 +207,13 @@ pub(crate) fn services(&self) -> impl Iterator<Item = Arc<dyn Service>> + Send {
 		cast!(self.users),
 		cast!(self.membership),
 		cast!(self.deactivate),
+		cast!(self.delayed_events),
 		cast!(self.oauth),
 		cast!(self.retention),
 		cast!(self.registration_tokens),
 		cast!(self.rendezvous),
 		cast!(self.profile),
+		cast!(self.turn),
 	]
 	.into_iter()
 }

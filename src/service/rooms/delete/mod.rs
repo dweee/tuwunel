@@ -7,6 +7,9 @@ use tuwunel_core::{Result, debug, result::LogErr, trace, utils::future::BoolExt,
 
 use crate::rooms::timeline::RoomMutexGuard;
 
+#[cfg(test)]
+mod tests;
+
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 }
@@ -33,15 +36,15 @@ impl crate::Service for Service {
 impl Service {
 	pub async fn delete_if_empty_local(&self, room_id: &RoomId, state_lock: RoomMutexGuard) {
 		debug_assert!(
-			self.services.config.delete_rooms_after_leave,
-			"Caller must checking if delete_rooms_after_leave configured."
+			self.services.config.rooms.delete_after_leave,
+			"Caller must check whether rooms.delete_after_leave is configured."
 		);
 
 		let has_local_users = self
 			.services
 			.state_cache
 			.local_users_in_room(room_id)
-			.boxed()
+			.boxed() // Unpin for into_future
 			.into_future()
 			.map(|(next, ..)| next.as_ref().is_some());
 
@@ -49,7 +52,7 @@ impl Service {
 			.services
 			.state_cache
 			.local_users_invited_to_room(room_id)
-			.boxed()
+			.boxed() // Unpin for into_future
 			.into_future()
 			.map(|(next, ..)| next.as_ref().is_some());
 
@@ -63,7 +66,7 @@ impl Service {
 		self.services
 			.delete
 			.delete_room(room_id, false, state_lock)
-			.boxed()
+			.boxed() // size firewall
 			.await
 			.expect("unhandled error during room deletion");
 	}
@@ -186,6 +189,12 @@ impl Service {
 			.await
 			.log_err()
 			.ok();
+
+		debug!("Deleting all the room's soft-fail markers");
+		self.services
+			.pdu_metadata
+			.delete_all_soft_failed_for_room(room_id)
+			.await;
 
 		debug!("Deleting all the room's member counts");
 		self.services

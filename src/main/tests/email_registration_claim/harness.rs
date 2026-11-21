@@ -106,22 +106,19 @@ fn server_args(
 	test_modes: &[&str],
 	config: RegistrationConfig,
 ) -> Args {
-	let mut args = Args::default_test(test_modes);
+	let mut args = Args::default_test(test_modes)
+		.with_database_path(db_path)
+		.with_loopback_listener(port);
 
 	args.option.extend([
-		format!("database_path=\"{}\"", db_path.display()),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
 		"listening=true".to_owned(),
 		// The test starts multiple servers, so none may claim global tracing.
-		"log_enable=false".to_owned(),
+		"logging.enable=false".to_owned(),
 		"well_known.client=\"https://localhost\"".to_owned(),
 		"smtp.connection_uri=\"smtp://127.0.0.1:1\"".to_owned(),
 		"smtp.sender=\"Tests <test@example.test>\"".to_owned(),
 		"smtp.require_email_for_registration=true".to_owned(),
-		"allow_registration=true".to_owned(),
-		"yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse=true"
-			.to_owned(),
+		"registration.enable=true".to_owned(),
 	]);
 
 	if config.terms {
@@ -135,7 +132,7 @@ fn server_args(
 
 	if let Some(token) = config.token {
 		args.option
-			.push(format!("registration_token={token:?}"));
+			.push(format!("registration.token={token:?}"));
 	}
 
 	args

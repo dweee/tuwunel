@@ -1,8 +1,17 @@
+use std::borrow::Cow;
+
 use futures::FutureExt;
 use ruma::{UserId, events::GlobalAccountDataEventType, push};
-use tuwunel_core::{Err, Result, error, implement, info, is_equal_to, warn};
+use tuwunel_core::{
+	Err, Result, error, implement, info, is_equal_to,
+	utils::{BoolExt, string::truncate_chars},
+	warn,
+};
 
-use crate::{membership::Join, profile::Propagation};
+use crate::{
+	membership::Join,
+	profile::{MAX_DISPLAYNAME_LENGTH, Propagation},
+};
 
 #[derive(Debug, Default)]
 pub struct Register<'a> {
@@ -61,23 +70,22 @@ pub async fn full_register(
 		.create(user_id, password, origin)
 		.await?;
 
-	let displayname_suffix = self
+	let suffix = self
 		.services
 		.config
-		.new_user_displayname_suffix
+		.registration
+		.displayname_suffix
 		.as_str();
 
-	let mut displayname = displayname.unwrap_or_else(|| user_id.localpart());
+	let suffix = omit_displayname_suffix
+		.or_some(suffix)
+		.filter(|suffix| !suffix.is_empty());
 
-	let displayname_with_suffix;
-	if !displayname_suffix.is_empty() && !omit_displayname_suffix {
-		displayname_with_suffix = format!("{displayname} {displayname_suffix}");
-		displayname = &displayname_with_suffix;
-	}
+	let displayname = new_displayname(displayname.unwrap_or_else(|| user_id.localpart()), suffix);
 
 	self.services
 		.profile
-		.set_displayname(user_id, Some(displayname), Some(Propagation::None))
+		.set_displayname(user_id, Some(&displayname), Some(Propagation::None))
 		.await?;
 
 	// Initial account data
@@ -103,7 +111,11 @@ pub async fn full_register(
 	if !is_guest
 		&& !is_appservice
 		&& grant_first_user_admin
-		&& self.services.config.grant_admin_to_first_user
+		&& self
+			.services
+			.config
+			.registration
+			.grant_admin_to_first_user
 		&& let Ok(admin_room) = self.services.admin.get_admin_room().await
 		&& self
 			.services
@@ -115,57 +127,125 @@ pub async fn full_register(
 		self.services
 			.admin
 			.make_user_admin(user_id)
-			.boxed()
+			.boxed() // cold arm
 			.await?;
+
 		warn!("Granting {user_id} admin privileges as the first user");
 	}
 
-	if !is_appservice && (self.services.config.allow_guests_auto_join_rooms || !is_guest) {
-		for room in &self.services.server.config.auto_join_rooms {
-			let Ok(room_id) = self.services.alias.maybe_resolve(room).await else {
-				error!(
-					"Failed to resolve room alias to room ID when attempting to auto join \
-					 {room}, skipping"
-				);
-				continue;
-			};
+	if is_appservice
+		|| (self
+			.services
+			.config
+			.registration
+			.guests
+			.allow_auto_join_rooms
+			.is_false()
+			&& is_guest)
+	{
+		return Ok(());
+	}
 
-			if !self
-				.services
-				.state_cache
-				.server_in_room(self.services.globals.server_name(), &room_id)
-				.await
-			{
-				warn!(
-					"Skipping room {room} to automatically join as we have never joined before."
-				);
-				continue;
-			}
+	for room in &self
+		.services
+		.server
+		.config
+		.registration
+		.auto_join_rooms
+	{
+		let Ok(room_id) = self.services.alias.maybe_resolve(room).await else {
+			error!(
+				"Failed to resolve room alias to room ID when attempting to auto join {room}, \
+				 skipping"
+			);
 
-			match self
-				.services
-				.membership
-				.join(Join {
-					sender_user: user_id,
-					room_id: &room_id,
-					orig_room_id: Some(room),
-					reason: Some("Automatically joining this room upon registration".to_owned()),
-					servers: &[],
-					is_appservice: false,
-					extra_content: None,
-				})
-				.await
-			{
-				| Err(e) => {
-					// don't return this error so we don't fail registrations
-					error!("Failed to automatically join room {room} for user {user_id}: {e}");
-				},
-				| _ => {
-					info!("Automatically joined room {room} for user {user_id}");
-				},
-			}
+			continue;
+		};
+
+		if !self
+			.services
+			.state_cache
+			.server_in_room(self.services.globals.server_name(), &room_id)
+			.await
+		{
+			warn!("Skipping room {room} to automatically join as we have never joined before.");
+
+			continue;
+		}
+
+		match self
+			.services
+			.membership
+			.join(Join {
+				sender_user: user_id,
+				room_id: &room_id,
+				orig_room_id: Some(room),
+				reason: Some("Automatically joining this room upon registration".to_owned()),
+				servers: &[],
+				is_appservice: false,
+				extra_content: None,
+			})
+			.await
+		{
+			| Err(e) => {
+				// don't return this error so we don't fail registrations
+				error!("Failed to automatically join room {room} for user {user_id}: {e}");
+			},
+			| _ => {
+				info!("Automatically joined room {room} for user {user_id}");
+			},
 		}
 	}
 
 	Ok(())
+}
+
+// The account already exists here, so an overlong name is shortened rather than refused.
+fn new_displayname<'a>(name: &'a str, suffix: Option<&str>) -> Cow<'a, str> {
+	let name = truncate_chars(name, MAX_DISPLAYNAME_LENGTH);
+	let fits = |suffix: &&str| {
+		name.chars()
+			.count()
+			.saturating_add(suffix.chars().count())
+			.lt(&MAX_DISPLAYNAME_LENGTH)
+	};
+
+	suffix
+		.filter(fits)
+		.map_or_else(|| name.into(), |suffix| format!("{name} {suffix}").into())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{MAX_DISPLAYNAME_LENGTH, new_displayname};
+
+	#[test]
+	fn a_name_that_fits_is_kept() {
+		assert_eq!(new_displayname("june", None), "june");
+		assert_eq!(new_displayname("june", Some("💕")), "june 💕");
+	}
+
+	#[test]
+	fn an_overlong_name_is_shortened_to_the_limit() {
+		let long = "é".repeat(MAX_DISPLAYNAME_LENGTH + 1);
+
+		assert_eq!(new_displayname(&long, None).chars().count(), MAX_DISPLAYNAME_LENGTH);
+		assert_eq!(new_displayname(&long, Some("💕")).chars().count(), MAX_DISPLAYNAME_LENGTH);
+	}
+
+	#[test]
+	fn the_suffix_is_added_only_where_it_fits() {
+		let fits = "n".repeat(MAX_DISPLAYNAME_LENGTH - 2);
+		let full = "n".repeat(MAX_DISPLAYNAME_LENGTH - 1);
+
+		assert_eq!(new_displayname(&fits, Some("💕")), format!("{fits} 💕"));
+		assert_eq!(new_displayname(&full, Some("💕")), full);
+	}
+
+	#[test]
+	fn an_overlong_suffix_leaves_the_name_alone() {
+		let suffix = "s".repeat(MAX_DISPLAYNAME_LENGTH);
+
+		assert_eq!(new_displayname("june", Some(&suffix)), "june");
+	}
 }

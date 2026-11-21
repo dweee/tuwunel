@@ -32,8 +32,8 @@ use self::{
 	},
 	write::write_atomic,
 };
-use super::{Config, DEPRECATED_KEYS, Sources, format::Toml};
-use crate::{Err, Error, Result, err, implement, utils::BoolExt};
+use super::{Config, DEPRECATED_KEYS, Sources, format::Toml, normalize::validate_registry};
+use crate::{Err, Result, err, implement, utils::BoolExt};
 
 const NEVER_EMIT: [&str; 2] = ["database_restore_backup", "force_migration"];
 
@@ -48,25 +48,22 @@ pub(super) enum FieldClass {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FieldSpec {
 	pub(super) name: &'static str,
+	pub(super) path: &'static str,
+	pub(super) legacy: &'static [&'static str],
 	pub(super) aliases: &'static [&'static str],
 	pub(super) example: &'static str,
 	pub(super) class: FieldClass,
+	pub(super) sensitive: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SectionSpec {
 	pub(super) section: &'static str,
 	pub(super) aliases: &'static [&'static str],
+	pub(super) about: &'static str,
 	pub(super) example: &'static str,
 	pub(super) fields: &'static [FieldSpec],
-	pub(super) position: SourcePosition,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct SourcePosition {
-	pub(super) file: &'static str,
-	pub(super) line: u32,
-	pub(super) column: u32,
+	pub(super) group: bool,
 }
 
 /// Selects how an existing configuration is regenerated.
@@ -146,6 +143,13 @@ struct RenderContext<'a> {
 }
 
 #[derive(Clone, Copy)]
+enum Block<'a, 'v> {
+	Instance(&'a Instance<'v>),
+	Environment(&'a Instance<'v>, (&'a Figment, &'a Dict)),
+	Template,
+}
+
+#[derive(Clone, Copy)]
 enum ResidueKind {
 	Deprecated,
 	Hidden,
@@ -161,12 +165,14 @@ enum ResidueDisposition {
 #[link_section::section(typed)]
 pub(super) static REGISTERED_SECTIONS: TypedSection<SectionSpec>;
 
+type MetadataKeys<'a> = SmallVec<[&'a str; 4]>;
+
 type OrderedSections = SmallVec<[&'static SectionSpec; 16]>;
 
 static ORDERED_SECTIONS: LazyLock<OrderedSections> = LazyLock::new(ordered_sections);
 
 #[inline]
-fn schema() -> &'static [&'static SectionSpec] { ORDERED_SECTIONS.as_slice() }
+pub(super) fn schema() -> &'static [&'static SectionSpec] { ORDERED_SECTIONS.as_slice() }
 
 fn ordered_sections() -> OrderedSections {
 	let mut sections = REGISTERED_SECTIONS
@@ -174,33 +180,20 @@ fn ordered_sections() -> OrderedSections {
 		.iter()
 		.collect::<OrderedSections>();
 
-	// Linker-section order is unspecified, so restore source declaration order.
-	sections.sort_unstable_by_key(|section| section.position);
+	// Section paths put each parent before its alphabetically ordered children.
+	sections.sort_unstable_by_key(|section| section.section.trim_matches(['[', ']']));
 	validate_schema(&sections);
 
 	sections
 }
 
 fn validate_schema(sections: &[&SectionSpec]) {
+	validate_registry(sections);
 	let first = sections
 		.first()
 		.expect("configuration schema must contain the global section");
 
-	assert!(
-		sections
-			.iter()
-			.all(|section| section.position.file == first.position.file),
-		"configuration sections must be declared in one source file",
-	);
-
 	assert_eq!(first.section, "global", "global must be the first configuration section");
-
-	for pair in sections.windows(2) {
-		assert_ne!(
-			pair[0].position, pair[1].position,
-			"configuration sections share a source location"
-		);
-	}
 
 	for (index, section) in sections.iter().enumerate() {
 		assert!(
@@ -253,14 +246,14 @@ pub fn regenerate_config(
 	sources: &Sources,
 	options: RegenerateOptions<'_>,
 ) -> Result<RegenerationSummary> {
-	let paths = sources.file_paths().unique().collect_vec();
-	let input_count = paths.len();
+	let paths = sources.file_paths().collect_vec();
+	let input_count = paths.iter().sorted_unstable().dedup().count();
 
 	if paths.is_empty() {
 		return Err!("Configuration regeneration requires at least one input file.");
 	}
 
-	if paths.len() > 1 && options.output.is_none() {
+	if input_count > 1 && options.output.is_none() {
 		return Err!(
 			"Layered configuration files require an explicit output path because they are \
 			 collapsed into one document."
@@ -281,7 +274,8 @@ pub fn regenerate_config(
 		.then(|| files.extract::<Dict>())
 		.transpose()?;
 
-	let effective = Config::merge_environment(files);
+	let effective = Config::merge_environment(files)?;
+
 	Config::new(&effective)?;
 
 	let mut values = match file_values {
@@ -311,9 +305,7 @@ pub fn regenerate_config(
 	let mut stats = RenderStats::default();
 	let rendered = {
 		let mut context = RenderContext {
-			environment: effective_values
-				.as_ref()
-				.map(|values| (&effective, values)),
+			environment: Some((&effective, effective_values.as_ref().unwrap_or(&values))),
 			strip_unknown: options.strip_unknown,
 			expected: &mut expected,
 			stats: &mut stats,
@@ -392,41 +384,76 @@ pub fn dropped_keys(&self) -> impl Iterator<Item = &'static str> + '_ {
 
 fn render_schema(values: &Dict, context: &mut RenderContext<'_>) -> Result<String> {
 	let schema = schema();
-	let mut output = String::with_capacity(schema.iter().map(|spec| spec.example.len()).sum());
+	let capacity = schema
+		.iter()
+		.flat_map(|spec| [spec.about, spec.example])
+		.map(str::len)
+		.sum();
 
-	for &spec in schema {
-		let instances = resolve_instances(spec, values);
-		let dynamic = is_dynamic(spec.section);
+	schema
+		.iter()
+		.try_fold(String::with_capacity(capacity), |output, &spec| {
+			render_section(output, spec, values, context)
+		})
+}
 
-		for instance in &instances {
-			render_instance(&mut output, spec, instance, context)?;
-		}
+fn render_section(
+	output: String,
+	spec: &SectionSpec,
+	values: &Dict,
+	context: &mut RenderContext<'_>,
+) -> Result<String> {
+	let environment = context.environment;
+	let instances = resolve_instances(spec, values);
+	let environment_instances = environment
+		.map(|(_, environment_values)| resolve_instances(spec, environment_values))
+		.unwrap_or_default();
 
-		let rendered_instance = instances.is_empty().is_false();
+	let rendered = instances.is_empty().is_false()
+		|| environment_instances
+			.iter()
+			.any(|candidate| is_unrendered(&instances, candidate));
 
-		let rendered_instance = match context.environment {
-			| None => rendered_instance,
-			| Some(environment @ (_, environment_values)) => {
-				let environment_instances = resolve_instances(spec, environment_values);
+	let templated = is_dynamic(spec.section) || rendered.is_false();
+	let environment_blocks = environment_instances
+		.iter()
+		.filter(|candidate| is_unrendered(&instances, candidate))
+		.filter_map(|candidate| {
+			environment.map(|environment| Block::Environment(candidate, environment))
+		});
 
-				environment_instances
-					.iter()
-					.filter(|candidate| {
-						instances
-							.iter()
-							.all(|instance| instance.path != candidate.path)
-					})
-					.try_fold(rendered_instance, |_, candidate| {
-						render_environment_instance(&mut output, spec, candidate, environment)?;
+	instances
+		.iter()
+		.map(Block::Instance)
+		.chain(environment_blocks)
+		.chain(templated.then_some(Block::Template))
+		.enumerate()
+		.try_fold(output, |output, (index, block)| {
+			render_block(output, index, spec, block, context)
+		})
+}
 
-						Ok::<_, Error>(true)
-					})?
-			},
-		};
+fn is_unrendered<'v>(instances: &[Instance<'v>], candidate: &Instance<'v>) -> bool {
+	instances
+		.iter()
+		.all(|instance| instance.path != candidate.path)
+}
 
-		if dynamic || !rendered_instance {
-			output.push_str(spec.example);
-		}
+fn render_block(
+	mut output: String,
+	index: usize,
+	spec: &SectionSpec,
+	block: Block<'_, '_>,
+	context: &mut RenderContext<'_>,
+) -> Result<String> {
+	let lead = if index == 0 { spec.about } else { "\n\n" };
+
+	output.push_str(lead);
+	match block {
+		| Block::Instance(instance) => render_instance(&mut output, spec, instance, context)?,
+		| Block::Environment(instance, environment) =>
+			render_environment_instance(&mut output, spec, instance, environment)?,
+		| Block::Template => output.push_str(spec.example),
 	}
 
 	Ok(output)
@@ -482,6 +509,25 @@ fn render_instance(
 	}
 
 	render_unlisted_fields(output, spec, instance, context)
+}
+
+#[cfg(test)]
+pub(super) fn render_fixture(spec: &SectionSpec, values: &Dict) -> Result<String> {
+	let mut output = String::new();
+	let mut expected = Dict::new();
+	let mut stats = RenderStats::default();
+	let mut context = RenderContext {
+		environment: None,
+		strip_unknown: false,
+		expected: &mut expected,
+		stats: &mut stats,
+	};
+
+	for instance in resolve_instances(spec, values) {
+		render_instance(&mut output, spec, &instance, &mut context)?;
+	}
+
+	Ok(output)
 }
 
 fn render_environment_instance(
@@ -678,10 +724,11 @@ fn annotate_environment(
 		return Ok(());
 	};
 
-	let action = file_value
-		.is_some()
-		.then_some("currently overridden by")
-		.unwrap_or("currently set by");
+	let action = match file_value {
+		| None => "currently set by",
+		| Some(value) if is_file_value(figment, value) => "currently overridden by",
+		| Some(_) => "materialized from",
+	};
 
 	write!(output, "# {action} ").expect("written to configuration buffer");
 	write_environment_name(output, figment, value, path);
@@ -781,32 +828,21 @@ fn write_environment_name(
 	value: &Value,
 	path: &[PathPart<'_>],
 ) {
-	let prefix = figment
-		.get_metadata(value.tag())
-		.and_then(|metadata| metadata.name.strip_prefix('`'))
-		.and_then(|name| name.split_once('`'))
-		.map(|(prefix, _)| prefix)
-		.unwrap_or("TUWUNEL_");
+	if let Some(metadata) = figment.get_metadata(value.tag()) {
+		let keys = path
+			.iter()
+			.filter_map(|part| match part {
+				| PathPart::Key(key) => Some(*key),
+				| PathPart::Index(_) => None,
+			})
+			.collect::<MetadataKeys<'_>>();
 
-	output.push_str(prefix);
+		let profile = value
+			.tag()
+			.profile()
+			.unwrap_or_else(|| figment.profile().clone());
 
-	for (index, key) in path
-		.iter()
-		.take_while(|part| matches!(part, PathPart::Key(_)))
-		.filter_map(|part| match part {
-			| PathPart::Key(key) => Some(*key),
-			| PathPart::Index(_) => None,
-		})
-		.enumerate()
-	{
-		if index > 0 {
-			output.push_str("__");
-		}
-
-		output.extend(
-			key.chars()
-				.map(|character| character.to_ascii_uppercase()),
-		);
+		output.push_str(&metadata.interpolate(&profile, &keys));
 	}
 }
 

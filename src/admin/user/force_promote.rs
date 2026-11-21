@@ -3,9 +3,13 @@ use ruma::{
 	Int, OwnedRoomOrAliasId,
 	events::room::power_levels::{RoomPowerLevelsEventContent, UserPowerLevel},
 };
-use tuwunel_core::{Err, Result, info, matrix::pdu::PduBuilder, utils::ReadyExt};
+use tuwunel_core::{Err, Result, info, utils::ReadyExt};
+use tuwunel_matrix::pdu::PduBuilder;
 
-use crate::{admin_command, utils::parse_user_id};
+use crate::{
+	admin_command,
+	utils::{check_existing_local_user, parse_user_id},
+};
 
 #[admin_command]
 pub(super) async fn force_promote(
@@ -14,6 +18,11 @@ pub(super) async fn force_promote(
 	room_id: OwnedRoomOrAliasId,
 ) -> Result {
 	let target_id = parse_user_id(self.services, &target_id)?;
+
+	if self.services.globals.user_is_local(&target_id) {
+		check_existing_local_user(self.services, &target_id).await?;
+	}
+
 	let room_id = self
 		.services
 		.alias

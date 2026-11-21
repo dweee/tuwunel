@@ -14,8 +14,12 @@ use axum::{
 };
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
+use ruma::TransactionId;
 use serde::Serialize;
-use tuwunel_core::{Error as CoreError, Result as CoreResult, err};
+use tuwunel_core::{
+	Error as CoreError, Result as CoreResult, err,
+	utils::{BoolExt, string::is_opaque_id},
+};
 use tuwunel_service::Services;
 
 pub(crate) use self::{
@@ -71,23 +75,33 @@ pub(super) fn ensure_available(services: &Services, client: IpAddr) -> CoreResul
 }
 
 pub(super) fn ensure_create_available<T>(services: &Services, body: &Ruma<T>) -> CoreResult {
-	services.oauth.get_server()?;
-
-	let authenticated = body.sender_user.is_some() || body.appservice_info.is_some();
-
-	(!services.config.rendezvous_authenticated_only || authenticated)
-		.then_some(())
+	create_permitted(services, body)?
+		.into_option()
 		.ok_or_else(|| {
 			err!(Request(Forbidden("Rendezvous session creation requires authentication")))
 		})
 }
 
-pub(super) fn ensure_data_size(services: &Services, data: &str) -> CoreResult {
-	let max_bytes = max_data_bytes(services.config.rendezvous_session_max_bytes);
+pub(super) fn create_permitted<T>(services: &Services, body: &Ruma<T>) -> CoreResult<bool> {
+	services.oauth.get_server()?;
 
-	(data.len() <= max_bytes)
-		.then_some(())
-		.ok_or_else(|| err!(Request(TooLarge("Rendezvous payload is too large"))))
+	let authenticated = body.sender_user.is_some() || body.appservice_info.is_some();
+
+	Ok(!services.config.rendezvous.authenticated_only || authenticated)
+}
+
+pub(super) fn ensure_txn_id(txn_id: &TransactionId) -> CoreResult {
+	BoolExt::ok_or_else(is_opaque_id(txn_id.as_str()), || {
+		err!(Request(InvalidParam("Transaction ID is not an opaque identifier")))
+	})
+}
+
+pub(super) fn ensure_data_size(services: &Services, data: &str) -> CoreResult {
+	let max_bytes = max_data_bytes(services.config.rendezvous.session_max_bytes);
+
+	BoolExt::ok_or_else(data.len() <= max_bytes, || {
+		err!(Request(TooLarge("Rendezvous payload is too large")))
+	})
 }
 
 fn max_data_bytes(configured: usize) -> usize { configured.min(MAX_DATA_BYTES) }
@@ -109,11 +123,11 @@ pub(super) fn ensure_safe_get(headers: &HeaderMap) -> CoreResult {
 		.get(SEC_FETCH_SITE)
 		.is_some_and(|value| value.as_bytes().eq(b"none"));
 
-	(!destination && !navigation && !user_activation && !direct_request)
-		.then_some(())
-		.ok_or_else(|| {
-			err!(Request(Forbidden("Rendezvous payload is unavailable to browser navigation")))
-		})
+	let safe = !destination && !navigation && !user_activation && !direct_request;
+
+	BoolExt::ok_or_else(safe, || {
+		err!(Request(Forbidden("Rendezvous payload is unavailable to browser navigation")))
+	})
 }
 
 pub(super) fn data_to_string(data: &Bytes) -> CoreResult<String> {

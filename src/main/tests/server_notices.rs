@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Result,
-	matrix::Event,
 	ruma::{EventId, UserId},
 };
+use tuwunel_matrix::Event;
 use tuwunel_service::Services;
 
 use self::client::{Client, field, register, wait_until_ready};
@@ -34,12 +34,11 @@ fn authorization_and_notice_membership() -> Result {
 
 	let args = Args::default_test(&["fresh", "cleanup"])
 		.with_database_path(&database)
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_loopback_listener(port)
 		.with_option("listening=true")
-		.with_option("create_admin_room=true")
-		.with_option("grant_admin_to_first_user=false")
-		.with_option("registration_shared_secret=\"notices-test\"");
+		.with_option("admin.room.create=true")
+		.with_option("registration.grant_admin_to_first_user=false")
+		.with_option("registration.shared_secret=\"notices-test\"");
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;

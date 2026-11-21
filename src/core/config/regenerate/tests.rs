@@ -7,17 +7,17 @@ use std::io::{Error as IoError, ErrorKind};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::{
-	env::{current_exe, temp_dir, var_os, vars_os},
-	ffi::OsStr,
-	fs::{
-		OpenOptions, Permissions, create_dir_all, metadata, read_to_string, remove_dir_all,
-		set_permissions, write,
-	},
-	io::Write as _,
+	env::{current_exe, temp_dir, var_os},
+	fs::{create_dir_all, read_to_string, remove_dir_all, write},
 	path::{Path, PathBuf},
 	process::{Command, id as process_id},
 	slice::from_ref,
 	sync::atomic::{AtomicU64, Ordering},
+};
+#[cfg(unix)]
+use std::{
+	fs::{OpenOptions, Permissions, metadata, set_permissions},
+	io::Write as _,
 };
 
 use figment::Figment;
@@ -31,11 +31,16 @@ use toml::{Value, from_str, value::Table};
 use super::write::owner_error;
 #[cfg(target_os = "macos")]
 use super::write::path_cstring;
+#[cfg(unix)]
+use super::{Overwrite, write_example_config};
 use super::{
-	Overwrite, RegenerateOptions, adjacent_new_path, example_config, regenerate_config,
-	write::write_atomic_with_precommit, write_example_config,
+	RegenerateOptions, adjacent_new_path, example_config, regenerate_config, schema,
+	write::write_atomic_with_precommit,
 };
-use crate::config::{ENV_PREFIXES, Sources};
+use crate::{
+	config::{ENV_PREFIXES, Sources},
+	utils::sys::command_without_env_prefixes,
+};
 
 #[cfg(target_os = "macos")]
 type XattrValue = SmallVec<[u8; 32]>;
@@ -45,6 +50,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const ENV_CHILD: &str = "CONFIG_REGEN_TEST_CHILD";
 const ENV_INCLUDED_OUTPUT: &str = "CONFIG_REGEN_TEST_INCLUDED_OUTPUT";
 const ENV_OUTPUT: &str = "CONFIG_REGEN_TEST_OUTPUT";
+const RULE_WIDTH: usize = 80;
 
 struct TempDir {
 	path: PathBuf,
@@ -73,22 +79,28 @@ fn regenerated_configuration_round_trips_and_is_idempotent() {
 		"server_name = \"round-trip.example\"\n",
 		"port = 10443\n",
 		"trusted_servers = [\"one.example\", \"two.example\"]\n",
+		"[global.smtp]\n",
+		"connection_uri = \"smtps://user:secret@mail.example.com:465\"\n",
 	);
 
 	write(&input, document).expect("input configuration written");
 
 	let rendered = regenerate(from_ref(&input), &first);
 	let parsed = parse(&rendered);
-	let original = parse(&read_to_string(&input).expect("input configuration read"));
+	let canonical = document
+		.replace("port = 10443", "http.listen.port = 10443")
+		.replace("trusted_servers =", "federation.keys.trusted_servers =");
+
+	let original = parse(&canonical);
 
 	assert_eq!(parsed, original);
 
 	let values = global(&parsed);
 
 	assert_eq!(values["server_name"].as_str(), Some("round-trip.example"));
-	assert_eq!(values["port"].as_integer(), Some(10443));
+	assert_eq!(values["http"]["listen"]["port"].as_integer(), Some(10443));
 	assert_eq!(
-		values["trusted_servers"]
+		values["federation"]["keys"]["trusted_servers"]
 			.as_array()
 			.expect("trusted servers array")
 			.len(),
@@ -111,7 +123,7 @@ fn nan_values_survive_semantic_verification() {
 
 	let rendered = regenerate(from_ref(&input), &output);
 	let parsed = parse(&rendered);
-	let value = global(&parsed)["cache_capacity_modifier"]
+	let value = global(&parsed)["cache"]["capacity_modifier"]
 		.as_float()
 		.expect("cache capacity modifier is a float");
 
@@ -141,7 +153,7 @@ fn serde_aliases_are_rendered_with_canonical_names() {
 	let parsed = parse(&rendered);
 	let values = global(&parsed);
 
-	assert_eq!(values["log_colors"].as_bool(), Some(false));
+	assert_eq!(values["logging"]["colors"].as_bool(), Some(false));
 	assert!(!values.contains_key("log_colours"));
 	assert_eq!(values["jwt"]["key"].as_str(), Some("legacy-jwt-key"));
 	assert!(
@@ -196,12 +208,16 @@ fn residue_is_preserved_but_dangerous_controls_are_dropped() {
 	assert!(rendered.contains("# UNDOCUMENTED: `allow_invalid_tls_certificates`"));
 	assert!(rendered.contains("# DEPRECATED: `name_attribute`"));
 	assert_eq!(values["unknown_future_option"].as_str(), Some("preserved"));
-	assert_eq!(values["resolve_state_locally"].as_bool(), Some(true));
-	assert_eq!(values["resolve_state_locally_shadow"].as_bool(), Some(true));
+	assert_eq!(values["federation"]["resolve_state_locally"].as_bool(), Some(true));
+	assert_eq!(values["federation"]["resolve_state_locally_shadow"].as_bool(), Some(true));
 	assert!(rendered.contains(
 		"# UNDOCUMENTED: `resolve_state_locally_shadow` is valid but omitted from the example"
 	));
-	assert_eq!(values["allow_invalid_tls_certificates"].as_bool(), Some(true));
+	assert_eq!(
+		values["network"]["http"]["allow_invalid_tls_certificates"].as_bool(),
+		Some(true)
+	);
+
 	assert_eq!(values["ldap"]["name_attribute"].as_str(), Some("cn"));
 	assert!(!values.contains_key("database_restore_backup"));
 	assert!(!values.contains_key("force_migration"));
@@ -233,8 +249,17 @@ fn residue_is_preserved_but_dangerous_controls_are_dropped() {
 			.expect("ldap table")
 			.contains_key("name_attribute")
 	);
-	assert_eq!(stripped_values["allow_invalid_tls_certificates"].as_bool(), Some(true));
-	assert_eq!(stripped_values["resolve_state_locally_shadow"].as_bool(), Some(true),);
+
+	assert_eq!(
+		stripped_values["network"]["http"]["allow_invalid_tls_certificates"].as_bool(),
+		Some(true)
+	);
+
+	assert_eq!(
+		stripped_values["federation"]["resolve_state_locally_shadow"].as_bool(),
+		Some(true),
+	);
+
 	assert!(stripped_rendered.contains("unknown_future_option = \"preserved\""));
 	assert!(stripped_rendered.contains("name_attribute = \"cn\""));
 }
@@ -342,6 +367,10 @@ fn dynamic_sections_keep_namespaces_and_repeatable_identity_providers() {
 			.len(),
 		1,
 	);
+
+	assert_eq!(rule_count(&rendered), schema().len());
+	assert!(rendered.contains("\n\n\n#[global.storage_provider.<ID>.local]\n"));
+	assert!(!rendered.contains("\n\n\n\n#[global.storage_provider.<ID>.local]\n"));
 }
 
 #[test]
@@ -373,7 +402,7 @@ fn layered_inputs_require_an_output_and_collapse_in_order() {
 	let values = global(&parsed);
 
 	assert_eq!(values["server_name"].as_str(), Some("layered.example"));
-	assert_eq!(values["port"].as_integer(), Some(7178));
+	assert_eq!(values["http"]["listen"]["port"].as_integer(), Some(7178));
 }
 
 #[test]
@@ -387,7 +416,7 @@ fn source_overrides_are_excluded_from_regeneration() {
 
 	let sources = Sources {
 		paths: vec![input],
-		overrides: Some(Box::new(|raw: Figment| Ok(raw.merge(("port", 9199))))),
+		overrides: Some(Box::new(|raw: Figment| Ok(raw.merge(("http.listen.port", 9199))))),
 	};
 
 	regenerate_config(&sources, options(&output))
@@ -395,7 +424,7 @@ fn source_overrides_are_excluded_from_regeneration() {
 
 	let rendered = read_to_string(output).expect("override output read");
 
-	assert_eq!(global(&parse(&rendered))["port"].as_integer(), Some(6167));
+	assert_eq!(global(&parse(&rendered))["http"]["listen"]["port"].as_integer(), Some(6167));
 }
 
 #[test]
@@ -419,7 +448,7 @@ fn headerless_input_is_normalized_and_named_profiles_are_rejected() {
 	let parsed = parse(&rendered);
 
 	assert_eq!(global(&parsed)["server_name"].as_str(), Some("headerless.example"));
-	assert_eq!(global(&parsed)["port"].as_integer(), Some(8189));
+	assert_eq!(global(&parsed)["http"]["listen"]["port"].as_integer(), Some(8189));
 
 	write(&named, "[staging]\nserver_name = \"named.example\"\n").expect("named profile written");
 	let sources = Sources { paths: vec![named], overrides: None };
@@ -603,7 +632,7 @@ fn config_can_be_selected_solely_through_the_path_environment() {
 		let rendered_values = global(&rendered_values);
 
 		assert_eq!(rendered_values["server_name"].as_str(), Some("environment.example"));
-		assert_eq!(rendered_values["port"].as_integer(), Some(6167));
+		assert_eq!(rendered_values["http"]["listen"]["port"].as_integer(), Some(6167));
 		assert!(rendered.contains("# currently overridden by TUWUNEL_PORT."));
 
 		let included_options = RegenerateOptions {
@@ -619,7 +648,7 @@ fn config_can_be_selected_solely_through_the_path_environment() {
 		let included = parse(&included);
 		let included_values = global(&included);
 
-		assert_eq!(included_values["port"].as_integer(), Some(6555));
+		assert_eq!(included_values["http"]["listen"]["port"].as_integer(), Some(6555));
 		assert!(!included_values.contains_key("config"));
 		assert!(!included_values.contains_key("runtime_worker_threads"));
 		return;
@@ -632,13 +661,7 @@ fn config_can_be_selected_solely_through_the_path_environment() {
 	let executable = current_exe().expect("current test executable found");
 
 	// env_clear() would drop the loader environment the nix check phase supplies.
-	let executed = vars_os()
-		.map(|(key, _)| key)
-		.filter(|key| is_config_env(key))
-		.fold(Command::new(executable), |mut command, key| {
-			command.env_remove(key);
-			command
-		})
+	let executed = command_without_env_prefixes(Command::new(executable), &ENV_PREFIXES)
 		.arg("config::regenerate::tests::config_can_be_selected_solely_through_the_path_environment")
 		.arg(exact)
 		.env("TUWUNEL_CONFIG", &input)
@@ -688,17 +711,6 @@ fn get_xattr(path: &Path, name: &str) -> Option<XattrValue> {
 	value.get(..length).map(XattrValue::from_slice)
 }
 
-// Matches figment's uncased prefix filter, which trims the key first.
-fn is_config_env(key: &OsStr) -> bool {
-	let key = key.to_string_lossy();
-	let key = key.trim();
-
-	ENV_PREFIXES.into_iter().any(|prefix| {
-		key.get(..prefix.len())
-			.is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-	})
-}
-
 impl TempDir {
 	fn new(label: &str) -> Self {
 		let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -740,4 +752,11 @@ fn global(document: &Value) -> &Table {
 		.get("global")
 		.and_then(Value::as_table)
 		.expect("global table present")
+}
+
+fn rule_count(document: &str) -> usize {
+	document
+		.lines()
+		.filter(|line| line.len() == RULE_WIDTH && line.bytes().all(|byte| byte == b'#'))
+		.count()
 }

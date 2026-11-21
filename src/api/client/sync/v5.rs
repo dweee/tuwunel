@@ -4,24 +4,27 @@ mod range;
 mod rooms;
 mod selector;
 
+#[cfg(test)]
+mod tests;
+
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	fmt::Debug,
+	iter::{once, repeat},
+	mem::take,
 	sync::Arc,
-	time::Duration,
 };
 
 use axum::extract::{Extension, State};
-use futures::{FutureExt, TryFutureExt, future::join};
+use futures::{TryFutureExt, future::join};
 use ruma::{
-	DeviceId, OwnedRoomId, UserId,
+	DeviceId, OwnedRoomId, RoomId, UserId,
 	api::client::sync::sync_events::v5::{ListId, Request, Response, response},
-	events::room::member::MembershipState,
+	events::{AnyStrippedStateEvent, StateEventType, room::member::MembershipState},
+	serde::Raw,
 };
-use tokio::{
-	sync::Notify,
-	time::{Instant, timeout_at},
-};
+use serde::Deserialize;
+use tokio::{sync::Notify, time::timeout_at};
 use tuwunel_core::{
 	Err, Result, debug,
 	debug::INFO_SPAN_LEVEL,
@@ -29,20 +32,30 @@ use tuwunel_core::{
 	error::inspect_log,
 	smallvec::SmallVec,
 	trace,
-	utils::{TryFutureExtExt, result::FlatOk},
+	utils::{
+		TryFutureExtExt,
+		result::{FlatOk, NotFound},
+		time::millis,
+	},
+	warn,
 };
 use tuwunel_service::{
 	Services,
 	presence::Ping,
-	sync::{Connection, into_connection_key},
+	rooms::state_cache::StrippedRoomState,
+	sync::{Connection, ConnectionKey, ConnectionVal, into_connection_key},
 };
 
 use self::{
-	extensions::{apply_profiles, apply_ranges, handle as handle_extensions},
+	extensions::{
+		acknowledge_to_device, apply_profiles, apply_ranges, check_to_device,
+		handle as handle_extensions, to_device_pending,
+	},
 	range::collect as collect_ranges,
+	selector::selector,
 };
-use super::share_encrypted_room;
-use crate::{ClientIp, Ruma};
+use super::{joined_since, share_encrypted_room};
+use crate::{ClientIp, Ruma, utils::poll_deadline};
 
 #[derive(Copy, Clone)]
 struct SyncInfo<'a> {
@@ -61,6 +74,7 @@ struct SyncInfo<'a> {
 struct WindowRoom {
 	room_id: OwnedRoomId,
 	membership: Option<MembershipState>,
+	forgotten: bool,
 	lists: ListIds,
 	event_count: u64,
 	payload_count: u64,
@@ -107,26 +121,26 @@ pub(crate) async fn sync_events_v5_route(
 	let sender_user = body.sender_user();
 	let sender_device = body.sender_device.as_deref();
 	let request = &body.body;
+
+	if let Some(fields) = request.extensions.profiles.fields.as_deref() {
+		services.profile.check_requested_fields(fields)?;
+	}
+
+	check_to_device(&request.extensions.to_device)?;
+
 	let since = request
 		.pos
 		.as_ref()
 		.and_then(|string| string.parse().ok())
 		.unwrap_or(0);
 
-	let timeout = request
-		.timeout
-		.as_ref()
-		.map(Duration::as_millis)
-		.map(TryInto::try_into)
-		.flat_ok()
-		.map(|timeout: u64| timeout.min(services.config.client_sync_timeout_max))
-		.unwrap_or(0);
+	let timeout = poll_timeout(request, services.config.client.sync.timeout_max);
 
 	let conn_key = into_connection_key(sender_user, sender_device, request.conn_id.as_deref());
 	let conn_val = services
 		.sync
 		.load_or_init_connection(&conn_key)
-		.await;
+		.await?;
 
 	let conn = conn_val.lock();
 	let ping = Ping {
@@ -144,13 +158,21 @@ pub(crate) async fn sync_events_v5_route(
 
 	let (mut conn, _) = join(conn, ping_presence).await;
 
+	if since != 0 {
+		check_profile_selection(services, request, &conn)?;
+	}
+
 	if since != 0 && conn.next_batch == 0 {
 		return Err!(Request(UnknownPos(warn!("Connection lost; restarting sync stream."))));
 	}
 
 	if since == 0 {
 		*conn = Connection::default();
-		conn.store(&services.sync, &conn_key);
+		services
+			.sync
+			.store_connection(&conn_key, &conn_val, &conn)
+			.await?;
+
 		debug_warn!(?conn_key, "Client cleared cache and reloaded.");
 	}
 
@@ -171,10 +193,16 @@ pub(crate) async fn sync_events_v5_route(
 	conn.next_batch = services.globals.wait_pending().await?;
 	conn.globalsince = since.min(conn.next_batch);
 	let config_changed = conn.update_cache(request);
+
+	acknowledge_to_device(services, sender_user, sender_device, &conn).await?;
+
 	let caught_up = conn.globalsince == conn.next_batch;
 
-	// A whole profile owed to a caught-up connection needs a pass like a new list.
-	let needs_pass = config_changed || conn.own_profile_owed();
+	// Caught-up connections run no pass, so config changes, owed profiles or to-device messages
+	// after `since` need a reserved position.
+	let needs_pass = config_changed
+		|| conn.own_profile_owed()
+		|| caught_up && to_device_pending(services, sender_user, sender_device, &conn).await?;
 
 	if config_change_needs_position(needs_pass, advancing, caught_up, since) {
 		// The permit publishes the reserved position when it retires on drop.
@@ -191,11 +219,9 @@ pub(crate) async fn sync_events_v5_route(
 		extensions: Default::default(),
 	};
 
-	let stop_at = Instant::now()
-		.checked_add(Duration::from_millis(timeout))
-		.expect("configuration must limit maximum timeout");
+	let stop_at = poll_deadline(timeout);
 
-	loop {
+	for woken in once(false).chain(repeat(true)) {
 		debug_assert!(
 			conn.globalsince <= conn.next_batch,
 			"since should not be greater than next_batch."
@@ -221,29 +247,26 @@ pub(crate) async fn sync_events_v5_route(
 			direct_rooms: &direct_rooms,
 		};
 
-		(window, response.lists) = selector::selector(&mut conn, sync_info)
-			.boxed()
-			.await;
+		(window, response.lists) = selector(&mut conn, sync_info).await;
 
 		if conn.globalsince < conn.next_batch {
 			let ranges = collect_ranges(sync_info, &conn, &window);
 			let extensions = handle_extensions(sync_info, &conn, &window);
-			let (mut ranges, extensions) = join(ranges, extensions).boxed().await;
+			let (mut ranges, extensions) = join(ranges, extensions).await;
 
 			let mut extensions = extensions?;
 
 			apply_profiles(sync_info, &conn, &window, &ranges, &mut extensions).await?;
 			apply_ranges(&conn, &window, &mut ranges, &mut extensions);
-			conn.update_rooms_epilogue(ranges.room_updates());
+			conn.update_rooms_epilogue(since, ranges.room_updates());
 			conn.update_profiles_epilogue();
 			response.rooms = ranges.into_payloads();
+			let keys_answer = woken || extensions.keys_changed();
+
 			response.extensions = extensions.into_response(&response.rooms);
 
-			if !is_empty_response(&response) {
-				response.pos = conn.next_batch.to_string().into();
-				trace!(conn.globalsince, conn.next_batch, "response {response:?}");
-				conn.store(&services.sync, &conn_key);
-				return Ok(response);
+			if !is_empty_response(&mut response, keys_answer) {
+				return respond(services, (&conn_key, &conn_val), &conn, response).await;
 			}
 		}
 
@@ -254,11 +277,8 @@ pub(crate) async fn sync_events_v5_route(
 			}
 		};
 
-		if timeout == 0 || services.server.is_stopping() || waiter().boxed().await {
-			response.pos = conn.next_batch.to_string().into();
-			trace!(conn.globalsince, conn.next_batch, "empty response {response:?}");
-			conn.store(&services.sync, &conn_key);
-			return Ok(response);
+		if timeout == 0 || services.server.is_stopping() || waiter().await {
+			return respond(services, (&conn_key, &conn_val), &conn, response).await;
 		}
 
 		debug!(
@@ -271,6 +291,36 @@ pub(crate) async fn sync_events_v5_route(
 
 		conn.globalsince = conn.next_batch;
 	}
+
+	unreachable!("a long poll has no last pass")
+}
+
+/// How long a request may long-poll, in milliseconds.
+///
+/// Per MSC4186 the timeout of a request without `pos` is ignored, so opening
+/// a connection answers after its first pass.
+fn poll_timeout(request: &Request, max: u64) -> u64 {
+	request
+		.timeout
+		.filter(|_| request.pos.is_some())
+		.and_then(millis)
+		.map(|timeout| timeout.min(max))
+		.unwrap_or(0)
+}
+
+fn check_profile_selection(services: &Services, request: &Request, conn: &Connection) -> Result {
+	let fields = request
+		.extensions
+		.profiles
+		.fields
+		.as_deref()
+		.or(conn.extensions.profiles.fields.as_deref());
+
+	if let Some(fields) = fields {
+		services.profile.check_requested_fields(fields)?;
+	}
+
+	Ok(())
 }
 
 fn config_change_needs_position(
@@ -282,20 +332,134 @@ fn config_change_needs_position(
 	config_changed && advancing && caught_up && since != 0
 }
 
-fn is_empty_response(response: &Response) -> bool {
-	response.extensions.is_empty() && response.rooms.is_empty()
+/// Whether a pass has nothing to answer the client with.
+///
+/// The key counts and fallback types are current state; they answer a pass the
+/// user's watchers woke or one where the counts changed since `pos`.
+/// A woken answer lets matrix-rust-sdk back up its room keys.
+/// Both fields remain in the response whether or not they answer the pass.
+fn is_empty_response(response: &mut Response, keys_answer: bool) -> bool {
+	let key_counts = take(
+		&mut response
+			.extensions
+			.e2ee
+			.device_one_time_keys_count,
+	);
+
+	let fallback_key_types = response
+		.extensions
+		.e2ee
+		.device_unused_fallback_key_types
+		.take(); // Extensions::is_empty cannot skip the key fields
+
+	let empty = response.extensions.is_empty()
+		&& response.rooms.is_empty()
+		&& (!keys_answer || (key_counts.is_empty() && fallback_key_types.is_none()));
+
+	response
+		.extensions
+		.e2ee
+		.device_one_time_keys_count = key_counts;
+
+	response
+		.extensions
+		.e2ee
+		.device_unused_fallback_key_types = fallback_key_types;
+
+	empty
 }
 
-#[cfg(test)]
-mod tests {
-	use super::config_change_needs_position;
+/// Positions a response at the connection's next batch and stores the
+/// connection.
+///
+/// The connection is stored as this response leaves it, so the client's next
+/// request resumes from the position the response carries.
+async fn respond(
+	services: &Services,
+	(key, loaded): (&ConnectionKey, &ConnectionVal),
+	conn: &Connection,
+	response: Response,
+) -> Result<Response> {
+	let response = Response {
+		pos: conn.next_batch.to_string().into(),
+		..response
+	};
 
-	#[test]
-	fn caught_up_advancing_config_change_needs_position() {
-		assert!(config_change_needs_position(true, true, true, 1));
-		assert!(!config_change_needs_position(false, true, true, 1));
-		assert!(!config_change_needs_position(true, false, true, 1));
-		assert!(!config_change_needs_position(true, true, false, 1));
-		assert!(!config_change_needs_position(true, true, true, 0));
-	}
+	trace!(conn.globalsince, conn.next_batch, ?response, "Responding");
+
+	services
+		.sync
+		.store_connection(key, loaded, conn)
+		.await?;
+
+	Ok(response)
+}
+
+/// The stripped state MSC4186 sends for an invited or knocked room.
+///
+/// For a knocked room this is the summary stored with the knock, ending with
+/// the user's own knock event, so a client can present a room this server is
+/// not in. An empty knock summary is omitted, since a client reading the
+/// user's membership from it would take the room for an invite.
+#[tracing::instrument(level = "trace", skip_all)]
+async fn stripped_state(
+	services: &Services,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	membership: Option<&MembershipState>,
+) -> StrippedRoomState {
+	let membership = membership?;
+	let state_cache = &services.state_cache;
+	let state = match membership {
+		| MembershipState::Invite =>
+			state_cache
+				.invite_state(sender_user, room_id)
+				.await,
+		| MembershipState::Knock =>
+			state_cache
+				.knock_state(sender_user, room_id)
+				.await,
+		| _ => return None,
+	};
+
+	state
+		.present()
+		.inspect_err(|error| warn!(%room_id, %error, "Unreadable stripped room state"))
+		.flat_ok()
+		.filter(|state| !state.is_empty() || *membership == MembershipState::Invite)
+}
+
+/// The content of the stripped state event with this type and an empty state
+/// key.
+///
+/// The first match wins; an event whose type or state key does not parse is
+/// skipped.
+fn stripped_content<'a, T>(
+	state: &'a [Raw<AnyStrippedStateEvent>],
+	kind: &StateEventType,
+) -> Option<T>
+where
+	T: Deserialize<'a>,
+{
+	state
+		.iter()
+		.filter(|event| {
+			event
+				.get_field("type")
+				.flat_ok()
+				.is_some_and(|event_type: StateEventType| event_type == *kind)
+		})
+		.find(|event| {
+			event
+				.get_field("state_key")
+				.flat_ok()
+				.is_some_and(str::is_empty)
+		})?
+		.get_field("content")
+		.flat_ok()
+}
+
+#[inline]
+fn departed(membership: Option<&MembershipState>) -> bool {
+	matches!(membership, Some(MembershipState::Leave | MembershipState::Ban))
 }

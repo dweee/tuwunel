@@ -35,9 +35,8 @@ fn device_key_read_errors_preserve_stored_bytes() -> Result {
 	let db_path = Args::test_database_path("device-key-read-errors");
 
 	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_option(format!("database_path={db_path:?}"))
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_database_path(&db_path)
+		.with_loopback_listener(port)
 		.with_option("listening=true");
 
 	let runtime = Runtime::new(Some(&args))?;

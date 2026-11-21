@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use reqwest::Response;
+use reqwest::{Method, Response};
 use serde_json::Value;
 use tokio::time::{sleep, timeout};
 use tuwunel_core::{
@@ -53,23 +53,34 @@ pub(crate) async fn create_room(&self, body: &Value) -> Result<OwnedRoomId> {
 /// an accepted request.
 #[implement(Client, params = "<'_>")]
 pub(crate) async fn post(&self, path: &str, body: &Value) -> Result<Value> {
-	let response = self
-		.post_url(&self.url(path), body)
-		.await?
-		.error_for_status()?
-		.json()
-		.await?;
-
-	Ok(response)
+	self.post_json(&self.url(path), body).await
 }
 
-/// The versioned client-API URL for one endpoint path.
+/// The v3 client-API URL for one endpoint path.
 ///
-/// Every versioned client-API request in the harness is addressed through
-/// here, so the base and the version prefix are stated once.
+/// Every v3 request in the harness is addressed through here, so that prefix
+/// is stated once; other versions name theirs through `client_url`.
 #[implement(Client, params = "<'_>")]
-pub(crate) fn url(&self, path: &str) -> String {
-	format!("{}/_matrix/client/v3/{path}", self.base)
+pub(crate) fn url(&self, path: &str) -> String { self.client_url("v3/", path) }
+
+/// A URL under the client-API root, from a prefix and what follows it.
+///
+/// The base and the root are stated here once, for versioned endpoints and
+/// unstable ones alike.
+#[implement(Client, params = "<'_>")]
+pub(crate) fn client_url(&self, prefix: &str, rest: &str) -> String {
+	format!("{}/_matrix/client/{prefix}{rest}", self.base)
+}
+
+/// Post a JSON body to an absolute URL as this user and parse the reply.
+///
+/// Where `post` takes a v3 endpoint path, this takes any URL; a
+/// non-success status is the error.
+#[implement(Client, params = "<'_>")]
+pub(crate) async fn post_json(&self, url: &str, body: &Value) -> Result<Value> {
+	let response = self.post_url(url, body).await?;
+
+	accepted(response).await
 }
 
 /// Post a JSON body to an absolute URL as this user and keep the raw reply.
@@ -78,18 +89,38 @@ pub(crate) fn url(&self, path: &str) -> String {
 /// readily as a success, on any API the server hosts.
 #[implement(Client, params = "<'_>")]
 pub(crate) async fn post_url(&self, url: &str, body: &Value) -> Result<Response> {
+	self.request(Method::POST, url, body).await
+}
+
+/// Send a JSON body to an absolute URL with any method as this user and keep
+/// the raw reply.
+///
+/// The status stays the caller's to judge, and every method carries the same
+/// bearer token and JSON body encoding.
+#[implement(Client, params = "<'_>")]
+pub(crate) async fn request(&self, method: Method, url: &str, body: &Value) -> Result<Response> {
 	let response = self
 		.services
 		.client
 		.clients
 		.default
-		.post(url)
+		.request(method, url)
 		.bearer_auth(self.token)
 		.json(body)
 		.send()
 		.await?;
 
 	Ok(response)
+}
+
+/// Parse the JSON body of a reply the server accepted.
+///
+/// A non-success status is the error, so a caller only ever sees the body of
+/// an accepted request.
+pub(crate) async fn accepted(response: Response) -> Result<Value> {
+	let body = response.error_for_status()?.json().await?;
+
+	Ok(body)
 }
 
 /// Wait for the listener to answer, which the boot does not itself await.

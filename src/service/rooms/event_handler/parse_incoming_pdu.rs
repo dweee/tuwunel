@@ -3,7 +3,10 @@ use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId,
 };
 use serde_json::value::RawValue as RawJsonValue;
-use tuwunel_core::{Result, err, implement, matrix::event::gen_event_id, result::FlatOk};
+use tuwunel_core::{Result, err, implement, result::FlatOk};
+use tuwunel_matrix::event::gen_event_id;
+
+use super::room_version_of;
 
 type Parsed = (OwnedRoomId, OwnedEventId, CanonicalJsonObject);
 
@@ -67,7 +70,8 @@ async fn invited_room_version(&self, room_id: &RoomId) -> Option<RoomVersionId> 
 				.services
 				.state_cache
 				.invite_state(&user_id, room_id)
-				.await && let Some(room_version) = super::room_version_of(&stripped)
+				.await
+			&& let Some(room_version) = room_version_of(&stripped)
 		{
 			return Some(room_version);
 		}

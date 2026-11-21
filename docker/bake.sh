@@ -21,6 +21,18 @@ default_sys_names='["debian"]'
 default_sys_versions='["testing-slim"]'
 default_sys_targets='["x86_64-v1-linux-gnu"]'
 
+# Package defaults are shared with CI; explicit system selections still win.
+for target in ${bake_target:-$*}; do
+    case "$target" in
+        pkg|deb|deb-install|build-deb|build-bins-deb|deps-build-bins-deb|rpm|rpm-install|build-rpm|nix|build-nix)
+            # shellcheck source=docker/package.env
+            source "$BASEDIR/package.env"
+            default_sys_versions="$package_sys_versions"
+            break
+            ;;
+    esac
+done
+
 if test ! -z "$cargo_profile"; then
     env_cargo_profiles="[\"${cargo_profile}\"]"
 fi
@@ -67,9 +79,9 @@ builder_name="${GITHUB_ACTOR:-owo}"
 # nightly to the `rust_toolchains` array as intended. see bake.hcl
 rust_nightly="${rust_nightly:-nightly}"
 
-# Translates 'stable' in `rust_toolchains` to some specific toolchain. Used
-# by default for all callers to ensure the msrv is used instead of latest
-# stable. see bake.hcl
+# Translates 'msrv' in `rust_toolchains` to the toolchain pinned in
+# rust-toolchain.toml, for all callers; 'stable' reaches rustup as the moving
+# stable channel. see bake.hcl
 toolchain_toml="$docker_dir/../rust-toolchain.toml"
 rust_msrv=$(grep "channel = " "$toolchain_toml" | cut -d'=' -f2 | sed 's/\s"\|"$//g')
 
@@ -133,6 +145,10 @@ else
     args="$args --set *.args.nprocs=${nprocs}"
     :
 fi
+
+export valgrind_build_jobs="${valgrind_build_jobs:-$(( (nprocs + 1) / 2 ))}"
+export linker_jobs="${linker_jobs:-${nprocs}}"
+export lto_linker_jobs="${lto_linker_jobs:-$(( (nprocs + 3) / 4 ))}"
 
 if test "$CI_SILENT_BAKE" = "true"; then
 	args="$args --progress=quiet"

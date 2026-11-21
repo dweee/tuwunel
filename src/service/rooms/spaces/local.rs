@@ -1,14 +1,15 @@
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{FutureExt, StreamExt, TryFutureExt, future::join5};
 use ruma::{
 	RoomId, api::federation::space::SpaceHierarchyParentSummary as ParentSummary,
 	events::space::child::HierarchySpaceChildEvent, room::RoomSummary, serde::Raw,
 };
 use tuwunel_core::{
-	Err, Error, Event, Result, debug, error, implement,
+	Err, Error, Result, debug, error, implement,
 	utils::{future::TryExtExt, timepoint_has_passed},
 };
+use tuwunel_matrix::Event;
 
-use super::{Accessibility, Cached, Identifier};
+use super::{Accessibility, Cached, Identifier, cache::Provenance};
 
 /// Gets the summary of a space using solely local information.
 #[implement(super::Service)]
@@ -20,20 +21,53 @@ pub(super) async fn get_summary_and_children_local(
 ) -> Result<Accessibility> {
 	use Accessibility::{Accessible, Inaccessible};
 
+	let local = self
+		.services
+		.state_cache
+		.server_in_room_result(self.services.server.name.as_ref(), current_room)
+		.await?;
+
 	match self.cache_get(current_room).await {
 		| Err(e) if !e.is_not_found() => {
 			error!(?current_room, "cache error: {e}");
 			return Err(e);
 		},
-		| Ok(Cached { expires, summary: Some(cached) }) if !timepoint_has_passed(expires) => {
+		| Ok(Cached {
+			expires,
+			summary: Some(cached),
+			provenance,
+		}) if !timepoint_has_passed(expires)
+			&& cached.summary.room_id == current_room
+			&& matches!(
+				(local, provenance),
+				(true, Provenance::Local) | (false, Provenance::Remote)
+			) =>
+		{
 			debug!(?current_room, ?expires, "cache hit");
-			return self
+			let accessible = self
 				.is_accessible_child(current_room, &cached.summary.join_rule, sender)
-				.await
-				.then(|| Ok(Accessible(cached)))
-				.unwrap_or(Ok(Inaccessible));
+				.await;
+
+			#[cfg(test)]
+			let accessible = super::tests::after_cached_access(accessible).await;
+
+			let still_local = self
+				.services
+				.state_cache
+				.server_in_room_result(self.services.server.name.as_ref(), current_room)
+				.await?;
+
+			if local == still_local {
+				return Ok(accessible
+					.then_some(Accessible(cached))
+					.unwrap_or(Inaccessible));
+			}
+
+			if !still_local {
+				return Err!(Request(NotFound("Space room not found locally.")));
+			}
 		},
-		| Ok(Cached { expires, summary: None }) if !timepoint_has_passed(expires) => {
+		| Ok(Cached { expires, summary: None, .. }) if !timepoint_has_passed(expires) => {
 			// Cache negative: try local computation below.
 			debug!(?current_room, ?expires, "negative cache hit");
 		},
@@ -43,12 +77,13 @@ pub(super) async fn get_summary_and_children_local(
 		},
 	}
 
-	if !self
+	let local = self
 		.services
 		.state_cache
-		.server_in_room(self.services.server.name.as_ref(), current_room)
-		.await
-	{
+		.server_in_room_result(self.services.server.name.as_ref(), current_room)
+		.await?;
+
+	if !local {
 		debug!(?current_room, "no local membership; defer to federation");
 		return Err!(Request(NotFound("Space room not found locally.")));
 	}
@@ -61,12 +96,13 @@ pub(super) async fn get_summary_and_children_local(
 
 	let summary = self
 		.get_room_summary(current_room, children_state, sender)
-		.boxed()
+		.boxed() // size firewall
 		.await;
 
 	match summary {
-		| Ok(Inaccessible) => self.cache_put(current_room, None),
-		| Ok(Accessible(ref summary)) => self.cache_put(current_room, Some(summary)),
+		| Ok(Inaccessible) => self.cache_put(current_room, None, Provenance::Local),
+		| Ok(Accessible(ref summary)) =>
+			self.cache_put(current_room, Some(summary), Provenance::Local),
 		| _ => (),
 	}
 
@@ -94,6 +130,12 @@ pub(super) async fn get_room_summary(
 		return Ok(Accessibility::Inaccessible);
 	}
 
+	let canonical_alias = self
+		.services
+		.state_accessor
+		.get_canonical_alias(room_id)
+		.ok();
+
 	let name = self
 		.services
 		.state_accessor
@@ -106,12 +148,23 @@ pub(super) async fn get_room_summary(
 		.get_room_topic(room_id)
 		.ok();
 
+	let avatar_url = self
+		.services
+		.state_accessor
+		.get_avatar(room_id)
+		.map_ok(|content| content.url)
+		.ok();
+
 	let room_type = self
 		.services
 		.state_accessor
 		.get_room_type(room_id)
 		.ok();
 
+	let (canonical_alias, name, topic, avatar_url, room_type) =
+		join5(canonical_alias, name, topic, avatar_url, room_type).await;
+
+	// Two rounds overlay in the layout; one ten-way join holds every read at once.
 	let world_readable = self
 		.services
 		.state_accessor
@@ -128,19 +181,6 @@ pub(super) async fn get_room_summary(
 		.room_joined_count(room_id)
 		.unwrap_or(0);
 
-	let canonical_alias = self
-		.services
-		.state_accessor
-		.get_canonical_alias(room_id)
-		.ok();
-
-	let avatar_url = self
-		.services
-		.state_accessor
-		.get_avatar(room_id)
-		.map_ok(|content| content.url)
-		.ok();
-
 	let room_version = self.services.state.get_room_version(room_id).ok();
 
 	let encryption = self
@@ -149,29 +189,8 @@ pub(super) async fn get_room_summary(
 		.get_room_encryption(room_id)
 		.ok();
 
-	let (
-		canonical_alias,
-		name,
-		num_joined_members,
-		topic,
-		world_readable,
-		guest_can_join,
-		avatar_url,
-		room_type,
-		room_version,
-		encryption,
-	) = futures::join!(
-		canonical_alias,
-		name,
-		num_joined_members,
-		topic,
-		world_readable,
-		guest_can_join,
-		avatar_url,
-		room_type,
-		room_version,
-		encryption,
-	);
+	let (world_readable, guest_can_join, num_joined_members, room_version, encryption) =
+		join5(world_readable, guest_can_join, num_joined_members, room_version, encryption).await;
 
 	let summary = ParentSummary {
 		children_state,

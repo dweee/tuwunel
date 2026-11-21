@@ -139,7 +139,10 @@ addresses at the node IP.
 
 If your server is behind NAT with a dynamic public address, keep
 `use_external_ip: true` and add `external_ip_only: true` to the `rtc`
-block to suppress the bridge addresses instead.
+block to suppress the bridge addresses instead. Livekit looks up the
+public address only when it starts, so it also needs a restart whenever
+that address changes; see
+[Calls stop working after some hours](#calls-stop-working-after-some-hours).
 
 ## 3. Configure .well-known
 
@@ -207,7 +210,8 @@ The final file should look something like this:
 > in Step 3.1, so the `rtc/transports` endpoint advertises the same
 > focus. Without it that endpoint answers with an empty list and clients
 > report that the server has no MatrixRTC transport, even though your
-> `.well-known` is correct.
+> `.well-known` is correct. If it names a different URL, current clients
+> use that one instead of your `.well-known` (see Troubleshooting).
 
 ## 4. Configure Firewall
 
@@ -435,6 +439,30 @@ Element Call should now be working.
 
 ## Additional Configuration
 
+### Delayed events
+
+Tuwunel supports delayed events with no setup.
+
+Element Call relies on
+[delayed events](https://github.com/matrix-org/matrix-spec-proposals/pull/4140)
+to remove callers who disappear. When someone joins a call, their client
+schedules their leave on the server and keeps postponing it while the call
+runs. If the client crashes or loses its connection, the postponing stops and
+the server sends the leave, so the caller drops out of the call instead of
+lingering in it. lk-jwt-service can postpone and send that leave on a caller's
+behalf.
+
+The limits are in the `[global.rooms.delayed_events]` section of your
+`tuwunel.toml` configuration file.
+
+| Setting | Limit | Default |
+| --- | --- | --- |
+| `max_delay_s` | How far ahead an event may be scheduled, in seconds | `86400` (one day) |
+| `max_scheduled` | How many events one user may have pending | `100` |
+
+Setting either to `0` disables delayed events and stops advertising them to
+clients, so callers who drop out stay listed in the call.
+
 ### External TURN Integration
 
 If you follow this guide and also set up Coturn as per the
@@ -616,6 +644,66 @@ DNS resolver (dnsmasq, AdGuard Home, Pi-hole) on the network and point
 LAN clients at it. External clients continue to resolve the subdomain
 to the public IP via public DNS.
 
+### Calls stop working after some hours
+
+If calls work after Livekit starts but begin failing some hours later,
+and restarting Livekit (or rebooting the server) brings them back until
+the next time, your public IP address is probably changing. Many home
+internet connections receive a new address from time to time, some on a
+fixed schedule.
+
+With `use_external_ip: true`, Livekit discovers the public address once,
+when it starts, and advertises it to clients for as long as it runs.
+After the address changes, clients are still sent the old one and cannot
+reach Livekit. Keeping your DNS records current, for example with a
+dynamic DNS client, does not change what Livekit advertises.
+
+To confirm, compare the address in Livekit's startup log with your
+current public address while calls are failing:
+
+```bash
+docker logs matrix-rtc-livekit 2>&1 | grep "using external IPs"
+curl -4 https://ifconfig.me
+```
+
+If they differ, Livekit needs a restart whenever the address changes.
+The script below checks the public address and restarts the container
+when it has changed. Save it as `/usr/local/bin/livekit-ip-watch.sh`,
+set `CONTAINER` to your Livekit container's name if it differs
+(`docker ps` lists them), and make it executable with
+`sudo chmod +x /usr/local/bin/livekit-ip-watch.sh`.
+
+```sh
+#!/bin/sh
+# Restart Livekit whenever the public IP address changes.
+
+CONTAINER=matrix-rtc-livekit
+STATE=/var/lib/livekit-ip
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+NEW=$(curl -4 -fsS -m 10 https://ifconfig.me) || exit 0
+echo "$NEW" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || exit 0
+OLD=$(cat "$STATE" 2>/dev/null)
+
+if [ "$NEW" != "$OLD" ]; then
+    logger -t livekit-ip-watch "Public IP changed from ${OLD:-unknown} to $NEW, restarting $CONTAINER"
+    docker restart "$CONTAINER" >/dev/null && echo "$NEW" > "$STATE"
+fi
+```
+
+Run it once by hand with `sudo /usr/local/bin/livekit-ip-watch.sh`. The
+first run restarts Livekit, since no address has been saved yet, and
+records the current one in `/var/lib/livekit-ip`. Then run it every five
+minutes by adding this line to root's crontab (`sudo crontab -e`):
+
+```
+*/5 * * * * /usr/local/bin/livekit-ip-watch.sh
+```
+
+Each restart is logged, and `journalctl -t livekit-ip-watch` lists them.
+A call in progress when the address changes still drops; new calls work
+again once the script has restarted Livekit.
+
 ### Clients report that the server has no MatrixRTC transport
 
 Element X and Element Call read the server's transports from
@@ -635,6 +723,41 @@ curl -s https://matrix.yourdomain.com/_matrix/client/unstable/org.matrix.msc4143
 
 An empty `rtc_transports` array means `livekit_url` is unset. Add it per
 step 3.1 and restart Tuwunel.
+
+### Element X fails every call with `OPEN_ID_ERROR`
+
+Element X, and other clients built on a current matrix-rust-sdk, fail
+every call with `OPEN_ID_ERROR`, while clients that still read
+`.well-known` first may keep working. The reverse proxy logs requests
+for `/sfu/get` on the wrong host, typically `"OPTIONS /sfu/get" 405` on
+its default or homeserver site. The same error also covers token
+failures, so this is one cause to check, not the only one.
+
+The usual cause is a `livekit_url` in `tuwunel.toml` that names the
+wrong address (often the homeserver itself) while a separately served
+`.well-known/matrix/client` is correct. Current clients ask the
+`rtc/transports` endpoint first and read `.well-known` only when the
+server does not implement it, so Tuwunel's answer wins. When Tuwunel
+serves `.well-known` itself, both come from the same settings and
+cannot disagree, so this applies to step 3.2 setups. Compare the two:
+
+```bash
+curl -s https://matrix.yourdomain.com/_matrix/client/unstable/org.matrix.msc4143/rtc/transports
+curl -s https://yourdomain.com/.well-known/matrix/client
+```
+
+Each `livekit_service_url` must be the same URL in both, the
+`matrix-rtc` address from step 3, never the homeserver itself. Entries
+under `[[global.well_known.rtc_transports]]` are advertised alongside
+`livekit_url`, so remove stale ones. Correct `livekit_url` and restart
+Tuwunel.
+
+Element X keeps the previous answer in memory for up to a day and can
+go on calling the old address after the fix. Closing the app fully
+clears it (on Android, App info, then Force stop; swiping it away may
+leave it running). If it still uses the old address, wait: the cached
+answer expires within a day, and the first call after that may still
+use it once while the client refreshes.
 
 ### Docker bridge addresses advertised as candidates
 

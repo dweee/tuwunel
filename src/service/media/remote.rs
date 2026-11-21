@@ -57,7 +57,7 @@ pub async fn fetch_remote_thumbnail(
 		.await;
 
 	if let Err(Error::Request(NotFound, ..)) = &result
-		&& self.services.server.config.request_legacy_media
+		&& self.services.server.config.media.request_legacy
 	{
 		return self
 			.fetch_thumbnail_unauthenticated(mxc, server, timeout_ms, dim, animate)
@@ -88,7 +88,7 @@ pub async fn fetch_remote_content(
 		.await;
 
 	if let Err(Error::Request(NotFound, ..)) = &result
-		&& self.services.server.config.request_legacy_media
+		&& self.services.server.config.media.request_legacy
 	{
 		return self
 			.fetch_content_unauthenticated(mxc, server, timeout_ms)
@@ -168,7 +168,7 @@ async fn fetch_thumbnail_unauthenticated(
 
 	let request = Request {
 		allow_remote: true,
-		allow_redirect: true,
+		allow_redirect: false,
 		animated: animate.into(),
 		method: dim.method.clone().into(),
 		width: dim.width.into(),
@@ -202,7 +202,7 @@ async fn fetch_content_unauthenticated(
 
 	let request = Request {
 		allow_remote: true,
-		allow_redirect: true,
+		allow_redirect: false,
 		server_name: mxc.server_name.into(),
 		media_id: mxc.media_id.into(),
 		timeout_ms,
@@ -270,7 +270,13 @@ async fn handle_content_file(&self, mxc: &Mxc<'_>, content: Content) -> Result<F
 
 #[implement(super::Service)]
 async fn handle_location(&self, mxc: &Mxc<'_>, location: &str) -> Result<Fetched> {
-	let limit = self.services.server.config.max_response_size;
+	let limit = self
+		.services
+		.server
+		.config
+		.network
+		.http
+		.max_response_size;
 
 	let media = self
 		.location_request(Fetch::Extern, location, limit)
@@ -387,9 +393,14 @@ where
 	Request::Authentication: FedAuth,
 	Request::PathBuilder: FedPath,
 {
-	self.services
-		.federation
-		.execute(server.unwrap_or(mxc.server_name), request)
+	// query-depth firewall
+	let fetch = Box::pin(
+		self.services
+			.federation
+			.execute(server.unwrap_or(mxc.server_name), request),
+	);
+
+	fetch
 		.await
 		.map_err(|error| handle_federation_error(mxc, server, error))
 }
@@ -462,7 +473,6 @@ pub async fn fetch_remote_thumbnail_legacy(
 pub async fn fetch_remote_content_legacy(
 	&self,
 	mxc: &Mxc<'_>,
-	allow_redirect: bool,
 	timeout_ms: Duration,
 ) -> Result<media::get_content::v3::Response, Error> {
 	self.check_legacy_freeze()?;
@@ -475,7 +485,7 @@ pub async fn fetch_remote_content_legacy(
 			server_name: mxc.server_name.into(),
 			media_id: mxc.media_id.into(),
 			timeout_ms,
-			allow_redirect,
+			allow_redirect: false,
 		})
 		.await?;
 
@@ -503,7 +513,8 @@ fn check_fetch_authorized(&self, mxc: &Mxc<'_>) -> Result {
 		.services
 		.server
 		.config
-		.prevent_media_downloads_from
+		.media
+		.prevent_downloads_from
 		.is_match(mxc.server_name.host())
 		|| self
 			.services
@@ -525,7 +536,8 @@ fn check_legacy_freeze(&self) -> Result {
 	self.services
 		.server
 		.config
-		.freeze_legacy_media
+		.media
+		.freeze_legacy
 		.then_some(())
 		.ok_or(err!(Request(NotFound("Remote media is frozen."))))
 }

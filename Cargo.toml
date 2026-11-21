@@ -2,8 +2,11 @@
 
 [workspace]
 resolver = "2"
-members = ["src/*"]
-default-members = ["src/*"]
+members = ["src/*", "src/api/*"]
+default-members = ["src/*", "src/api/*"]
+exclude = [
+	"src/api/router",
+]
 
 [workspace.package]
 authors = [
@@ -30,7 +33,7 @@ license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/matrix-construct/tuwunel"
 rust-version = "1.95.0"
-version = "1.9.3"
+version = "2.0.0"
 
 [workspace.metadata.crane]
 name = "tuwunel"
@@ -104,11 +107,6 @@ version = "1.11"
 version = "2.3"
 default-features = false
 features = ["serde", "std"]
-
-[workspace.dependencies.cargo_toml]
-version = "1.0"
-default-features = false
-features = ["features"]
 
 [workspace.dependencies.checked_ops]
 version = "0.1"
@@ -247,7 +245,6 @@ version = "11.0"
 default-features = false
 features = [
 	"aws_lc_rs",
-	"use_pem",
 ]
 
 [workspace.dependencies.ldap3]
@@ -285,7 +282,7 @@ version = "0.4"
 default-features = false
 
 [workspace.dependencies.loole]
-version = "0.4"
+version = "0.5"
 
 [workspace.dependencies.lru-cache]
 version = "0.1"
@@ -322,15 +319,14 @@ version = "0.2"
 version = "0.14"
 default-features = false
 features = [
-	"aws",
 	"fs",
 ]
 
 [workspace.dependencies.opentelemetry]
-version = "0.32"
+version = "0.33"
 
 [workspace.dependencies.opentelemetry-otlp]
-version = "0.32"
+version = "0.33"
 default-features = false
 features = [
 	"grpc-tonic",
@@ -338,7 +334,7 @@ features = [
 ]
 
 [workspace.dependencies.opentelemetry_sdk]
-version = "0.32"
+version = "0.33"
 
 [workspace.dependencies.pin-project-lite]
 version = "0.2"
@@ -371,7 +367,7 @@ features = [
 
 [workspace.dependencies.ruma]
 git = "https://github.com/matrix-construct/ruma"
-rev = "fc0d9808182aa013a8f0f1b8f0e9963a89acdcfc"
+rev = "834cbeacbf961926a83968aa16eb56f864985835"
 features = [
     "__compat",
     "appservice-api-c",
@@ -381,7 +377,6 @@ features = [
     "federation-api",
     "identifiers-validation",
     "identity-service-api",
-    "markdown",
     "push-gateway-api-c",
     "rand",
     "ring-compat",
@@ -401,6 +396,7 @@ features = [
     "unstable-msc4075",
     "unstable-msc4121",
     "unstable-msc4125",
+    "unstable-msc4140", # delayed events
     "unstable-msc4143",
     "unstable-msc4155",
     "unstable-msc4186",
@@ -415,12 +411,13 @@ features = [
     "unstable-msc4388",
     "unstable-msc4429", # profile updates for legacy sync
     "unstable-msc4439",
+    "unstable-msc4446",
     "unstable-msc4466",
 ]
 
 [workspace.dependencies.synapse-admin-api]
 git = "https://github.com/matrix-construct/synapse-admin-api"
-rev = "9e509d6c68274c7852034d0df913c1874329a691"
+rev = "df608b8ae41a6987a5f27402e35c079e28580d9d"
 features = ["server"]
 
 [workspace.dependencies.rustls]
@@ -458,6 +455,11 @@ version = "0.6"
 [workspace.dependencies.sd-notify]
 version = "0.5"
 default-features = false
+
+[workspace.dependencies.semver]
+version = "1.0"
+default-features = false
+features = ["serde"]
 
 [workspace.dependencies.sentry]
 version = "0.49"
@@ -540,10 +542,6 @@ features = [
 	"write",
 ]
 
-[workspace.dependencies.subtle]
-version = "2.6"
-default-features = false
-
 [workspace.dependencies.syn]
 version = "2.0"
 default-features = false
@@ -564,7 +562,7 @@ version = "2.0"
 default-features = false
 
 [workspace.dependencies.tokio]
-version = "1.53"
+version = "1.54"
 default-features = false
 features = [
 	"fs",
@@ -622,7 +620,7 @@ default-features = false
 version = "0.2"
 
 [workspace.dependencies.tracing-opentelemetry]
-version = "0.33"
+version = "0.34"
 
 [workspace.dependencies.tracing-subscriber]
 version = "0.3"
@@ -643,6 +641,11 @@ features = ["serde"]
 [workspace.dependencies.webpage]
 version = "2.0"
 default-features = false
+
+[workspace.dependencies.windows-sys]
+version = "0.61"
+default-features = false
+features = ["Win32_Storage_FileSystem"]
 
 #
 # Patches
@@ -704,6 +707,31 @@ package = "tuwunel_api"
 path = "src/api"
 default-features = false
 
+[workspace.dependencies.tuwunel-api-admin]
+package = "tuwunel_api_admin"
+path = "src/api/admin"
+default-features = false
+
+[workspace.dependencies.tuwunel-api-client]
+package = "tuwunel_api_client"
+path = "src/api/client"
+default-features = false
+
+[workspace.dependencies.tuwunel-api-federation]
+package = "tuwunel_api_federation"
+path = "src/api/federation"
+default-features = false
+
+[workspace.dependencies.tuwunel-api-mas]
+package = "tuwunel_api_mas"
+path = "src/api/mas"
+default-features = false
+
+[workspace.dependencies.tuwunel-api-oidc]
+package = "tuwunel_api_oidc"
+path = "src/api/oidc"
+default-features = false
+
 [workspace.dependencies.tuwunel-service]
 package = "tuwunel_service"
 path = "src/service"
@@ -712,6 +740,11 @@ default-features = false
 [workspace.dependencies.tuwunel-database]
 package = "tuwunel_database"
 path = "src/database"
+default-features = false
+
+[workspace.dependencies.tuwunel-matrix]
+package = "tuwunel_matrix"
+path = "src/matrix"
 default-features = false
 
 [workspace.dependencies.tuwunel-core]
@@ -837,11 +870,16 @@ incremental = false
 #	'-Clink-arg=-Wl,-z,nodelete',
 #]
 
+[profile.dev.package.tuwunel_matrix]
+incremental = false
+
 [profile.dev.package.'*']
 debug = 0
 strip = "symbols"
 opt-level = 'z'
 incremental = false
+# no debuginfo to split; matches profile.test so builds and tests share artifacts
+split-debuginfo = "unpacked"
 #rustflags = [
 #	'--cfg', 'tuwunel_mods',
 #	'-Ztls-model=global-dynamic',
@@ -865,6 +903,8 @@ incremental = false
 debug = "limited"
 codegen-units = 1
 opt-level = 'z'
+# keep dependency debuginfo in the binary rather than inheriting dev's split
+split-debuginfo = "off"
 
 # primarily used for CI
 [profile.test]
@@ -880,6 +920,9 @@ opt-level = 'z'
 #
 # Linting
 #
+
+[workspace.lints.cargo]
+unused_dependencies = "allow"
 
 [workspace.lints.rust]
 absolute_paths_not_starting_with_crate = "warn"
@@ -908,6 +951,7 @@ semicolon_in_expressions_from_macros = "warn"
 single_use_lifetimes = "warn"
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
+unexpected_cfgs.level = "warn"
 unit_bindings = "warn"
 unnameable_types = "warn"
 unreachable_pub = "warn"
@@ -921,13 +965,7 @@ unused_must_use = "warn"
 unused_qualifications = "warn"
 #unused_results = "warn"                                             # TODO
 
-## some sadness
-mismatched_lifetime_syntaxes = "allow"
-# counts every pub item of test and bench executables as dead code
-dead_code_pub_in_binary = "allow"
-let_underscore_drop = "allow"
-missing_docs = "allow"
-unexpected_cfgs = { level = "warn", check-cfg = [
+unexpected_cfgs.check-cfg = [
 	'cfg(core_intrinsics)',
 	'cfg(disable)',
 	'cfg(panic_trap)',
@@ -937,17 +975,22 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 	'cfg(tuwunel_debug_logging)',
 	'cfg(tuwunel_mods)',
 	'cfg(unabridged)',
-] }
+]
+
+## some sadness
+mismatched_lifetime_syntaxes = "allow"
+# counts every pub item of test and bench executables as dead code
+dead_code_pub_in_binary = "allow"
+let_underscore_drop = "allow"
+missing_docs = "allow"
 # buggy, but worth checking on occasionally
 unused_crate_dependencies = "allow"
 unsafe_code = "allow"
 # skips niche-encoded enums (nearly all of ours) and compares a ratio rather
 # than a magnitude; clippy::large_enum_variant covers this by size instead.
 variant_size_differences = "allow"
-
 # we check nightly clippy lints
 unknown_lints = "allow"
-
 # BoolExt::ok_or/ok_or_else collide with unstable bool inherents on the pinned
 # stable toolchain; silent on nightly, where std no longer has them.
 # <https://github.com/rust-lang/rust/issues/48919>

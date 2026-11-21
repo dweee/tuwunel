@@ -26,7 +26,13 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tuwunel_core::{
 	Err, Error, Result, err, implement,
-	utils::{hash::sha256, result::LogErr, stream::ReadyExt},
+	smallstr::SmallString,
+	utils::{
+		hash::sha256,
+		result::{LogErr, NotFound},
+		stream::{ReadyExt, TryReadyExt},
+		string::truncate_deterministic,
+	},
 	warn,
 };
 use url::Url;
@@ -35,11 +41,14 @@ use self::{providers::Providers, sessions::Sessions};
 pub use self::{
 	providers::{Provider, ProviderId},
 	server::Server,
-	sessions::{CODE_VERIFIER_LENGTH, SESSION_ID_LENGTH, Session, SessionId},
+	sessions::{CODE_VERIFIER_LENGTH, Deleted, Deletions, SESSION_ID_LENGTH, Session, SessionId},
 	token_response::TokenResponse,
 	user_info::UserInfo,
 };
 use crate::{SelfServices, client::read_response_capped};
+
+/// Fallback localpart derived from an identity's unique-id string.
+pub type Localpart = SmallString<[u8; 23]>;
 
 /// Per-client-IP token-bucket table: last-refill instant and remaining tokens.
 type Ratelimiter = Mutex<HashMap<IpAddr, (Instant, f64)>>;
@@ -94,13 +103,15 @@ const DEVICE_RC_PER_SECOND: f64 = 1.0;
 /// Generous allowance for the one code a real user enters.
 const DEVICE_RC_BURST: f64 = 60.0;
 
-/// Shared per-client-IP token-bucket throttle for the OIDC endpoints. A no-op
-/// unless both `oidc_rc_per_second` and `oidc_rc_burst_count` are configured.
+/// Shared per-client-IP token-bucket throttle for the OIDC endpoints.
+///
+/// A no-op unless both `authentication.oidc.rc_per_second` and
+/// `authentication.oidc.rc_burst_count` are configured.
 #[implement(Service)]
 pub fn check_rate_limit(&self, client: IpAddr) -> Result {
 	let config = &self.services.config;
-	let rate = f64::from(config.oidc_rc_per_second);
-	let burst = f64::from(config.oidc_rc_burst_count);
+	let rate = f64::from(config.authentication.oidc.rc_per_second);
+	let burst = f64::from(config.authentication.oidc.rc_burst_count);
 
 	if rate <= 0.0 || burst <= 0.0 {
 		return Ok(());
@@ -182,19 +193,24 @@ fn check_bucket_at(
 	Ok(())
 }
 
-/// Remove all session state for a user. For debug and developer use only;
-/// deleting state can cause registration conflicts and unintended
-/// re-registrations.
+/// Remove every session listed under a user.
+///
+/// Each listed session is deleted whether or not its provider still resolves,
+/// and one that cannot be read is kept; the result counts each outcome, and an
+/// unreadable list is an error. For debug and developer use only; deleting
+/// state can cause registration conflicts and unintended re-registrations.
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn delete_user_sessions(&self, user_id: &UserId) {
-	self.user_sessions(user_id)
-		.ready_filter_map(Result::ok)
-		.ready_filter_map(|(_, session)| session.sess_id)
-		.for_each(async |sess_id| {
-			self.sessions.delete(&sess_id).await;
+pub async fn delete_user_sessions(&self, user_id: &UserId) -> Result<Deletions> {
+	self.sessions
+		.get_sess_id_by_user(user_id)
+		// A user with no sessions has no index row to list them.
+		.ready_filter(|listed| !listed.is_missing())
+		.and_then(async |sess_id| Ok((self.sessions.delete(&sess_id).await, sess_id)))
+		.ready_try_fold_default(|deletions: Deletions, (deleted, sess_id)| {
+			Ok(deletions.tally(deleted, &sess_id))
 		})
-		.await;
+		.await
 }
 
 /// Revoke all session tokens for a user.
@@ -344,12 +360,7 @@ pub async fn request_token(
 /// uses the oauth-specific http client and is configured for JSON with special
 /// casing for an `error` property in the response.
 #[implement(Service)]
-#[tracing::instrument(
-	name = "request",
-	level = "debug",
-	ret(level = "trace"),
-	skip(self, body)
-)]
+#[tracing::instrument(name = "request", level = "debug", skip(self, body))]
 pub async fn request<Body>(
 	&self,
 	(provider, session): (Option<&Provider>, Option<&Session>),
@@ -379,7 +390,13 @@ where
 		request = request.bearer_auth(access_token);
 	}
 
-	let limit = self.services.config.max_response_size;
+	let limit = self
+		.services
+		.config
+		.network
+		.http
+		.max_response_size;
+
 	let http_response = request.send().await?.error_for_status()?;
 
 	let body = read_response_capped(http_response, limit).await?;
@@ -427,6 +444,19 @@ pub fn unique_id_iss_sub((iss, sub): (&str, &str)) -> Result<String> {
 	let b64 = b64encode.encode(hash);
 
 	Ok(b64)
+}
+
+/// Derive the fallback localpart of an identity from its unique-id string.
+///
+/// The localpart is a lowercase prefix of 15 to 23 characters selected from the
+/// string's contents. An identity whose claimed usernames are unavailable
+/// therefore falls back to the same localpart on every sign-in.
+#[must_use]
+pub fn fallback_localpart(unique_id: &str) -> Localpart {
+	truncate_deterministic(unique_id, Some(15..23))
+		.chars()
+		.flat_map(char::to_lowercase)
+		.collect()
 }
 
 fn unique_id_parts<'a>(

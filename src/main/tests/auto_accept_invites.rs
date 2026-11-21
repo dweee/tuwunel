@@ -44,15 +44,14 @@ fn direct_invites_are_accepted_and_others_are_not() -> Result {
 
 	let db_path = Args::test_database_path("auto-accept");
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	let mut args = Args::default_test(&["fresh", "cleanup"])
+		.with_database_path(&db_path)
+		.with_loopback_listener(port);
 
 	args.option.extend([
-		format!("database_path={db_path:?}"),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
 		"listening=true".to_owned(),
-		"auto_accept_invites=true".to_owned(),
-		"auto_accept_invites_direct_only=true".to_owned(),
+		"rooms.invites.auto_accept=true".to_owned(),
+		"rooms.invites.auto_accept_direct_only=true".to_owned(),
 	]);
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -106,18 +105,15 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.await
 		.ok_or_else(|| err!("the direct invitation was never accepted"))?;
 
+	marked_direct(services, &invitee_id, &direct)
+		.await
+		.into_option()
+		.ok_or_else(|| err!("the server does not read the accepted room back as direct"))?;
+
 	invitee
 		.marks_direct(&invitee_id, &inviter_id, &direct)
 		.await?
 		.ok_or_else(|| err!("the accepted room is missing from the invitee's m.direct"))?;
-
-	services
-		.account_data
-		.direct_rooms(&invitee_id)
-		.await
-		.contains(&direct)
-		.into_option()
-		.ok_or_else(|| err!("the server does not read the accepted room back as direct"))?;
 
 	joined(services, &invitee_id, &plain)
 		.await
@@ -183,6 +179,21 @@ async fn joined(services: &Services, user_id: &UserId, room_id: &RoomId) -> bool
 			.state_cache
 			.is_joined(user_id, room_id)
 			.await
+	})
+	.await
+}
+
+/// Whether the server reads the room back as direct before the deadline.
+///
+/// The `m.direct` write trails the join, so it is polled like the membership.
+#[tracing::instrument(level = "debug", skip_all)]
+async fn marked_direct(services: &Services, user_id: &UserId, room_id: &RoomId) -> bool {
+	poll_until(ACCEPT_DEADLINE, async || {
+		services
+			.account_data
+			.direct_rooms(user_id)
+			.await
+			.contains(room_id)
 	})
 	.await
 }

@@ -11,11 +11,21 @@
 /// Disabled local configurations return no provider.
 pub mod local;
 
+/// Google Cloud Storage storage-provider construction.
+///
+/// The constructor applies bucket and prefix options before wrapping the
+/// object-store client as a provider. Credentials come from the environment,
+/// ending at the instance metadata server, so GKE Workload Identity needs no
+/// credential settings. Configurations without a bucket return no provider.
+#[cfg(feature = "gcs_storage")]
+pub mod gcs;
+
 /// S3-compatible storage-provider construction.
 ///
 /// The constructor applies endpoint, credential, transport, and signing
 /// options before wrapping the object-store client as a provider.
 /// Configurations with neither a URL nor a bucket return no provider.
+#[cfg(feature = "s3_storage")]
 pub mod s3;
 
 #[cfg(test)]
@@ -31,11 +41,13 @@ use std::{
 use bytes::Bytes;
 use derive_more::Debug;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+#[cfg(any(feature = "gcs_storage", feature = "s3_storage"))]
 use http::Method;
+#[cfg(any(feature = "gcs_storage", feature = "s3_storage"))]
+use object_store::{GetOptions, signer::Signer};
 use object_store::{
-	Attributes, CopyMode, DynObjectStore, GetOptions, GetResult, MultipartUpload, ObjectMeta,
-	ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-	path::Path, signer::Signer,
+	Attributes, CopyMode, DynObjectStore, GetResult, MultipartUpload, ObjectMeta, ObjectStore,
+	ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use tuwunel_core::{
 	Error, Result,
@@ -67,6 +79,7 @@ pub struct Provider {
 	/// Erased object-store implementation receiving provider operations.
 	pub(crate) provider: Box<DynObjectStore>,
 
+	#[cfg(any(feature = "gcs_storage", feature = "s3_storage"))]
 	#[debug(skip)]
 	/// Optional backend signer used to create time-limited object URLs.
 	pub(crate) signer: Option<Arc<dyn Signer>>,
@@ -430,6 +443,7 @@ pub async fn load(&self, path: &str) -> Result<GetResult> {
 ///
 /// The provider prefix is applied before signing. Backends without a signer,
 /// such as local filesystem providers, return `None` without performing I/O.
+#[cfg(any(feature = "gcs_storage", feature = "s3_storage"))]
 #[implement(Provider)]
 #[tracing::instrument(
 	level = "debug",
@@ -455,8 +469,20 @@ pub async fn signed_get_url(&self, path: &str, ttl: Duration) -> Result<Option<U
 		.await
 }
 
+/// Creates no URL, since a build without S3 or GCS support has no signer.
+///
+/// Such a build has only local filesystem providers, so callers serve every
+/// object directly, as they do for local providers in any build.
+#[cfg(not(any(feature = "gcs_storage", feature = "s3_storage")))]
+#[implement(Provider)]
+#[expect(clippy::unused_async)]
+pub async fn signed_get_url(&self, _path: &str, _ttl: Duration) -> Result<Option<Url>> {
+	Ok(None)
+}
+
 /// Signs only an existing object whose headers match the Matrix response.
 /// HEAD avoids downloading the body and makes mixed local/S3 migrations safe.
+#[cfg(any(feature = "gcs_storage", feature = "s3_storage"))]
 #[implement(Provider)]
 pub async fn signed_media_url(
 	&self,
@@ -481,6 +507,19 @@ pub async fn signed_media_url(
 	}
 
 	self.signed_get_url(path, ttl).await
+}
+
+/// Creates no media redirect URL when neither S3 nor GCS support is compiled in.
+#[cfg(not(any(feature = "gcs_storage", feature = "s3_storage")))]
+#[implement(Provider)]
+#[expect(clippy::unused_async)]
+pub async fn signed_media_url(
+	&self,
+	_path: &str,
+	_ttl: Duration,
+	_attributes: &Attributes,
+) -> Result<Option<Url>> {
+	Ok(None)
 }
 
 /// Deletes one object from this provider.
@@ -531,7 +570,7 @@ where
 					source: path::Error::InvalidPath { path: path.into() },
 				})
 		})
-		.boxed();
+		.boxed(); // type-erasure boundary
 
 	self.provider
 		.delete_stream(paths)
@@ -668,7 +707,6 @@ pub async fn ping(&self) -> Result {
 		.inspect_err(|e| {
 			error!(chain = %error_chain(e), "Failed to connect to storage provider");
 		})
-		.boxed()
 		.await
 		.map(|_| ())
 }
@@ -715,6 +753,10 @@ fn strip_base_path(&self, location: Path) -> Path {
 fn multipart_threshold(&self) -> usize {
 	extract_variant!(&self.config, StorageProvider::s3)
 		.map(|config| config.multipart_threshold.as_u64())
+		.or_else(|| {
+			extract_variant!(&self.config, StorageProvider::gcs)
+				.map(|config| config.multipart_threshold.as_u64())
+		})
 		.map(TryInto::try_into)
 		.flat_ok()
 		.unwrap_or(usize::MAX)
@@ -724,6 +766,10 @@ fn multipart_threshold(&self) -> usize {
 fn multipart_part_size(&self) -> usize {
 	extract_variant!(&self.config, StorageProvider::s3)
 		.map(|config| config.multipart_part_size.as_u64())
+		.or_else(|| {
+			extract_variant!(&self.config, StorageProvider::gcs)
+				.map(|config| config.multipart_part_size.as_u64())
+		})
 		.map(TryInto::try_into)
 		.flat_ok()
 		.unwrap_or(usize::MAX)

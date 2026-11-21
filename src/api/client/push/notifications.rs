@@ -3,12 +3,12 @@ use futures::StreamExt;
 use ruma::{MilliSecondsSinceUnixEpoch, api::client::push::get_notifications, push::Action};
 use tuwunel_core::{
 	Result, at, err,
-	matrix::{Event, PduId},
 	utils::{
 		stream::{ReadyExt, WidebandExt},
 		string::to_small_string,
 	},
 };
+use tuwunel_matrix::{Event, PduId};
 
 use crate::Ruma;
 
@@ -64,13 +64,13 @@ pub(crate) async fn get_notifications_route(
 				.get_pdu_from_id(&pdu_id.into())
 				.await
 				.ok()
-				.filter(|event| !event.is_redacted())?;
+				.filter(|event| !event.is_redacted())?
+				.without_private_unless_sender(Some(sender_user));
 
 			let read = services
 				.pusher
-				.last_notification_read(sender_user, event.room_id())
-				.await
-				.is_ok_and(|last_read| last_read.ge(&count));
+				.notification_read(sender_user, &event, count)
+				.await;
 
 			let ts = notify
 				.ts

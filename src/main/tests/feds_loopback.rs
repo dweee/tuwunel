@@ -40,20 +40,14 @@ mod tests {
 		let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 		let certificate = source.join(CERTIFICATE);
 		let private_key = source.join(PRIVATE_KEY);
-		let mut args = Args::default_test(&["fresh", "cleanup"]);
-
-		args.maintenance = true;
-		args.option.extend([
-			format!("database_path={:?}", database.0),
-			format!("server_name=\"127.0.0.1:{port}\""),
-			"address=[\"127.0.0.1\"]".to_owned(),
-			format!("port={port}"),
-			"listening=true".to_owned(),
-			"ip_range_denylist=[]".to_owned(),
-			"allow_invalid_tls_certificates=true".to_owned(),
-			format!("tls.certs={certificate:?}"),
-			format!("tls.key={private_key:?}"),
-		]);
+		let args = Args::maintenance_test(&database.0)
+			.with_option(format!("server_name=\"127.0.0.1:{port}\""))
+			.with_loopback_listener(port)
+			.with_option("listening=true")
+			.with_option("network.http.ip_range_denylist=[]")
+			.with_option("network.http.allow_invalid_tls_certificates=true")
+			.with_path_option("tls.certs", &certificate)
+			.with_path_option("tls.key", &private_key);
 
 		let runtime = Runtime::new(Some(&args))?;
 		let server = Server::new(Some(&args), Some(&runtime))?;
@@ -87,9 +81,10 @@ mod tests {
 	async fn exercise(services: &Services, base: &str) -> Result {
 		wait_until_ready(services, base).await?;
 		assert!(
-			!services.config.federation_loopback,
+			!services.config.federation.loopback,
 			"the feds test must leave global loopback disabled",
 		);
+
 		init(&services.admin);
 
 		let outcome = async {
@@ -167,7 +162,7 @@ mod tests {
 	) -> Result<CommandOutput> {
 		match services
 			.admin
-			.command_in_place(command, None)
+			.command_in_place(command.into())
 			.await
 		{
 			| Ok(Some(output)) => Ok(output),

@@ -1,5 +1,8 @@
+pub(crate) mod admin;
 mod appservice;
 mod dispatch;
+#[cfg(feature = "jwt_login")]
+pub(crate) mod jwt;
 mod server;
 mod uiaa;
 
@@ -26,23 +29,22 @@ use ruma::{
 		},
 		profile::{delete_profile_field, get_profile, get_profile_field, set_profile_field},
 		room::{create_room, upgrade_room},
-		session::{logout, logout_all},
+		session::{
+			logout::v3::Request as LogoutRequest, logout_all::v3::Request as LogoutAllRequest,
+		},
 	},
 };
-use tuwunel_core::{Err, Result, is_less_than, smallstr::SmallString};
+use tuwunel_core::{Err, Result, utils::deadline_has_passed};
 use tuwunel_service::{Services, appservice::RegistrationInfo};
 
-pub(super) use self::dispatch::AuthDispatch;
-use self::dispatch::Scheme;
-pub(crate) use self::uiaa::auth_uiaa;
+pub(super) use self::dispatch::{AuthDispatch, Scheme};
+pub use self::uiaa::auth_uiaa;
 use super::request::Request;
-
-type AccessToken = SmallString<[u8; 32]>;
 
 pub(super) enum Token {
 	Appservice(Box<RegistrationInfo>),
 	User((OwnedUserId, OwnedDeviceId, Option<SystemTime>)),
-	Expired(AccessToken),
+	Expired,
 	Invalid,
 	None,
 }
@@ -71,10 +73,11 @@ pub(super) async fn auth<A: AuthDispatch>(
 		| None => request.query.access_token.as_deref(),
 	};
 
+	// An expired token can still sign out, so a client can end a session it cannot resume.
 	let token = match find_token(services, access_token).await? {
 		| Token::User((_, _, expires_at))
-			if expires_at.is_some_and(is_less_than!(SystemTime::now())) =>
-			Token::Expired(access_token.unwrap_or_default().into()),
+			if deadline_has_passed(expires_at) && !is_logout(route) =>
+			Token::Expired,
 
 		| token => token,
 	};
@@ -94,6 +97,10 @@ pub(super) async fn auth<A: AuthDispatch>(
 	Ok(auth)
 }
 
+fn is_logout(route: TypeId) -> bool {
+	route == TypeId::of::<LogoutRequest>() || route == TypeId::of::<LogoutAllRequest>()
+}
+
 /// MSC3939: 401 `M_USER_LOCKED` for locked accounts; logout endpoints
 /// bypass. `soft_logout: true` is emitted by ruma for this errcode.
 #[inline(never)]
@@ -102,10 +109,7 @@ async fn locked_account_check(services: &Services, auth: &Auth, route: TypeId) -
 		return Ok(());
 	};
 
-	let is_logout = route == TypeId::of::<logout::v3::Request>()
-		|| route == TypeId::of::<logout_all::v3::Request>();
-
-	if is_logout {
+	if is_logout(route) {
 		return Ok(());
 	}
 
@@ -148,20 +152,18 @@ fn check_auth_still_required(services: &Services, token: &Token, route: TypeId) 
 
 	let is_public_rooms = route == TypeId::of::<get_public_rooms::v3::Request>();
 
-	if (is_profile
-		&& services
-			.server
-			.config
-			.require_auth_for_profile_requests)
+	if (is_profile && services.server.config.profile.require_auth)
 		|| (is_public_rooms
 			&& !services
 				.server
 				.config
-				.allow_public_room_directory_without_auth)
+				.directory
+				.rooms
+				.allow_without_auth)
 	{
 		match token {
 			| Token::Appservice(_) | Token::User(_) => Ok(()),
-			| Token::None | Token::Expired(_) | Token::Invalid =>
+			| Token::None | Token::Expired | Token::Invalid =>
 				Err!(Request(MissingToken("Missing or invalid access token."))),
 		}
 	} else {

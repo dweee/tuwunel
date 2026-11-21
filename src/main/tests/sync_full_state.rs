@@ -15,6 +15,12 @@ use self::client::{Client, field, register, wait_until_ready};
 
 mod client;
 
+#[path = "client/put.rs"]
+mod put;
+
+#[path = "client/state.rs"]
+mod state;
+
 const ACCESS_TOKEN: &str = "sync-full-state-test-access-token";
 const EMPTY_TIMELINE: &str = r#"{"room":{"timeline":{"limit":0}}}"#;
 
@@ -24,8 +30,7 @@ fn full_state_includes_quiet_joined_rooms() -> Result {
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
 	let port = listener.local_addr()?.port();
 	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_loopback_listener(port)
 		.with_option("listening=true");
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -79,16 +84,9 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		(&plain, "m.room.topic", json!({"topic": "quiet plain room"})),
 		(&encrypted, "m.room.encryption", json!({"algorithm": "m.megolm.v1.aes-sha2"})),
 	] {
-		services
-			.client
-			.clients
-			.default
-			.put(client.url(&format!("rooms/{room}/state/{event_type}")))
-			.bearer_auth(ACCESS_TOKEN)
-			.json(&content)
-			.send()
-			.await?
-			.error_for_status()?;
+		client
+			.put_state(room, event_type, "", &content)
+			.await?;
 	}
 
 	let initial = sync(&client, &[]).await?;

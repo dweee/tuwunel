@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, convert::identity, fmt::Debug};
 
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{StreamExt, TryFutureExt};
 use ruma::{
 	OwnedServerName, OwnedServerSigningKeyId, ServerName, ServerSigningKeyId,
 	api::federation::discovery::{
@@ -61,12 +61,16 @@ where
 		.services
 		.server
 		.config
+		.federation
+		.keys
 		.trusted_server_batch_size;
 
 	let batch_concurrency = self
 		.services
 		.server
 		.config
+		.federation
+		.keys
 		.trusted_server_batch_concurrency;
 
 	let batches: Vec<_> = server_keys
@@ -141,7 +145,6 @@ where
 				"Requesting keys from notary server failed: {e}",
 			);
 		})
-		.boxed()
 		.await
 }
 

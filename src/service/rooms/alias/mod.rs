@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 use ruma::{
-	OwnedRoomId, OwnedServerName, OwnedUserId, RoomAliasId, RoomId, RoomOrAliasId, UserId,
-	api::federation::query::get_room_information::v1::Request, events::StateEventType,
+	OwnedRoomId, OwnedServerName, OwnedUserId, RoomAliasId, RoomId, RoomOrAliasId, ServerName,
+	UserId, api::federation::query::get_room_information::v1::Request, events::StateEventType,
 };
 use tuwunel_core::{
-	Err, Result, err,
-	matrix::Event,
+	Err, Error, Result, err, implement,
 	utils::{ReadyExt, stream::TryIgnore},
 };
-use tuwunel_database::{Deserialized, Ignore, Interfix, Map};
+use tuwunel_database::{Deserialized, Ignore, Interfix, Map, Txn, serialize_key};
+use tuwunel_matrix::Event;
 
 use crate::appservice::RegistrationInfo;
 
@@ -43,6 +43,27 @@ impl crate::Service for Service {
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
+/// Refuses a user's alias creation when `allow_room_alias_creation` is off.
+///
+/// Appservices and server admins are exempt. Callers run it before creating
+/// anything, so a refusal leaves no room or alias behind.
+#[implement(Service)]
+#[tracing::instrument(skip(self, appservice_info), level = "trace")]
+pub async fn creation_check(
+	&self,
+	user_id: &UserId,
+	appservice_info: Option<&RegistrationInfo>,
+) -> Result {
+	if self.services.config.rooms.allow_alias_creation
+		|| appservice_info.is_some()
+		|| self.services.admin.user_is_admin(user_id).await
+	{
+		return Ok(());
+	}
+
+	Err!(Request(Forbidden("Room alias creation has been disabled.")))
+}
+
 impl Service {
 	pub fn set_alias(&self, alias: &RoomAliasId, room_id: &RoomId) -> Result {
 		self.check_alias_local(alias)?;
@@ -67,16 +88,15 @@ impl Service {
 
 		let count = self.services.globals.next_count();
 
-		let localpart = alias.alias();
+		let localpart = alias.alias().as_bytes();
+		let key = serialize_key((room_id, *count))?;
 
-		// Comes first as we don't want a stuck alias
-		self.db.alias_userid.insert(localpart, user_id);
-
-		self.db.alias_roomid.insert(localpart, room_id);
-
-		self.db
-			.aliasid_alias
-			.put_raw((room_id, *count), alias);
+		Txn::insert_each_slice(&[
+			(&self.db.alias_userid, localpart, user_id.as_bytes()),
+			(&self.db.alias_roomid, localpart, room_id.as_bytes()),
+			(&self.db.aliasid_alias, key.as_slice(), alias.as_bytes()),
+		])
+		.execute();
 
 		Ok(())
 	}
@@ -184,7 +204,8 @@ impl Service {
 			.services
 			.federation
 			.execute(server, request)
-			.await?;
+			.await
+			.map_err(|error| gateway_error(server, error))?;
 
 		Ok((response.room_id, response.servers))
 	}
@@ -331,5 +352,19 @@ impl Service {
 		}
 
 		Ok(())
+	}
+}
+
+/// Reports a failure to reach an alias's server as a gateway error.
+///
+/// A timeout reads as any other failure, because a 504 has clients repeat a
+/// join that already waited it out. A remote's own answer, a local refusal and
+/// a shutdown pass through unchanged. For an alias naming another server,
+/// `Error::Err` comes only from the resolver, for a failed address lookup.
+fn gateway_error(server: &ServerName, error: Error) -> Error {
+	match error {
+		| Error::Reqwest(_) | Error::Err(_) =>
+			err!(Request(ConnectionFailed("Failed to fetch alias from {server}."))),
+		| _ => error,
 	}
 }

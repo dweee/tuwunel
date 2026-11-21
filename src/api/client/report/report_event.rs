@@ -1,10 +1,48 @@
+use std::borrow::Cow;
+
 use axum::extract::State;
-use ruma::{EventId, RoomId, UserId, api::client::room::report_content};
-use tuwunel_core::{Err, Result, debug_info, info, matrix::pdu::PduEvent, utils::ReadyExt};
+use futures::{StreamExt, TryFutureExt, pin_mut};
+use ruma::{
+	EventId, RoomAliasId, RoomId, UserId,
+	api::client::room::report_content,
+	events::{
+		StateEventType,
+		room::{create::RoomCreateEventContent, message::RoomMessageEventContent},
+	},
+	room::RoomType,
+};
+use serde::Deserialize;
+use tuwunel_core::{
+	Err, Result, debug_error, debug_info, info,
+	utils::{ReadyExt, html::escape, string::single_line},
+};
+use tuwunel_matrix::{Event, pdu::PduEvent};
 use tuwunel_service::Services;
 
 use super::REASON_MAX_LEN;
 use crate::{ClientIp, Ruma};
+
+#[cfg(test)]
+mod tests;
+
+const DETAIL_MAX_CHARS: usize = 500;
+
+struct Report<'a> {
+	reporter: &'a UserId,
+	reason: &'a str,
+	event_id: &'a EventId,
+	room_id: &'a RoomId,
+	room_type: &'a str,
+	room_alias: Option<&'a RoomAliasId>,
+	body: Option<&'a str>,
+	sender: &'a UserId,
+	sender_is_local: bool,
+}
+
+#[derive(Deserialize)]
+struct Content {
+	body: Option<String>,
+}
 
 /// # `POST /_matrix/client/v3/rooms/{roomId}/report/{eventId}`
 ///
@@ -39,14 +77,45 @@ pub(crate) async fn report_event_route(
 	)
 	.await?;
 
-	services
-		.admin
-		.send_report(&format!(
-			"@room Event report received from {}\nReport Reason: {}\n\nEvent ID: {}\nRoom ID: \
-			 {}\nSent By: {}",
-			sender_user, reason, pdu.event_id, pdu.room_id, pdu.sender,
-		))
+	let room_type = services
+		.state_accessor
+		.room_state_get_content(&pdu.room_id, &StateEventType::RoomCreate, "")
+		.map_ok(|content: RoomCreateEventContent| content.room_type)
+		.inspect_err(|error| debug_error!(%error, "Failed to read reported room type"))
 		.await;
+
+	let room_type = room_type
+		.as_ref()
+		.map(|kind| kind.as_ref().map_or("regular", RoomType::as_str))
+		.unwrap_or("unavailable");
+
+	let body = pdu
+		.get_content()
+		.ok()
+		.and_then(|content: Content| content.body);
+
+	let report = {
+		let aliases = services
+			.alias
+			.local_aliases_for_room(&pdu.room_id);
+
+		pin_mut!(aliases);
+		let room_alias = aliases.next().await;
+
+		format_report(&Report {
+			reporter: sender_user,
+			reason,
+			event_id: &pdu.event_id,
+			room_id: &pdu.room_id,
+			room_type,
+			room_alias,
+			body: body.as_deref(),
+			sender: &pdu.sender,
+			sender_is_local: services.globals.user_is_local(&pdu.sender),
+		})
+	};
+
+	services.admin.send_report_content(report).await;
 
 	Ok(report_content::v3::Response {})
 }
@@ -92,4 +161,45 @@ async fn is_event_report_valid(
 	}
 
 	Ok(())
+}
+
+fn format_report(report: &Report<'_>) -> RoomMessageEventContent {
+	let event_id = single_line(report.event_id.as_str());
+	let room_alias = report
+		.room_alias
+		.map_or("none", RoomAliasId::as_str);
+
+	let (redact_hint, redact_id) = if report.sender_is_local {
+		("\n\nTo redact it: !admin users redact-event ", event_id.as_ref())
+	} else {
+		("", "")
+	};
+
+	let body = format!(
+		"@room Event report received from {}\nReport Reason: {}\n\nEvent ID: {}\nRoom ID: \
+		 {}\nRoom Type: {}\nRoom Alias: {}\nSent By: {}\nMessage: {}{}{}",
+		single_line(report.reporter.as_str()),
+		single_line(report.reason),
+		event_id,
+		single_line(report.room_id.as_str()),
+		excerpt(report.room_type),
+		excerpt(room_alias),
+		single_line(report.sender.as_str()),
+		excerpt(report.body.unwrap_or("unavailable")),
+		redact_hint,
+		redact_id,
+	);
+
+	let html = escape(&body).replace('\n', "<br>");
+
+	RoomMessageEventContent::text_html(body, html)
+}
+
+fn excerpt(value: &str) -> Cow<'_, str> {
+	let text = value
+		.char_indices()
+		.nth(DETAIL_MAX_CHARS)
+		.map_or(value, |(end, _)| value.split_at(end).0);
+
+	single_line(text)
 }

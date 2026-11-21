@@ -20,6 +20,8 @@ use crate::{
 /// opened [`Map`] through an `Arc`. Dropped or unavailable families are absent.
 pub(super) type Maps = BTreeMap<MapsKey, MapsVal>;
 
+pub(super) type Indexed = Box<[Option<MapsVal>]>;
+
 /// Names a column family in the map catalog.
 ///
 /// Catalog names have static lifetime because descriptors are process-wide
@@ -36,19 +38,29 @@ pub(super) type MapsVal = Arc<Map>;
 ///
 /// The returned index contains only descriptors that are live and present in
 /// the opened database. Individual map handles share the supplied engine.
-pub(super) fn open(engine: &Arc<Engine>) -> Result<Maps> { open_list(engine, MAPS) }
+/// The second index follows `MAPS`, with `None` for dropped or absent families.
+pub(super) fn open(engine: &Arc<Engine>) -> Result<(Maps, Indexed)> { open_list(engine, MAPS) }
 
 /// Opens maps from an explicit descriptor list.
 ///
 /// Dropped descriptors and column families missing from the engine are skipped.
 /// Any failure to open a retained map aborts construction of the index.
+/// The second index follows `MAPS`, with `None` for dropped or absent families.
 #[tracing::instrument(name = "maps", level = "debug", skip_all)]
-pub(super) fn open_list(engine: &Arc<Engine>, maps: &[Descriptor]) -> Result<Maps> {
-	maps.iter()
+pub(super) fn open_list(engine: &Arc<Engine>, maps: &[Descriptor]) -> Result<(Maps, Indexed)> {
+	let maps: Maps = maps
+		.iter()
 		.filter(|desc| !desc.dropped)
 		.filter(|desc| engine.has_cf(desc.name))
 		.map(|desc| Ok((desc.name, Map::open(engine, desc.name)?)))
-		.collect()
+		.collect::<Result<_>>()?;
+
+	let indexed = MAPS
+		.iter()
+		.map(|desc| maps.get(desc.name).cloned())
+		.collect();
+
+	Ok((maps, indexed))
 }
 
 #[cfg(test)]
@@ -105,8 +117,24 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "delayid_event",
+		key_size_hint: Some(32),
+		val_size_hint: Some(384),
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "delayid_finalised",
+		ttl: 60 * 60 * 24 * 7, // MSC4140 lookup; about a week, less at the size cap
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
 		name: "disabledroomids",
 		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "dueat_delayid",
+		key_size_hint: Some(48),
+		..descriptor::SEQUENTIAL_SMALL
 	},
 	Descriptor {
 		name: "email_userid",
@@ -200,7 +228,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "mediaid_lazy",
-		ttl: 60 * 60 * 24 * 30, // raised by url_preview_cache_ttl; must outlive url_preview
+		ttl: 60 * 60 * 24 * 30, // raised by media.url_preview.cache_ttl; must outlive url_preview
 		limit_size: 1024 * 1024 * 512,
 		..descriptor::RANDOM_SMALL_CACHE
 	},
@@ -301,6 +329,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "presenceid_presence",
+		cache_disp: CacheDisp::Unique,
+		key_size_hint: Some(32),
+		val_size_hint: Some(96),
+		block_size: 1024 * 4,
 		..descriptor::SEQUENTIAL_SMALL
 	},
 	Descriptor {
@@ -313,7 +345,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "relatesto_typed",
-		key_size_hint: Some(40),
+		key_size_hint: Some(33),
 		val_size_hint: Some(8),
 		..descriptor::RANDOM_SMALL
 	},
@@ -358,7 +390,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
 		name: "roomid_spacehierarchy",
 		limit_size: 1024 * 1024 * 64,
-		ttl: 60 * 60 * 24 * 7, // above spacehierarchy_cache_ttl_max (18h default)
+		ttl: 60 * 60 * 24 * 7, // above cache.space_hierarchy.ttl_max (18h default)
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
@@ -379,12 +411,20 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::DROPPED
 	},
 	Descriptor {
+		name: "roomtseventid_prevwalk",
+		cache_disp: CacheDisp::Unique, // admin sweeps would evict the shared pool
+		cache_shards: 8,               // 512 KiB each, RocksDB's default minimum shard
+		block_size: 4096,              // scanned, never point-read
+		ttl: 60 * 60 * 24 * 3,         // the "up to three days" the view's docs name
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
 		name: "roomuserdataid_accountdata",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
 		name: "roomuserid_invitecount",
-		val_size_hint: Some(8),
+		val_size_hint: Some(53),
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
@@ -426,7 +466,15 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "senderkey_emailcursor",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "senderkey_pusher",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "senderkeyroom_emailthrottle",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
@@ -476,6 +524,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "serverroomids",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "servershortroomid_park",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
@@ -557,8 +609,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "tofrom_relation",
-		key_size_hint: Some(8),
-		val_size_hint: Some(8),
+		key_size_hint: Some(16),
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
@@ -576,7 +627,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "url_preview",
-		ttl: 60 * 60 * 24 * 7, // floor; url_preview_cache_ttl raises it when higher
+		ttl: 60 * 60 * 24 * 7, // floor; media.url_preview.cache_ttl raises it when higher
 		limit_size: 1024 * 1024 * 128,
 		..descriptor::RANDOM_SMALL_CACHE
 	},
@@ -637,6 +688,11 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "userid_blurhash",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "userid_delayid",
+		key_size_hint: Some(80),
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {

@@ -13,14 +13,17 @@ use ruma::{
 };
 use serde::Deserialize;
 use tuwunel_core::{
-	Error, Event, Result, error,
+	Error, Result, error,
 	error::default_log,
 	implement,
-	pdu::{MAX_PDU_BYTES, PduBuilder},
 	utils::{json::serialized_len, stream::IterStream, string::chunk},
 };
+use tuwunel_matrix::{
+	Event,
+	pdu::{MAX_PDU_BYTES, PduBuilder},
+};
 
-use super::CommandOutput;
+use super::{CommandOutput, notices::notice_markdown};
 use crate::rooms::state::RoomMutexGuard;
 
 /// Room event relation carried by an admin response.
@@ -79,19 +82,20 @@ pub(super) async fn handle_response(
 		pdu.sender()
 	};
 
-	let threads = self.services.server.config.admin_output_threads;
+	let threads = self.services.server.config.admin.output_threads;
 	let mode = command_thread(&pdu)
 		.or_else(|| threads.then(|| reply_id.to_owned()))
 		.map_or_else(|| Mode::Reply(reply_id.to_owned()), Mode::Thread);
 
 	self.respond(&output, pdu.room_id(), response_sender, &mode)
-		.boxed()
+		.boxed() // size firewall
 		.await
 }
 
-/// Splits the output across up to `admin_output_max_events` reply or thread
-/// events; output needing more events, or any output when the limit is zero,
-/// is uploaded and posted as a single file attachment instead.
+/// Splits output across up to `admin.output_max_events` reply or thread events.
+///
+/// Output needing more events, or any output when the limit is zero, is uploaded
+/// and posted as a single file attachment instead.
 #[implement(super::Service)]
 async fn respond(
 	&self,
@@ -105,7 +109,8 @@ async fn respond(
 		.services
 		.server
 		.config
-		.admin_output_max_events;
+		.admin
+		.output_max_events;
 
 	let segments = (max_events != 0)
 		.then(|| {
@@ -118,7 +123,7 @@ async fn respond(
 	match segments {
 		| Some(segments) =>
 			self.send_segments(&segments, room_id, sender, mode, markdown)
-				.boxed()
+				.boxed() // size firewall
 				.await,
 		| None => {
 			let mut content = self.attach(output).await.unwrap_or_else(|e| {
@@ -135,7 +140,7 @@ async fn respond(
 			content.relates_to = Some(mode.relation(None));
 
 			self.respond_to_room(content, room_id, sender)
-				.boxed()
+				.boxed() // cold arm
 				.await
 		},
 	}
@@ -178,7 +183,7 @@ async fn send_segments(
 
 	if let Err(e) = result {
 		self.handle_response_error(e, room_id, sender, &state_lock)
-			.boxed()
+			.boxed() // cold arm
 			.await
 			.unwrap_or_else(default_log);
 	}
@@ -204,7 +209,7 @@ pub(super) async fn respond_to_room(
 		.await
 	{
 		self.handle_response_error(e, room_id, user_id, &state_lock)
-			.boxed()
+			.boxed() // cold arm
 			.await
 			.unwrap_or_else(default_log);
 	}
@@ -229,7 +234,7 @@ async fn handle_response_error(
 	self.services
 		.timeline
 		.build_and_append_pdu(PduBuilder::timeline(&content), user_id, room_id, state_lock)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	Ok(())
@@ -263,7 +268,7 @@ impl Mode {
 
 fn notice(text: &str, markdown: bool) -> RoomMessageEventContent {
 	match markdown {
-		| true => RoomMessageEventContent::notice_markdown(text),
+		| true => notice_markdown(text),
 		| false => RoomMessageEventContent::notice_plain(text),
 	}
 }

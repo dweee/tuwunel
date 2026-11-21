@@ -1,9 +1,6 @@
-use std::collections::HashMap;
-
-use futures::{FutureExt, TryStreamExt, future::try_join5};
+use futures::{FutureExt, TryFutureExt, TryStreamExt, future::try_join4};
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId,
-	RoomId, RoomVersionId, ServerName, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId, RoomId, ServerName, UserId,
 	events::{
 		AnyStrippedStateEvent, StateEventType,
 		room::member::{MembershipState, RoomMemberEventContent},
@@ -13,27 +10,82 @@ use tuwunel_core::{
 	Err, Result, async_noinline, debug,
 	debug::INFO_SPAN_LEVEL,
 	debug_warn, err, implement,
-	matrix::{Event, PduCount, PduEvent, pdu::MAX_PREV_EVENTS, room_version::from_create_event},
 	smallvec::SmallVec,
 	trace,
 	utils::{
 		BoolExt,
-		stream::{IterStream, TryWidebandExt},
+		future::ReadyEqExt,
+		result::NotFound,
+		stream::{IterStream, TryBroadbandExt, TryReadyExt},
 	},
 	warn,
 };
+use tuwunel_matrix::{
+	Event, PduCount, PduEvent, pdu::MAX_PREV_EVENTS, room_version::from_create_event,
+};
 
-use super::backoff::{Context, Disposition};
+use super::{
+	backoff::{Context, Disposition, Suppression, UPGRADE_RETRY},
+	fetch_prev::{Pdus, PrevFetch},
+	handle_prev_pdu::PrevUpgrade,
+	prev_walk::PrevWalk,
+	room_version_of,
+};
 use crate::rooms::{state_cache::MembershipUpdate, timeline::RawPduId};
 
-type PrevResultsHandled = SmallVec<[PrevHandled; MAX_PREV_EVENTS]>;
-type PrevHandled = (OwnedEventId, Handled);
 type PrevSplit = SmallVec<[OwnedEventId; MAX_PREV_EVENTS]>;
 
 type Handled = Option<(RawPduId, bool)>;
 
-/// When receiving an event one needs to:
-/// 0. Check the server is in the room
+/// Handle a PDU a peer pushed to this server in a federation transaction.
+///
+/// A room every local user has left keeps its stored events and frozen state,
+/// and resolving a pushed event against them can rewrite a local member's
+/// membership, so such a room takes an inviter's rescission and nothing else.
+/// A rescission is signature-checked and clears only that inviter's own invite,
+/// so the room's frozen ACLs and disabled flag do not gate it. Anything else is
+/// dropped as handled, since the sender's view of the room is stale and a retry
+/// cannot help.
+///
+/// The caller holds the room's federation mutex, which a remote join keeps
+/// until its join event is appended, so a PDU arriving during a join waits for
+/// that join and reads the server as resident.
+#[implement(super::Service)]
+pub async fn handle_pushed_pdu<'a>(
+	&'a self,
+	origin: &'a ServerName,
+	room_id: &'a RoomId,
+	event_id: &'a EventId,
+	pdu: CanonicalJsonObject,
+) -> Result<Handled> {
+	let resident = self
+		.services
+		.state_cache
+		.server_in_room_result(self.services.globals.server_name(), room_id)
+		.await?;
+
+	if resident {
+		return self
+			.handle_incoming_pdu(origin, room_id, event_id, pdu, true)
+			.await;
+	}
+
+	if self
+		.handle_rescinded_invite(room_id, event_id, &pdu)
+		.await?
+		.is_false()
+	{
+		debug!(%origin, "Dropping a PDU for a room this server is not in.");
+	}
+
+	Ok(None)
+}
+
+/// Handle an event received from a federation peer.
+///
+/// Only a push is gated on this server being in the room, through
+/// `handle_pushed_pdu`; backfill and the membership routes reach rooms it has
+/// left. When receiving an event one needs to:
 /// 1. Skip the PDU if we already know about it
 /// 1.1. Remove unsigned field
 /// 2. Check signatures, otherwise drop
@@ -83,20 +135,14 @@ pub async fn handle_incoming_pdu<'a>(
 		return Ok(Some((pdu_id, false)));
 	}
 
-	// 1.1 Check the server is in the room
-	let meta_exists = self.services.metadata.exists(room_id).map(Ok);
-
-	// 1.2 Check if the room is disabled
 	let is_disabled = self
 		.services
 		.metadata
 		.is_disabled(room_id)
 		.map(Ok);
 
-	// 1.3.1 Check room ACL on origin field/server
 	let origin_acl_check = self.acl_check(origin, room_id);
 
-	// 1.3.2 Check room ACL on sender's server name
 	let sender: &UserId = pdu
 		.get("sender")
 		.try_into()
@@ -107,34 +153,20 @@ pub async fn handle_incoming_pdu<'a>(
 		.ne(origin)
 		.then_async(|| self.acl_check(sender.server_name(), room_id));
 
-	// Fetch create event; absent when we are not resident in the room.
+	// Absent when the room's state was never stored or was deleted.
 	let create_event = self
 		.services
 		.state_accessor
 		.room_state_get(room_id, &StateEventType::RoomCreate, "")
 		.map(|result| Ok(result.ok()));
 
-	let (meta_exists, is_disabled, (), (), create_event) = try_join5(
-		meta_exists,
+	let (is_disabled, (), (), create_event) = try_join4(
 		is_disabled,
 		origin_acl_check,
 		sender_acl_check.map(|o| o.unwrap_or(Ok(()))),
 		create_event,
 	)
 	.await?;
-
-	// When not resident, the only event we can act on is a leave rescinding an
-	// out-of-band invite we hold for a local user.
-	if !meta_exists {
-		return if self
-			.handle_rescinded_invite(room_id, &pdu)
-			.await?
-		{
-			Ok(None)
-		} else {
-			Err!(Request(NotFound("Room is unknown to this server")))
-		};
-	}
 
 	if is_disabled {
 		return Err!(Request(Forbidden("Federation of this room is disabled by this server.")));
@@ -156,83 +188,128 @@ pub async fn handle_incoming_pdu<'a>(
 			kind = ?incoming_pdu.event_type(),
 			"Not a timeline event.",
 		);
+
 		return Ok(None);
 	}
 
-	// Skip old events
-	let first_ts_in_room = self
+	let first_normal_ts = self
 		.services
 		.timeline
-		.first_pdu_in_room(room_id)
+		.first_normal_pdu_in_room(room_id)
 		.await?
 		.origin_server_ts();
 
-	if incoming_pdu.origin_server_ts() < first_ts_in_room {
+	let gapped = self
+		.services
+		.timeline
+		.non_outlier_pdus_exist(incoming_pdu.prev_events())
+		.eq(&false)
+		.await;
+
+	// An application service can backdate an event at the tip of the DAG.
+	if gapped && incoming_pdu.origin_server_ts() < first_normal_ts {
 		debug!(
 			origin_server_ts = ?incoming_pdu.origin_server_ts(),
-			?first_ts_in_room,
+			?first_normal_ts,
 			"Skipping old event."
 		);
+
+		return Ok(None);
+	}
+
+	self.prev_walk.enter(gapped);
+
+	let create_event_id = create_event.event_id();
+	let upgrade = PrevUpgrade {
+		origin,
+		room_id,
+		event_id,
+		room_version: &room_version,
+		recursion_level,
+		first_normal_ts,
+		create_event_id,
+	};
+
+	// Start before the first await so a dropped future still settles the gapped count.
+	let pass = gapped.then(|| PrevWalk::start(self, &upgrade));
+
+	let standing = gapped
+		.then_async(|| self.is_suppressed(Context::Incoming, event_id, UPGRADE_RETRY))
+		.await
+		.unwrap_or(Suppression::Absent);
+
+	if standing.is_deny() {
+		if let Some(pass) = pass {
+			pass.hold();
+		}
+
+		debug_warn!(%origin, %room_id, %event_id, "Backing off from a gapped incoming event.");
 		return Ok(None);
 	}
 
 	// 9. Fetch any missing prev events doing all checks listed here starting at 1.
 	//    These are timeline events
-	let (sorted_prev_events, eventid_info) = self
-		.fetch_prev(
-			origin,
-			room_id,
-			event_id,
-			incoming_pdu.prev_events(),
-			&room_version,
-			recursion_level,
-			first_ts_in_room,
-		)
-		.await?;
+	let fetch = self
+		.fetch_prev(upgrade, incoming_pdu.prev_events())
+		.await;
 
-	self.handle_prev_events(
-		origin,
-		room_id,
-		event_id,
-		sorted_prev_events,
-		eventid_info,
-		&room_version,
-		recursion_level,
-		first_ts_in_room,
-		create_event.event_id(),
-	)
-	.boxed() // size firewall
-	.await?;
+	let stopping = self.services.server.is_stopping();
+	let walk = pass.and_then(|pass| pass.fetched(fetch.as_ref(), stopping));
+	let fetch = fetch?;
 
-	// Done with prev events, now handling the incoming event
-	self.upgrade_outlier_to_timeline_pdu(
-		origin,
-		room_id,
-		incoming_pdu,
-		pdu,
-		&room_version,
-		recursion_level,
-		create_event.event_id(),
-	)
-	.boxed() // size firewall
-	.await
+	let walking = fetch.sorted.is_empty().is_false();
+	let attempt = walking.then(|| self.record_attempt(Context::Incoming, event_id));
+	let PrevFetch { sorted, pdus, .. } = fetch;
+
+	let (handled, upgraded) = self
+		.handle_prev_events(upgrade, sorted, pdus)
+		.boxed() // size firewall
+		.and_then(|upgraded| {
+			self.upgrade_outlier_to_timeline_pdu(upgrade, incoming_pdu, pdu)
+				.boxed() // size firewall
+				.map(move |handled| Ok((handled, upgraded)))
+		})
+		.unwrap_or_else(|error| (Err(error), 0))
+		.await;
+
+	let appended = handled.as_ref().map(Option::is_some);
+
+	if let Some(walk) = walk {
+		walk.settle(appended, upgraded, self.services.server.is_stopping());
+	}
+
+	self.record_completion(Context::Incoming, event_id, standing, attempt, appended)
+		.await;
+
+	handled
 }
 
 /// Apply a federated leave that rescinds an out-of-band invite for a local
 /// user.
 ///
-/// We are not resident in the room, so the kick cannot be processed as a normal
-/// timeline event for lack of room state; but it must still clear the invite so
-/// the invited user's `/sync` reflects the rescission. Mirrors Synapse's
+/// We are not resident in the room, so we hold no current state to process the
+/// kick against as a normal timeline event; but it must still clear the invite
+/// so the invited user's `/sync` reflects the rescission. Mirrors Synapse's
 /// out-of-band membership handling: only a kick from the original inviter is
 /// honored, since without the room state we cannot judge any other sender's
-/// authority. Returns `true` when a rescission was applied.
+/// authority. An event already accepted is a replay of history, which leaves a
+/// newer invite from that inviter alone. When the current invite has a recorded
+/// event ID, the kick must name it in `auth_events`. Returns `true` when a
+/// rescission was applied.
 #[implement(super::Service)]
-#[tracing::instrument(skip_all, level = "debug", fields(%room_id))]
-async fn handle_rescinded_invite(
-	&self,
-	room_id: &RoomId,
-	pdu: &CanonicalJsonObject,
+// cold arm: rescission, whose layout overflows the route's depth limit
+#[async_noinline]
+#[tracing::instrument(
+	name = "rescinded_invite",
+	level = "debug",
+	skip_all,
+	fields(%room_id),
+)]
+async fn handle_rescinded_invite<'a>(
+	&'a self,
+	room_id: &'a RoomId,
+	event_id: &'a EventId,
+	pdu: &'a CanonicalJsonObject,
 ) -> Result<bool> {
 	if pdu
 		.get("type")
@@ -279,7 +356,8 @@ async fn handle_rescinded_invite(
 		.services
 		.state_cache
 		.user_membership(&target, room_id)
-		.await != Some(MembershipState::Invite)
+		.ne(&Some(MembershipState::Invite))
+		.await
 	{
 		return Ok(false);
 	}
@@ -304,7 +382,28 @@ async fn handle_rescinded_invite(
 		return Ok(false);
 	}
 
-	let Some(room_version_id) = super::room_version_of(&invite_state) else {
+	if self
+		.services
+		.timeline
+		.get_pdu_id(event_id)
+		.await
+		.optional()?
+		.is_some()
+	{
+		return Ok(false);
+	}
+
+	let invite_event = self
+		.services
+		.state_cache
+		.get_invite_event(room_id, &target)
+		.await?;
+
+	if invite_event.is_some_and(|invite_event| !authenticates_invite(pdu, &invite_event)) {
+		return Ok(false);
+	}
+
+	let Some(room_version_id) = room_version_of(&invite_state) else {
 		return Ok(false);
 	};
 
@@ -327,7 +426,9 @@ async fn handle_rescinded_invite(
 			sender: &sender,
 			last_state: None,
 			invite_via: None,
+			invite_event: None,
 			update_joined_count: false,
+			replaced_join: None,
 			count: PduCount::Normal(*count),
 		})
 		.await?;
@@ -337,22 +438,32 @@ async fn handle_rescinded_invite(
 	Ok(true)
 }
 
+fn authenticates_invite(pdu: &CanonicalJsonObject, invite_event: &EventId) -> bool {
+	pdu.get("auth_events")
+		.and_then(CanonicalJsonValue::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(|event| match event {
+			| CanonicalJsonValue::String(event_id) => Some(event_id.as_str()),
+			| CanonicalJsonValue::Array(pair) =>
+				pair.first().and_then(CanonicalJsonValue::as_str),
+			| _ => None,
+		})
+		.any(|event_id| event_id == invite_event.as_str())
+}
+
 /// Upgrade an incoming PDU's previous events, walking interior events after
 /// their parents so each derives state locally instead of refetching it.
+///
+/// Extremities upgrade concurrently up to `prev_events_concurrency`; interior
+/// events upgrade one at a time. Returns how many previous events were upgraded.
 #[implement(super::Service)]
-#[expect(clippy::too_many_arguments)]
 async fn handle_prev_events(
 	&self,
-	origin: &ServerName,
-	room_id: &RoomId,
-	event_id: &EventId,
+	upgrade: PrevUpgrade<'_>,
 	sorted_prev_events: Vec<OwnedEventId>,
-	mut eventid_info: HashMap<OwnedEventId, (PduEvent, CanonicalJsonObject)>,
-	room_version: &RoomVersionId,
-	recursion_level: usize,
-	first_ts_in_room: MilliSecondsSinceUnixEpoch,
-	create_event_id: &EventId,
-) -> Result<()> {
+	mut pdus: Pdus, // HashMap::remove takes &mut self
+) -> Result<usize> {
 	trace!(
 		events = sorted_prev_events.len(),
 		event_ids = ?sorted_prev_events,
@@ -362,9 +473,9 @@ async fn handle_prev_events(
 	let (interior, extremities): (PrevSplit, PrevSplit) = sorted_prev_events
 		.into_iter()
 		.partition(|prev_id| {
-			eventid_info.get(prev_id).is_some_and(|(pdu, _)| {
+			pdus.get(prev_id).is_some_and(|(pdu, _)| {
 				pdu.prev_events()
-					.any(|prev| eventid_info.contains_key(prev))
+					.any(|prev| pdus.contains_key(prev))
 			})
 		});
 
@@ -372,28 +483,20 @@ async fn handle_prev_events(
 		self.services
 			.server
 			.config
+			.federation
+			.history
 			.prev_events_concurrency,
 	);
 
-	extremities
+	let upgraded = extremities
 		.into_iter()
 		.try_stream()
-		.map_ok(|prev_id| (eventid_info.remove(&prev_id), prev_id))
-		.widen_and_then(concurrency, async |(info, prev_id)| {
-			self.upgrade_prev_event(
-				origin,
-				room_id,
-				event_id,
-				info,
-				room_version,
-				recursion_level,
-				first_ts_in_room,
-				prev_id,
-				create_event_id,
-			)
-			.await
+		.map_ok(|prev_id| (pdus.remove(&prev_id), prev_id))
+		.broadn_and_then(concurrency, async |(info, prev_id)| {
+			self.upgrade_prev_event(upgrade, info, &prev_id)
+				.await
 		})
-		.try_collect::<PrevResultsHandled>()
+		.ready_try_fold(0, tally_upgraded)
 		.boxed() // size firewall
 		.await?;
 
@@ -401,74 +504,61 @@ async fn handle_prev_events(
 	interior
 		.into_iter()
 		.try_stream()
-		.map_ok(|prev_id| (eventid_info.remove(&prev_id), prev_id))
-		.try_for_each(async |(info, prev_id)| {
-			self.upgrade_prev_event(
-				origin,
-				room_id,
-				event_id,
-				info,
-				room_version,
-				recursion_level,
-				first_ts_in_room,
-				prev_id,
-				create_event_id,
-			)
-			.await?;
-
-			Ok(())
+		.map_ok(|prev_id| (pdus.remove(&prev_id), prev_id))
+		.and_then(async |(info, prev_id)| {
+			self.upgrade_prev_event(upgrade, info, &prev_id)
+				.await
 		})
+		.ready_try_fold(upgraded, tally_upgraded)
 		.boxed() // size firewall
 		.await
 }
 
-/// Upgrade one previous event, folding a transient failure into a no-op so a
-/// single bad prev does not abort the batch; a shutdown still propagates.
+/// Upgrade one previous event, folding a failure into a non-fatal skip so a
+/// single bad prev does not abort the batch.
+///
+/// A failure records a transient backoff for the prev. A shutdown propagates
+/// through the leading running check; an interruption surfacing from inside
+/// the upgrade is not a verdict on the prev and records nothing.
 #[implement(super::Service)]
-#[expect(clippy::too_many_arguments)]
 async fn upgrade_prev_event(
 	&self,
-	origin: &ServerName,
-	room_id: &RoomId,
-	event_id: &EventId,
+	upgrade: PrevUpgrade<'_>,
 	info: Option<(PduEvent, CanonicalJsonObject)>,
-	room_version: &RoomVersionId,
-	recursion_level: usize,
-	first_ts_in_room: MilliSecondsSinceUnixEpoch,
-	prev_id: OwnedEventId,
-	create_event_id: &EventId,
-) -> Result<PrevHandled> {
+	prev_id: &EventId,
+) -> Result<Handled> {
 	self.services.server.check_running()?;
-	match self
-		.handle_prev_pdu(
-			origin,
-			room_id,
-			event_id,
-			info,
-			room_version,
-			recursion_level,
-			first_ts_in_room,
-			&prev_id,
-			create_event_id,
-		)
-		.await
-	{
-		| Ok(handled) => {
-			if handled.is_some() {
-				self.record_success(Context::Upgrade, &prev_id)
-					.await;
-				debug!(?prev_id, ?handled, "Prev event processed.");
-			} else {
-				debug_warn!(?prev_id, "Prev event not processed.");
-			}
 
-			Ok((prev_id, handled))
+	let PrevUpgrade { room_id, event_id, .. } = upgrade;
+
+	match self.handle_prev_pdu(upgrade, info, prev_id).await {
+		| Err(error) if error.is_interrupted() || self.services.server.is_stopping() => {
+			debug!(?prev_id, ?event_id, ?room_id, %error, "Prev event processing interrupted.");
+
+			Ok(None)
 		},
-		| Err(e) => {
-			self.record_outcome(Context::Upgrade, &prev_id, Disposition::Transient);
-			warn!(?prev_id, ?event_id, ?room_id, "Prev event processing failed: {e}");
+		| Err(error) => {
+			self.record_outcome(Context::Upgrade, prev_id, Disposition::Transient);
+			warn!(?prev_id, ?event_id, ?room_id, %error, "Prev event processing failed.");
 
-			Ok((prev_id, None))
+			Ok(None)
+		},
+		| Ok(None) => {
+			debug_warn!(?prev_id, "Prev event not processed.");
+
+			Ok(None)
+		},
+		| Ok(handled) => {
+			self.record_success(Context::Upgrade, prev_id)
+				.await;
+
+			debug!(?prev_id, ?handled, "Prev event processed.");
+
+			Ok(handled)
 		},
 	}
+}
+
+fn tally_upgraded(upgraded: usize, handled: Handled) -> Result<usize> {
+	Ok(upgraded.saturating_add(usize::from(handled.is_some())))
 }

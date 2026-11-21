@@ -18,11 +18,15 @@ use itertools::Itertools;
 use regex::RegexSet;
 use url::Url;
 
-use super::{DEPRECATED_KEYS, IdentityProvider, IpSource, KNOWN_KEYS};
+use super::{
+	DEPRECATED_KEYS, IdentityProvider, KNOWN_KEYS,
+	turn::{Provider, Turn},
+};
 use crate::{
 	Config, Err, Result, debug, debug_info, err, error,
 	utils::{
 		is_secret_set,
+		string::{equals_any, is_opaque_id},
 		sys::storage::{Filesystem, filesystem_from_path},
 		time::timepoint_from_now,
 	},
@@ -49,10 +53,38 @@ pub fn reload(old: &Config, new: &Config) -> Result {
 		));
 	}
 
-	if new.ip_source != old.ip_source {
+	if new.http.ip_source != old.http.ip_source {
 		return Err!(Config(
-			"ip_source",
-			"ip_source cannot be changed at runtime; restart the server to apply this change."
+			"http.ip_source",
+			"http.ip_source cannot be changed at runtime; restart the server to apply this \
+			 change."
+		));
+	}
+
+	if new.storage_provider != old.storage_provider {
+		return Err!(Config(
+			"storage_provider",
+			"Storage providers cannot be changed at runtime; restart the server to apply this \
+			 change."
+		));
+	}
+
+	let old = &old.telemetry.sentry;
+	let new = &new.telemetry.sentry;
+
+	if new.enable != old.enable
+		|| new.endpoint != old.endpoint
+		|| new.send_server_name != old.send_server_name
+		|| new.traces_sample_rate.to_bits() != old.traces_sample_rate.to_bits()
+		|| new.attach_stacktrace != old.attach_stacktrace
+		|| new.send_panic != old.send_panic
+		|| new.send_error != old.send_error
+		|| new.filter != old.filter
+	{
+		return Err!(Config(
+			"telemetry.sentry",
+			"Sentry settings cannot be changed at runtime; restart the server to apply this \
+			 change."
 		));
 	}
 
@@ -78,13 +110,19 @@ pub fn check(config: &Config) -> Result {
 	check_storage(config)?;
 	check_registration(config)?;
 	check_registration_terms(config)?;
+	check_profile_requests(config)?;
+	check_relation_limits(config)?;
+	check_space_hierarchy_cache(config)?;
+	check_typing_timeouts(config)?;
 	check_password_hashing(config)?;
+	check_jwt(config)?;
 	check_turn_and_media_misc(config)?;
 	check_url_previews(config)?;
 	check_room_version(config)?;
 	check_identity_providers(config)?;
 	warn_oidc_registration_token(config);
 	warn_oidc_client_approval(config);
+	warn_native_auth_without_sign_in(config);
 	check_media_providers(config)?;
 	check_well_known_support_contact_validity(config)?;
 	check_email(config)?;
@@ -93,26 +131,94 @@ pub fn check(config: &Config) -> Result {
 }
 
 fn warn_legacy_state_local(config: &Config) {
-	if config.resolve_state_locally_shadow {
+	if config.federation.resolve_state_locally_shadow {
 		warn!(
-			"resolve_state_locally_shadow is deprecated; use resolve_state_locally=false to \
-			 disable local state derivation."
+			"resolve_state_locally_shadow is deprecated; use \
+			 federation.resolve_state_locally=false to disable local state derivation."
 		);
 	}
 }
 
 fn check_observability(config: &Config) -> Result {
-	if config.sentry && config.sentry_endpoint.is_none() {
+	if config.telemetry.sentry.enable && config.telemetry.sentry.endpoint.is_none() {
 		return Err!(Config(
-			"sentry_endpoint",
+			"telemetry.sentry.endpoint",
 			"Sentry cannot be enabled without an endpoint set"
 		));
 	}
 
-	if config.sentry && !(0.0..=1.0).contains(&config.sentry_traces_sample_rate) {
+	if config.telemetry.sentry.enable
+		&& !(0.0..=1.0).contains(&config.telemetry.sentry.traces_sample_rate)
+	{
 		return Err!(Config(
-			"sentry_traces_sample_rate",
+			"telemetry.sentry.traces_sample_rate",
 			"Sentry traces sample rate must be between 0.0 and 1.0 inclusive"
+		));
+	}
+
+	Ok(())
+}
+
+fn check_profile_requests(config: &Config) -> Result {
+	if config.profile.max_remote_fields == 0 {
+		return Err!(Config("profile.max_remote_fields", "Must be greater than zero"));
+	}
+
+	if config.profile.max_fields_per_request == 0 {
+		return Err!(Config("profile.max_fields_per_request", "Must be greater than zero"));
+	}
+
+	if config
+		.profile
+		.limit_requests_to_users_who_share_rooms
+		&& !config.profile.require_auth
+	{
+		return Err!(Config(
+			"profile.limit_requests_to_users_who_share_rooms",
+			"profile.limit_requests_to_users_who_share_rooms requires profile.require_auth to \
+			 be enabled"
+		));
+	}
+
+	Ok(())
+}
+
+fn check_relation_limits(config: &Config) -> Result {
+	if config
+		.rooms
+		.redaction
+		.thread_latest_reply_search_limit
+		.eq(&0)
+	{
+		return Err!(Config(
+			"rooms.redaction.thread_latest_reply_search_limit",
+			"Must be greater than zero"
+		));
+	}
+
+	Ok(())
+}
+
+fn check_space_hierarchy_cache(config: &Config) -> Result {
+	let cache = &config.cache.space_hierarchy;
+
+	if cache.ttl_min >= cache.ttl_max {
+		return Err!(Config(
+			"cache.space_hierarchy.ttl_min",
+			"Must be less than cache.space_hierarchy.ttl_max"
+		));
+	}
+
+	Ok(())
+}
+
+fn check_typing_timeouts(config: &Config) -> Result {
+	let typing = &config.typing;
+
+	if typing.client_timeout_min_s > typing.client_timeout_max_s {
+		return Err!(Config(
+			"typing.client_timeout_min_s",
+			"Must not exceed typing.client_timeout_max_s"
 		));
 	}
 
@@ -121,11 +227,11 @@ fn check_observability(config: &Config) -> Result {
 
 fn check_network(config: &Config) -> Result {
 	#[cfg(not(unix))]
-	if config.unix_socket_path.is_some() {
+	if config.http.listen.unix_socket_path.is_some() {
 		return Err!(Config(
-			"unix_socket_path",
+			"http.listen.unix_socket_path",
 			"UNIX socket support is only available on *nix platforms. Please remove \
-			 'unix_socket_path' from your config."
+			 'http.listen.unix_socket_path' from your config."
 		));
 	}
 
@@ -137,71 +243,95 @@ fn check_network(config: &Config) -> Result {
 
 	// A non-zero depth shards the 64-char SHA-256 hex digest into `depth`
 	// segments of `length` plus a remainder, so the product must stay below 64.
-	let depth = config.conduit_media_directory_depth;
-	let length = config.conduit_media_directory_length;
+	let depth = config.media.import.conduit.directory_depth;
+	let length = config.media.import.conduit.directory_length;
+
 	if depth > 0 && length == 0 {
 		return Err!(Config(
-			"conduit_media_directory_length",
-			"must be non-zero when conduit_media_directory_depth is non-zero"
-		));
-	}
-	if depth > 0 && usize::from(depth).saturating_mul(usize::from(length)) >= 64 {
-		return Err!(Config(
-			"conduit_media_directory_depth",
-			"conduit_media_directory_depth times conduit_media_directory_length must be less \
-			 than 64, the length of a SHA-256 hex digest"
+			"media.import.conduit.directory_length",
+			"must be non-zero when media.import.conduit.directory_depth is non-zero"
 		));
 	}
 
-	if let Some(source) = config.ip_source
-		&& !matches!(source, IpSource::ConnectInfo)
+	if depth > 0 && usize::from(depth).saturating_mul(usize::from(length)) >= 64 {
+		return Err!(Config(
+			"media.import.conduit.directory_depth",
+			"media.import.conduit.directory_depth times media.import.conduit.directory_length \
+			 must be less than 64, the length of a SHA-256 hex digest"
+		));
+	}
+
+	let bind_addrs = config.get_bind_addrs();
+
+	if let Some(source) = config.http.ip_source
+		&& source.is_header()
 	{
 		warn!(
-			"ip_source is set to {source:?}, a header-based source. Ensure a trusted reverse \
-			 proxy populates this header for every request; otherwise clients can spoof their \
-			 IP address."
+			?source,
+			"http.ip_source selects a header-based source. Ensure a trusted reverse proxy \
+			 populates this header for every request; otherwise clients can spoof their IP \
+			 address."
 		);
+	} else {
+		warn_unforwarded_local_listeners(config, &bind_addrs);
 	}
 
 	if !config.listening {
 		warn!("Configuration item `listening` is set to `false`. Cannot hear anyone.");
 	}
 
-	if config.prev_events_concurrency == 0 {
+	if config.federation.history.prev_events_concurrency == 0 {
 		return Err!(Config(
-			"prev_events_concurrency",
+			"federation.history.prev_events_concurrency",
 			"Previous-event recovery concurrency must be at least one; zero stalls every \
 			 incoming event with a backward extremity."
 		));
 	}
 
-	if config.unix_socket_path.is_none() {
-		config
-			.get_bind_addrs()
+	if config.http.listen.unix_socket_path.is_none() {
+		bind_addrs
 			.iter()
 			.for_each(warn_loopback_in_container);
 	}
 
-	for server in &config.dns_servers {
+	for server in &config.network.dns.servers {
 		if server.parse::<SocketAddr>().is_err() && server.parse::<IpAddr>().is_err() {
 			return Err!(Config(
-				"dns_servers",
+				"network.dns.servers",
 				"{server:?} is not an IP address or socket address."
 			));
 		}
 	}
 
 	// check if user specified valid IP CIDR ranges on startup
-	for cidr in &config.ip_range_denylist {
+	for cidr in &config.network.http.ip_range_denylist {
 		if let Err(e) = ipaddress::IPAddress::parse(cidr) {
 			return Err!(Config(
-				"ip_range_denylist",
+				"network.http.ip_range_denylist",
 				"Parsing specified IP CIDR range from string failed: {e}."
 			));
 		}
 	}
 
 	Ok(())
+}
+
+fn warn_unforwarded_local_listeners<'a, Addrs>(config: &Config, bind_addrs: Addrs)
+where
+	Addrs: IntoIterator<Item = &'a SocketAddr>,
+{
+	let local = config.http.listen.unix_socket_path.is_some()
+		|| bind_addrs
+			.into_iter()
+			.any(|addr| addr.ip().is_loopback());
+
+	if local {
+		warn!(
+			"Password attempts through a Unix socket or loopback listener have no per-address \
+			 limit, since http.ip_source names no forwarding header to identify their clients. \
+			 Behind a reverse proxy, set http.ip_source to the header the proxy sets."
+		);
+	}
 }
 
 fn warn_loopback_in_container(addr: &SocketAddr) {
@@ -243,14 +373,14 @@ fn warn_loopback_in_container(addr: &SocketAddr) {
 
 fn check_storage(config: &Config) -> Result {
 	// rocksdb does not allow max_log_files to be 0
-	if config.rocksdb_max_log_files == 0 {
+	if config.rocksdb.max_log_files == 0 {
 		return Err!(Config(
 			"max_log_files",
 			"rocksdb_max_log_files cannot be 0. Please set a value at least 1."
 		));
 	}
 
-	if config.rocksdb_allow_fallocate
+	if config.rocksdb.allow_fallocate
 		&& let Some(filesystem) = database_filesystem(config)
 	{
 		warn!(
@@ -288,43 +418,47 @@ fn database_filesystem(config: &Config) -> Option<Filesystem> {
 
 fn check_registration(config: &Config) -> Result {
 	if config
+		.authentication
 		.emergency_password
 		.as_ref()
 		.is_some_and(|emergency_password| emergency_password == "F670$2CP@Hw8mG7RY1$%!#Ic7YA")
 	{
 		return Err!(Config(
-			"emergency_password",
+			"authentication.emergency_password",
 			"The public example emergency password is being used, this is insecure. Please \
 			 change this."
 		));
 	}
 
 	if config
+		.authentication
 		.emergency_password
 		.as_ref()
 		.is_some_and(String::is_empty)
 	{
 		return Err!(Config(
-			"emergency_password",
+			"authentication.emergency_password",
 			"Emergency password was set to an empty string, this is not valid. Unset \
-			 emergency_password to disable it or set it to a real password."
+			 authentication.emergency_password to disable it or set it to a real password."
 		));
 	}
 
 	if config
-		.registration_token
+		.registration
+		.token
 		.as_ref()
 		.is_some_and(String::is_empty)
 	{
 		return Err!(Config(
-			"registration_token",
+			"registration.token",
 			"Registration token was specified but is empty (\"\")"
 		));
 	}
 
 	// check if we can read the token file path, and check if the file is empty
 	if config
-		.registration_token_file
+		.registration
+		.token_file
 		.as_ref()
 		.is_some_and(|path| {
 			let Ok(token) = read_to_string(path).inspect_err(|e| {
@@ -336,40 +470,51 @@ fn check_registration(config: &Config) -> Result {
 			token == String::new()
 		}) {
 		return Err!(Config(
-			"registration_token_file",
+			"registration.token_file",
 			"Registration token file was specified but is empty or failed to be read"
 		));
 	}
 
 	let no_token =
-		config.registration_token.is_none() && config.registration_token_file.is_none();
+		config.registration.token.is_none() && config.registration.token_file.is_none();
 
-	if config.allow_registration
+	let email_required =
+		config.smtp.connection_uri.is_some() && config.smtp.require_email_for_registration;
+
+	if config.registration.enable
 		&& no_token
-		&& !config.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse
+		&& !email_required
+		&& !config
+			.registration
+			.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse
 	{
 		return Err!(Config(
-			"registration_token",
-			"!! You have `allow_registration` enabled without a token configured in your config \
-			 which means you are allowing ANYONE to register on your tuwunel instance without \
-			 any 2nd-step (e.g. registration token). If this is not the intended behaviour, \
-			 please set a registration token. For security and safety reasons, tuwunel will \
-			 shut down. If you are extra sure this is the desired behaviour you want, please \
-			 set the following config option to true:
-`yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse`"
+			"registration.token",
+			"!! You have `registration.enable` enabled without a registration token or a \
+			 required email stage (`smtp.require_email_for_registration` with \
+			 `smtp.connection_uri`). This allows ANYONE to register without any 2nd-step. \
+			 Please set a registration token or require an email stage. For security and safety \
+			 reasons, tuwunel will shut down. If you are extra sure this is the desired \
+			 behaviour you want, please set the following config option to true:
+`registration.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse`"
 		));
 	}
 
-	if config.allow_registration
+	if config.registration.enable
 		&& no_token
-		&& config.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse
+		&& !email_required
+		&& config
+			.registration
+			.yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse
 	{
 		warn!(
 			"Open registration is enabled via setting \
-			 `yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse` and \
-			 `allow_registration` to true without a registration token configured. You are \
+			 `registration.\
+			 yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse` and \
+			 `registration.enable` to true without a registration token or a required email \
+			 stage (`smtp.require_email_for_registration` with `smtp.connection_uri`). You are \
 			 expected to be aware of the risks now. If this is not the desired behaviour, \
-			 please set a registration token."
+			 please set a registration token or require an email stage."
 		);
 	}
 
@@ -378,13 +523,7 @@ fn check_registration(config: &Config) -> Result {
 
 fn check_registration_terms(config: &Config) -> Result {
 	for (id, policy) in &config.registration_terms {
-		let opaque = !id.is_empty()
-			&& id.len() <= 255
-			&& id.bytes().all(
-				|b| matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'_' | b'~' | b'-'),
-			);
-
-		if !opaque {
+		if !is_opaque_id(id) {
 			return Err!(Config(
 				"registration_terms",
 				"Policy id {id:?} must be a non-empty opaque identifier of at most 255 \
@@ -409,63 +548,80 @@ fn check_password_hashing(config: &Config) -> Result {
 	let cost = config.password_hash_cost();
 
 	cost.check().map_err(|e| match e {
-		| Argon2Error::TimeTooSmall => err!(Config("argon2_t_cost", "{e}")),
+		| Argon2Error::TimeTooSmall => err!(Config("authentication.argon2.t_cost", "{e}")),
 		| Argon2Error::ThreadsTooFew | Argon2Error::ThreadsTooMany => {
-			err!(Config("argon2_p_cost", "{e}"))
+			err!(Config("authentication.argon2.p_cost", "{e}"))
 		},
 		| Argon2Error::MemoryTooLittle => err!(Config(
-			"argon2_m_cost",
-			"{e}; it needs at least eight blocks per lane of argon2_p_cost"
+			"authentication.argon2.m_cost",
+			"{e}; it needs at least eight blocks per lane of authentication.argon2.p_cost"
 		)),
-		| _ => err!(Config("argon2_m_cost", "{e}")),
+		| _ => err!(Config("authentication.argon2.m_cost", "{e}")),
 	})?;
 
 	if !cost.is_recommended() {
 		warn!(
 			?cost,
 			"The Argon2id cost is below the weakest OWASP recommendation, so new password \
-			 hashes are cheaper to crack than the default. See argon2_m_cost for the \
-			 recommended pairs."
+			 hashes are cheaper to crack than the default. See authentication.argon2.m_cost for \
+			 the recommended pairs."
 		);
 	}
 
 	Ok(())
 }
 
-fn check_turn_and_media_misc(config: &Config) -> Result {
-	// A blank secret resolves to none at all, so it is checked the same way here.
-	if !config.turn_uris.is_empty()
-		&& !is_secret_set(config.turn_secret_file.as_deref(), config.turn_secret.as_deref())
-		&& config.turn_username.is_empty()
-		&& config.turn_password.is_empty()
-	{
-		warn!(
-			"turn_uris is configured but no credential source is set; the endpoint \
-			 /_matrix/client/v3/voip/turnServer will return empty username and password. Set \
-			 turn_secret, turn_secret_file, or both turn_username and turn_password."
-		);
+fn check_jwt(config: &Config) -> Result {
+	let jwt = &config.jwt;
+
+	#[cfg(not(feature = "jwt_login"))]
+	if jwt.enable {
+		return Err!(Config(
+			"jwt.enable",
+			"tuwunel was not built with JWT login support (\"jwt_login\")"
+		));
 	}
 
-	if config.max_request_size < 10_000_000 {
+	// A server without JWT login has an empty key, and without [global.jwt] an empty format.
+	#[cfg(feature = "jwt_login")]
+	if jwt.enable {
+		jwt.key_format()?;
+		jwt.nonempty_key()?;
+	}
+
+	if jwt.enable && jwt.expire_access_token && config.authentication.access_token_ttl == 0 {
 		return Err!(Config(
-			"max_request_size",
+			"jwt.expire_access_token",
+			"Needs an authentication.access_token_ttl greater than zero."
+		));
+	}
+
+	Ok(())
+}
+
+fn check_turn_and_media_misc(config: &Config) -> Result {
+	check_turn(&config.turn)?;
+
+	if config.http.max_request_size < 10_000_000 {
+		return Err!(Config(
+			"http.max_request_size",
 			"Max request size is less than 10MB. Please increase it as this is too low for \
 			 operable federation."
 		));
 	}
 
-	if config.allow_outgoing_presence && !config.allow_local_presence {
+	if config.presence.allow_outgoing && !config.presence.allow_local {
 		return Err!(Config(
-			"allow_local_presence",
+			"presence.allow_local",
 			"Outgoing presence requires allowing local presence. Please enable \
-			 'allow_local_presence' or disable outgoing presence."
+			 'presence.allow_local' or disable outgoing presence."
 		));
 	}
 
-	if config.suppress_push_when_active {
+	if config.push.suppress_when_active {
 		warn!(
 			"Push suppression when active is enabled (EXPERIMENTAL): behavior may change or be \
-			 unstable. Disable by removing or setting suppress_push_when_active to false."
+			 unstable. Disable by removing or setting push.suppress_when_active to false."
 		);
 	}
 
@@ -473,18 +629,65 @@ fn check_turn_and_media_misc(config: &Config) -> Result {
 	check_video_thumbnails(config)
 }
 
-fn check_thumbnails(config: &Config) -> Result {
-	if config.media_thumbnail_max_pixels == 0 {
+fn check_turn(turn: &Turn) -> Result {
+	if turn.providers().count() > 1 {
 		return Err!(Config(
-			"media_thumbnail_max_pixels",
+			"turn.cloudflare.key_id",
+			"turn.endpoint.url is set as well; configure one TURN credential provider."
+		));
+	}
+
+	let provider = turn.provider();
+
+	if provider.is_some() && turn.ttl == 0 {
+		return Err!(Config(
+			"turn.ttl",
+			"Needs to be greater than zero while turn.endpoint or turn.cloudflare is set."
+		));
+	}
+
+	// A blank secret resolves to none at all, so it is checked the same way here.
+	let local = is_secret_set(turn.secret_file.as_deref(), turn.secret.as_deref())
+		|| !turn.username.is_empty()
+		|| !turn.password.is_empty();
+
+	if let Some(Provider::Cloudflare(cloudflare, _)) = provider
+		&& !is_secret_set(cloudflare.token_file.as_deref(), cloudflare.token.as_deref())
+	{
+		warn!(
+			"turn.cloudflare.key_id is set without turn.cloudflare.token or \
+			 turn.cloudflare.token_file; every request for TURN credentials will fail."
+		);
+	}
+
+	match provider {
+		| Some(_) if local || !turn.uris.is_empty() => warn!(
+			"turn.uris, the shared TURN secret and the static TURN credentials are ignored \
+			 while turn.endpoint or turn.cloudflare provides TURN credentials."
+		),
+		| None if !local && !turn.uris.is_empty() => warn!(
+			"turn.uris is configured but no credential source is set; the endpoint \
+			 /_matrix/client/v3/voip/turnServer will return empty username and password. Set \
+			 turn.secret, turn.secret_file, or both turn.username and turn.password."
+		),
+		| _ => {},
+	}
+
+	Ok(())
+}
+
+fn check_thumbnails(config: &Config) -> Result {
+	if config.media.thumbnail.max_pixels == 0 {
+		return Err!(Config(
+			"media.thumbnail.max_pixels",
 			"A pixel budget of zero refuses every picture; remove the setting to take the \
 			 default."
 		));
 	}
 
-	if unusable_concurrency(config.media_thumbnail_animated_concurrency) {
+	if unusable_concurrency(config.media.thumbnail.animated_concurrency) {
 		return Err!(Config(
-			"media_thumbnail_animated_concurrency",
+			"media.thumbnail.animated_concurrency",
 			"Animated thumbnail source jobs permitted at once must be between 1 and \
 			 {MAX_THUMBNAIL_CONCURRENCY}: zero leaves every source read waiting for a slot that \
 			 never frees, and the ceiling is far past any useful degree of parallelism."
@@ -495,18 +698,18 @@ fn check_thumbnails(config: &Config) -> Result {
 }
 
 fn check_video_thumbnails(config: &Config) -> Result {
-	if unusable_concurrency(config.media_video_thumbnail_concurrency) {
+	if unusable_concurrency(config.media.video_thumbnail.concurrency) {
 		return Err!(Config(
-			"media_video_thumbnail_concurrency",
+			"media.video_thumbnail.concurrency",
 			"Video thumbnail programs permitted at once must be between 1 and \
 			 {MAX_THUMBNAIL_CONCURRENCY}: zero leaves every extraction waiting for a slot that \
 			 never frees, and the ceiling is far past any useful degree of parallelism."
 		));
 	}
 
-	if config.media_video_thumbnail_timeout == 0 {
+	if config.media.video_thumbnail.timeout == 0 {
 		return Err!(Config(
-			"media_video_thumbnail_timeout",
+			"media.video_thumbnail.timeout",
 			"A video thumbnail deadline of zero expires before the program can start."
 		));
 	}
@@ -523,82 +726,131 @@ fn unusable_concurrency(slots: usize) -> bool {
 }
 
 fn check_url_previews(config: &Config) -> Result {
-	let wildcard = "*".to_owned();
 	let url_preview_wildcards = [
 		(
-			"url_preview_domain_contains_allowlist",
-			&config.url_preview_domain_contains_allowlist,
+			"media.url_preview.domain_contains_allowlist",
+			&config.media.url_preview.domain_contains_allowlist,
 		),
 		(
-			"url_preview_domain_explicit_allowlist",
-			&config.url_preview_domain_explicit_allowlist,
+			"media.url_preview.domain_explicit_allowlist",
+			&config.media.url_preview.domain_explicit_allowlist,
 		),
-		("url_preview_url_contains_allowlist", &config.url_preview_url_contains_allowlist),
+		(
+			"media.url_preview.url_contains_allowlist",
+			&config.media.url_preview.url_contains_allowlist,
+		),
 	];
 
-	for (name, list) in url_preview_wildcards {
-		if list.contains(&wildcard) {
+	url_preview_wildcards
+		.into_iter()
+		.filter(|&(_, list)| equals_any("*", list))
+		.for_each(|(name, _)| {
 			warn!(
-				"All URLs are allowed for URL previews via setting \"{name}\" to \"*\". This \
-				 opens up significant attack surface to your server. You are expected to be \
-				 aware of the risks by doing this."
+				setting = name,
+				"All URLs are allowed for URL previews by \"*\" in this setting. This opens up \
+				 significant attack surface to your server. You are expected to be aware of the \
+				 risks by doing this."
 			);
-		}
-	}
+		});
 
-	if let Some(Either::Right(_)) = config.url_preview_bound_interface.as_ref()
+	warn_domain_contains_entries(config);
+
+	if let Some(Either::Right(_)) = config.media.url_preview.bound_interface.as_ref()
 		&& !matches!(OS, "android" | "fuchsia" | "linux")
 	{
 		return Err!(Config(
-			"url_preview_bound_interface",
+			"media.url_preview.bound_interface",
 			"Not a valid IP address. Interface names not supported on {OS}."
 		));
 	}
 
-	if let Some(user_agent) = config.url_preview_user_agent.as_deref()
+	if let Some(user_agent) = config.media.url_preview.user_agent.as_deref()
 		&& HeaderValue::from_str(user_agent).is_err()
 	{
-		return Err!(Config("url_preview_user_agent", "Not a valid HTTP header value."));
+		return Err!(Config("media.url_preview.user_agent", "Not a valid HTTP header value."));
 	}
 
-	if let Some(user_agent) = config.url_preview_media_user_agent.as_deref()
+	if let Some(user_agent) = config
+		.media
+		.url_preview
+		.media_user_agent
+		.as_deref()
 		&& HeaderValue::from_str(user_agent).is_err()
 	{
-		return Err!(Config("url_preview_media_user_agent", "Not a valid HTTP header value."));
+		return Err!(Config(
+			"media.url_preview.media_user_agent",
+			"Not a valid HTTP header value."
+		));
 	}
 
-	if let Some(accept_language) = config.url_preview_accept_language.as_deref()
+	if let Some(accept_language) = config
+		.media
+		.url_preview
+		.accept_language
+		.as_deref()
 		&& HeaderValue::from_str(accept_language).is_err()
 	{
-		return Err!(Config("url_preview_accept_language", "Not a valid HTTP header value."));
+		return Err!(Config(
+			"media.url_preview.accept_language",
+			"Not a valid HTTP header value."
+		));
 	}
 
-	timepoint_from_now(Duration::from_secs(config.url_preview_cache_ttl)).map_err(|_| {
-		err!(Config(
-			"url_preview_cache_ttl",
-			"Value is too large to add to the current time."
-		))
-	})?;
+	timepoint_from_now(Duration::from_secs(config.media.url_preview.cache_ttl)).map_err(
+		|_| {
+			err!(Config(
+				"media.url_preview.cache_ttl",
+				"Value is too large to add to the current time."
+			))
+		},
+	)?;
 
 	Ok(())
 }
 
+/// Warns about `domain_contains_allowlist` entries that can never match.
+///
+/// An empty entry matches nothing, and an entry holding a `/` is never found
+/// in a host, which carries no scheme or path.
+fn warn_domain_contains_entries(config: &Config) {
+	let entries = &config.media.url_preview.domain_contains_allowlist;
+
+	if entries.iter().any(String::is_empty) {
+		warn!(
+			setting = "media.url_preview.domain_contains_allowlist",
+			"An empty entry matches nothing."
+		);
+	}
+
+	entries
+		.iter()
+		.filter(|entry| entry.contains('/'))
+		.for_each(|entry| {
+			warn!(
+				setting = "media.url_preview.domain_contains_allowlist",
+				?entry,
+				"Matched against the host alone, so this entry never matches."
+			);
+		});
+}
+
 fn check_room_version(config: &Config) -> Result {
-	if !config.supported_room_version(&config.default_room_version) {
+	if !config.supported_room_version(&config.rooms.default_version) {
 		return Err!(Config(
-			"default_room_version",
+			"rooms.default_version",
 			"Room version {:?} is not available",
-			config.default_room_version
+			config.rooms.default_version
 		));
 	}
 
 	if config
+		.rooms
 		.default_power_level_content_override
 		.as_ref()
 		.is_some_and(|value| !value.is_object())
 	{
 		return Err!(Config(
-			"default_power_level_content_override",
+			"rooms.default_power_level_content_override",
 			"must be a table (a JSON object)"
 		));
 	}
@@ -628,7 +880,10 @@ fn check_identity_providers(config: &Config) -> Result {
 		check_identity_provider_secret(i, provider)?;
 	}
 
-	if !config.sso_custom_providers_page
+	if !config
+		.authentication
+		.login
+		.sso_custom_providers_page
 		&& config.identity_provider.len() > 1
 		&& config
 			.identity_provider
@@ -652,6 +907,7 @@ fn check_identity_providers(config: &Config) -> Result {
 	}
 
 	let mas_active = config
+		.authentication
 		.mas_secret
 		.as_deref()
 		.is_some_and(|secret| !secret.is_empty());
@@ -663,11 +919,11 @@ fn check_identity_providers(config: &Config) -> Result {
 			.any(|provider| provider.brand == "mas")
 	{
 		warn!(
-			"mas_secret is set but no identity_provider is configured with `brand = MAS`. \
-			 Tuwunel is its own OpenID Connect issuer and does not delegate authentication to \
-			 MAS; the secret only authorizes MAS provisioning calls on `/_synapse/mas/`. \
-			 Logging in through MAS additionally requires an identity_provider entry with \
-			 `brand = MAS`."
+			"authentication.mas_secret is set but no identity_provider is configured with \
+			 `brand = MAS`. Tuwunel is its own OpenID Connect issuer and does not delegate \
+			 authentication to MAS; the secret only authorizes MAS provisioning calls on \
+			 `/_synapse/mas/`. Logging in through MAS additionally requires an \
+			 identity_provider entry with `brand = MAS`."
 		);
 	}
 
@@ -679,12 +935,12 @@ fn check_identity_providers(config: &Config) -> Result {
 			.for_each(|provider| {
 				warn!(
 					provider = provider.id(),
-					"`mas_secret` is set and this MAS identity provider is configured without \
-					 `trusted = true`. Existing accounts provisioned by MAS will not be matched \
-					 automatically during SSO login, so users may receive separate accounts. \
-					 Set `trusted = true` only when this identity provider is the same \
-					 self-hosted MAS instance that provisions this server and you fully control \
-					 it; otherwise associate users explicitly."
+					"`authentication.mas_secret` is set and this MAS identity provider is \
+					 configured without `trusted = true`. Existing accounts provisioned by MAS \
+					 will not be matched automatically during SSO login, so users may receive \
+					 separate accounts. Set `trusted = true` only when this identity provider \
+					 is the same self-hosted MAS instance that provisions this server and you \
+					 fully control it; otherwise associate users explicitly."
 				);
 			});
 	}
@@ -722,68 +978,124 @@ fn check_identity_provider_secret(i: &str, provider: &IdentityProvider) -> Resul
 }
 
 fn warn_oidc_client_approval(config: &Config) {
-	if !config.oidc_require_client_approval {
+	if !config.authentication.oidc.require_client_approval {
 		warn!(
-			"oidc_require_client_approval is disabled, so an authorization code is issued \
-			 without asking the user, whichever client requested it. Anyone who can reach \
-			 dynamic client registration can then register a client with a redirect target they \
-			 control and phish a sign-in link. Prefer listing the clients you serve in \
-			 oidc_registration_allowed_redirect_hosts, which waives the prompt for them alone."
+			"authentication.oidc.require_client_approval is disabled, so an authorization code \
+			 is issued without asking the user, whichever client requested it. Anyone who can \
+			 reach dynamic client registration can then register a client with a redirect \
+			 target they control and phish a sign-in link. Prefer listing the clients you serve \
+			 in authentication.oidc.registration_allowed_redirect_hosts, which waives the \
+			 prompt for them alone."
 		);
 	}
 }
 
 fn warn_oidc_registration_token(config: &Config) {
-	if !config.oidc_registration_access_token.is_empty() {
+	if !config
+		.authentication
+		.oidc
+		.registration_access_token
+		.is_empty()
+	{
 		warn!(
-			"oidc_registration_access_token is set, so dynamic client registration requires an \
-			 RFC 7591 initial access token. No Matrix client sends one, so next-gen auth login \
-			 will fail with `M_FORBIDDEN` for every ordinary client. Leave it empty unless \
-			 every OAuth client on this server is registered out of band."
+			"authentication.oidc.registration_access_token is set, so dynamic client \
+			 registration requires an RFC 7591 initial access token. No Matrix client sends \
+			 one, so next-gen auth login will fail with `M_FORBIDDEN` for every ordinary \
+			 client. Leave it empty unless every OAuth client on this server is registered out \
+			 of band."
+		);
+	}
+}
+
+fn warn_native_auth_without_sign_in(config: &Config) {
+	if config.authentication.oidc.native_auth
+		&& !config.authentication.login.with_password
+		&& config.identity_provider.is_empty()
+	{
+		warn!(
+			"authentication.oidc.native_auth is enabled, but authentication.login.with_password \
+			 is false and no identity_provider is configured, so the native login page offers \
+			 no way to sign in. Enable password login or configure an identity provider."
 		);
 	}
 }
 
 fn check_media_providers(config: &Config) -> Result {
-	for provider in &config.store_media_on_providers {
-		if !config.media_storage_providers.contains(provider) {
-			return Err!(Config(
-				"store_media_on_providers",
-				"Providers must be listed in 'media_storage_providers'"
-			));
-		}
+	if config
+		.media
+		.store_on_providers
+		.iter()
+		.any(|provider| !config.media.storage_providers.contains(provider))
+	{
+		return Err!(Config(
+			"media.store_on_providers",
+			"Providers must be listed in 'media.storage_providers'"
+		));
 	}
 
 	if config
-		.media_storage_providers
+		.media
+		.storage_providers
 		.iter()
 		.filter(|&provider| {
 			if config.storage_provider.contains_key(provider) || provider == "media" {
 				return false;
 			}
 
-			error!("`media_storage_providers` references non-existent provider {provider:?}");
+			error!(?provider, "`media.storage_providers` references non-existent provider");
 			true
 		})
 		.count()
 		.gt(&0)
 	{
 		return Err!(Config(
-			"media_storage_providers",
+			"media.storage_providers",
 			"Contains missing or unconfigured storage providers."
 		));
 	}
 
-	if config.media_storage_providers.len() > 1 && config.store_media_on_providers.is_empty() {
+	if !has_upload_provider(config) {
+		config
+			.storage_provider_sections()
+			.filter(|(name, _)| config.media.writes_to(name))
+			.for_each(|(provider, _)| {
+				error!(?provider, "Storage provider for uploads is disabled");
+			});
+
+		return if config.media.store_on_providers.is_empty() {
+			Err!(Config(
+				"media.storage_providers",
+				"No enabled storage provider is left to receive uploads."
+			))
+		} else {
+			Err!(Config(
+				"media.store_on_providers",
+				"No enabled storage provider is left to receive uploads."
+			))
+		};
+	}
+
+	if config.media.storage_providers.len() > 1 && config.media.store_on_providers.is_empty() {
 		warn!(
-			"Media will be duplicated to multiple providers {:?} until \
-			 `store_media_on_providers` is configured. This warning can be suppressed by \
-			 explicitly configuring `store_media_on_providers`",
-			config.media_storage_providers
+			providers = ?config.media.storage_providers,
+			"Media will be duplicated to multiple providers until \
+			 `media.store_on_providers` is configured. This warning can be suppressed by \
+			 explicitly configuring `media.store_on_providers`"
 		);
 	}
 
 	Ok(())
+}
+
+/// Reports whether any provider the storage service builds receives uploads.
+///
+/// The service skips a disabled section, and the media lists narrow the rest
+/// to the upload targets.
+fn has_upload_provider(config: &Config) -> bool {
+	config
+		.storage_provider_sections()
+		.filter(|(_, provider)| provider.is_enabled())
+		.any(|(name, _)| config.media.writes_to(name))
 }
 
 fn check_well_known_support_contact_validity(config: &Config) -> Result {
@@ -898,21 +1210,27 @@ fn warn_deprecated(config: &Config) {
 /// anchored depends on what the operator meant it to match, and a substring
 /// match is sometimes the intent.
 fn warn_literal_patterns(config: &Config) {
+	let allowed = &config
+		.federation
+		.allowed_remote_server_names_experimental;
+
+	let directory_servers = &config
+		.directory
+		.rooms
+		.forbidden_remote_server_names;
+
 	let options = [
-		("dns_passthru_domains", &config.dns_passthru_domains),
+		("network.dns.passthru_domains", &config.network.dns.passthru_domains),
+		("federation.allowed_remote_server_names_experimental", allowed),
+		("media.prevent_downloads_from", &config.media.prevent_downloads_from),
 		(
-			"allowed_remote_server_names_experimental",
-			&config.allowed_remote_server_names_experimental,
+			"federation.forbidden_remote_server_names",
+			&config.federation.forbidden_remote_server_names,
 		),
-		("prevent_media_downloads_from", &config.prevent_media_downloads_from),
-		("forbidden_remote_server_names", &config.forbidden_remote_server_names),
-		(
-			"forbidden_remote_room_directory_server_names",
-			&config.forbidden_remote_room_directory_server_names,
-		),
-		("forbidden_alias_names", &config.forbidden_alias_names),
-		("forbidden_usernames", &config.forbidden_usernames),
-		("deprioritize_joins_through_servers", &config.deprioritize_joins_through_servers),
+		("directory.rooms.forbidden_remote_server_names", directory_servers),
+		("rooms.forbidden_alias_names", &config.rooms.forbidden_alias_names),
+		("registration.forbidden_usernames", &config.registration.forbidden_usernames),
+		("rooms.joins.deprioritize_servers", &config.rooms.joins.deprioritize_servers),
 	];
 
 	options
@@ -967,7 +1285,7 @@ fn warn_unknown_key(config: &Config) -> Result {
 		.keys()
 		.filter(|key| !known_keys.is_match(key))
 		.inspect(|key| {
-			if config.error_on_unknown_config_opts {
+			if config.configuration.error_on_unknown_opts {
 				error!("Config parameter \"{key}\" is unknown to tuwunel");
 			} else {
 				warn!("Config parameter \"{key}\" is unknown to tuwunel, ignoring.");
@@ -975,7 +1293,7 @@ fn warn_unknown_key(config: &Config) -> Result {
 		})
 		.collect_vec();
 
-	if !unknown_keys.is_empty() && config.error_on_unknown_config_opts {
+	if !unknown_keys.is_empty() && config.configuration.error_on_unknown_opts {
 		Err!("Unknown config options were found: {unknown_keys:?}")
 	} else {
 		Ok(())

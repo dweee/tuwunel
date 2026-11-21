@@ -20,9 +20,9 @@ fn signatures_are_canonical_and_foreign_updates_are_private() -> Result {
 
 	let args = Args::default_test(&["fresh", "cleanup"])
 		.with_database_path(&database)
-		.with_option("allow_local_presence=false")
-		.with_option("allow_outgoing_presence=false")
-		.with_option("device_key_update_encrypted_rooms_only=false");
+		.with_option("presence.allow_local=false")
+		.with_option("presence.allow_outgoing=false")
+		.with_option("encryption.device_key_update_encrypted_rooms_only=false");
 
 	let args = Args { maintenance: true, ..args };
 
@@ -75,13 +75,13 @@ async fn exercise(services: &Services) -> Result {
 
 	assert_changes(services, &sender, before, &[&target]).await?;
 	assert_changes(services, &target, before, &[]).await?;
-	assert!(
-		services
-			.users
-			.room_keys_changed(room, before, None)
-			.count()
-			.await == 0
-	);
+	let changed = services
+		.users
+		.room_keys_changed(room, before, None)
+		.count()
+		.await;
+
+	assert_eq!(changed, 0);
 
 	let other = Fixture::new(&sender, &target)?.with_target(&fixture)?;
 

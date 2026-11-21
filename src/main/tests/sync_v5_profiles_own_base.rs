@@ -21,6 +21,8 @@ use self::client::{Client, field, register, wait_until_ready};
 )]
 mod client;
 
+mod sliding_sync;
+
 const TOKEN: &str = "sync-v5-profiles-own-base-test-access-token";
 
 const STATUS: &str = "org.matrix.msc4426.status";
@@ -67,12 +69,11 @@ fn seeds_the_whole_own_profile() -> Result {
 	let port = listener.local_addr()?.port();
 
 	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_loopback_listener(port)
 		.with_option("listening=true")
 		// A presence ping would advance the count between the late rounds.
-		.with_option("allow_local_presence=false")
-		.with_option("allow_outgoing_presence=false");
+		.with_option("presence.allow_local=false")
+		.with_option("presence.allow_outgoing=false");
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -269,28 +270,7 @@ async fn sync_profiles(
 		},
 	});
 
-	let query = pos
-		.map(|pos| format!("?pos={pos}&timeout={POLL_TIMEOUT}"))
-		.unwrap_or_default();
-
-	let url = format!(
-		"{}/_matrix/client/unstable/org.matrix.simplified_msc3575/sync{query}",
-		self.base
-	);
-
-	self.services
-		.client
-		.clients
-		.default
-		.post(url)
-		.bearer_auth(self.token)
-		.json(&body)
-		.send()
-		.await?
-		.error_for_status()?
-		.json()
-		.await
-		.map_err(Into::into)
+	self.sliding_sync(pos, POLL_TIMEOUT, &body).await
 }
 
 /// Checks that a round carried the whole own profile, the status included.

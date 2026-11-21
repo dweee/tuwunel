@@ -1,9 +1,9 @@
 use ruma::{EventId, OwnedEventId, OwnedRoomOrAliasId};
 use tuwunel_core::{
 	Result, debug_warn,
-	matrix::Event,
 	utils::{ReadyExt, stream::BroadbandExt},
 };
+use tuwunel_matrix::Event;
 use tuwunel_service::Services;
 
 use crate::admin_command;
@@ -69,7 +69,7 @@ async fn clear_event(services: &Services, event_id: &EventId) -> ClearSummary {
 
 	services
 		.event_handler
-		.clear_upgrade_backoff(event_id)
+		.clear_delivery_backoff(event_id)
 		.await;
 
 	services

@@ -13,9 +13,23 @@ use tuwunel_core::{
 };
 use tuwunel_service::Services;
 
-use self::client::{Client, field, register, wait_until_ready};
+use self::{
+	client::{Client, field, register, wait_until_ready},
+	lists::{expect_count, list},
+};
 
 mod client;
+mod sliding_sync;
+
+#[path = "sliding_sync/lists.rs"]
+mod lists;
+
+#[expect(dead_code)] // Only the self-membership action is used from the add-on.
+#[path = "client/membership.rs"]
+mod membership;
+
+#[path = "client/put.rs"]
+mod put;
 
 const ALICE_TOKEN: &str = "sync-v5-list-filters-alice-access-token";
 const BOB_TOKEN: &str = "sync-v5-list-filters-bob-access-token";
@@ -51,14 +65,11 @@ fn list_filters_partition_rooms_by_dm_and_tag() -> Result {
 
 	let db_path = Args::test_database_path("sync-v5-filters");
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	let mut args = Args::default_test(&["fresh", "cleanup"])
+		.with_database_path(&db_path)
+		.with_loopback_listener(port);
 
-	args.option.extend([
-		format!("database_path={db_path:?}"),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
-		"listening=true".to_owned(),
-	]);
+	args.option.extend(["listening=true".to_owned()]);
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -114,8 +125,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 	let direct = alice.create_room(&direct_body).await?;
 	let plain = alice.create_room(&plain_body).await?;
 
-	bob.join(&direct).await?;
-	bob.join(&plain).await?;
+	bob.act(&direct, "join").await?;
+	bob.act(&plain, "join").await?;
 
 	// The join erases the invite's `is_direct`, so account data is all that is
 	// left.
@@ -177,30 +188,10 @@ async fn woken_poll_sees_the_change(
 	};
 
 	let (polled, flipped) = join(polling, flipping).await;
+
 	flipped?;
 
-	let count = list_count(&polled?, "directs");
-
-	count
-		.eq(&2)
-		.into_option()
-		.ok_or_else(|| err!("the woken poll reported {count} direct rooms rather than two"))
-}
-
-#[implement(Client, params = "<'_>")]
-async fn join(&self, room_id: &RoomId) -> Result {
-	self.services
-		.client
-		.clients
-		.default
-		.post(self.url(&format!("rooms/{room_id}/join")))
-		.bearer_auth(self.token)
-		.json(&json!({}))
-		.send()
-		.await?
-		.error_for_status()?;
-
-	Ok(())
+	expect_count(&polled?, "directs", 2, "the woken poll")
 }
 
 /// Record the room as a direct chat with `counterparty`.
@@ -216,16 +207,8 @@ async fn mark_direct(
 ) -> Result {
 	let path = format!("user/{user_id}/account_data/m.direct");
 
-	self.services
-		.client
-		.clients
-		.default
-		.put(self.url(&path))
-		.bearer_auth(self.token)
-		.json(&json!({ counterparty: rooms }))
-		.send()
-		.await?
-		.error_for_status()?;
+	self.put(&path, &json!({ counterparty: rooms }))
+		.await?;
 
 	Ok(())
 }
@@ -234,16 +217,7 @@ async fn mark_direct(
 async fn tag_room(&self, user_id: &UserId, room_id: &RoomId, tag: &str) -> Result {
 	let path = format!("user/{user_id}/rooms/{room_id}/tags/{tag}");
 
-	self.services
-		.client
-		.clients
-		.default
-		.put(self.url(&path))
-		.bearer_auth(self.token)
-		.json(&json!({}))
-		.send()
-		.await?
-		.error_for_status()?;
+	self.put(&path, &json!({})).await?;
 
 	Ok(())
 }
@@ -255,15 +229,6 @@ async fn tag_room(&self, user_id: &UserId, room_id: &RoomId, tag: &str) -> Resul
 /// the proposal resolves in favour of `not_tags`.
 #[implement(Client, params = "<'_>")]
 async fn sync_lists(&self, since: Option<&str>) -> Result<Value> {
-	let list = |filters: Value| {
-		json!({
-			"ranges": [[0, 99]],
-			"required_state": [],
-			"timeline_limit": 0,
-			"filters": filters,
-		})
-	};
-
 	let priority = json!({
 		"tags": [FAVOURITE, LOW_PRIORITY],
 		"not_tags": [LOW_PRIORITY],
@@ -271,50 +236,16 @@ async fn sync_lists(&self, since: Option<&str>) -> Result<Value> {
 
 	let body = json!({
 		"lists": {
-			"directs": list(json!({ "is_dm": true })),
-			"others": list(json!({ "is_dm": false })),
-			"favourites": list(json!({ "tags": [FAVOURITE] })),
-			"untagged": list(json!({ "not_tags": [FAVOURITE] })),
-			"priority": list(priority),
+			"directs": list(&json!({ "is_dm": true })),
+			"others": list(&json!({ "is_dm": false })),
+			"favourites": list(&json!({ "tags": [FAVOURITE] })),
+			"untagged": list(&json!({ "not_tags": [FAVOURITE] })),
+			"priority": list(&priority),
 		},
 	});
 
-	let query =
-		since.map_or_else(String::new, |since| format!("?pos={since}&timeout={POLL_TIMEOUT}"));
-
-	let url = format!(
-		"{}/_matrix/client/unstable/org.matrix.simplified_msc3575/sync{query}",
-		self.base
-	);
-
-	let response: Value = self
-		.services
-		.client
-		.clients
-		.default
-		.post(url)
-		.bearer_auth(self.token)
-		.json(&body)
-		.send()
-		.await?
-		.error_for_status()?
-		.json()
-		.await?;
-
-	Ok(response)
-}
-
-/// The number of rooms a list reported matching.
-///
-/// The count is recomputed on every pass from the rooms the filters admitted,
-/// so it moves with `m.direct` even on a pass that re-sends no room payload.
-fn list_count(response: &Value, list: &str) -> u64 {
-	response
-		.get("lists")
-		.and_then(|lists| lists.get(list))
-		.and_then(|list| list.get("count"))
-		.and_then(Value::as_u64)
-		.unwrap_or_default()
+	self.sliding_sync(since, POLL_TIMEOUT, &body)
+		.await
 }
 
 /// The lists the room came back naming.

@@ -2,7 +2,6 @@
 
 use std::{
 	fs,
-	net::{IpAddr, Ipv4Addr, SocketAddr},
 	os::unix::{self, fs::PermissionsExt, net::UnixListener},
 	path::Path,
 };
@@ -10,7 +9,7 @@ use std::{
 use axum::{Extension, Router, extract::ConnectInfo};
 use axum_server::Handle;
 use futures::{FutureExt, future::BoxFuture};
-use tuwunel_core::{Result, err, warn};
+use tuwunel_core::{Result, config::UNIX_SOCKET_PEER, err, warn};
 
 #[tracing::instrument(skip_all, level = "debug")]
 pub(super) async fn serve<'a>(
@@ -20,10 +19,9 @@ pub(super) async fn serve<'a>(
 	path: Option<&Path>,
 	socket_perms: u32,
 ) -> Result<Vec<BoxFuture<'a, Result<(), std::io::Error>>>> {
-	// Loopback so a unix-socket peer bypasses a configured `ip_source`.
 	let router = router
 		.clone()
-		.layer(Extension(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))))
+		.layer(Extension(ConnectInfo(UNIX_SOCKET_PEER)))
 		.into_make_service();
 
 	let mut acceptors = listeners
@@ -31,7 +29,7 @@ pub(super) async fn serve<'a>(
 			Ok(axum_server::from_unix(listener)?
 				.handle(handle.clone())
 				.serve(router.clone())
-				.boxed())
+				.boxed()) // heterogeneous Vec<BoxFuture>
 		})
 		.collect::<Result<Vec<_>>>()?;
 
@@ -40,14 +38,17 @@ pub(super) async fn serve<'a>(
 			warn!("Removing existing UNIX socket {path:?} (unclean shutdown?)...");
 			fs::remove_file(path).map_err(|e| {
 				err!(Config(
-					"unix_socket_path",
+					"http.listen.unix_socket_path",
 					"Failed to remove stale UNIX socket at {path:?}: {e}",
 				))
 			})?;
 		}
 
 		let unix_listener = UnixListener::bind(path).map_err(|e| {
-			err!(Config("unix_socket_path", "Failed to bind UNIX socket at {path:?}: {e}",))
+			err!(Config(
+				"http.listen.unix_socket_path",
+				"Failed to bind UNIX socket at {path:?}: {e}",
+			))
 		})?;
 
 		unix_listener.set_nonblocking(true)?;
@@ -55,7 +56,7 @@ pub(super) async fn serve<'a>(
 		let perms = fs::Permissions::from_mode(socket_perms);
 		fs::set_permissions(path, perms).map_err(|e| {
 			err!(Config(
-				"unix_socket_path",
+				"http.listen.unix_socket_path",
 				"Failed to set permissions {socket_perms:o} on UNIX socket at {path:?}: {e}",
 			))
 		})?;
@@ -71,7 +72,7 @@ pub(super) async fn serve<'a>(
 					}
 				}
 			})
-			.boxed();
+			.boxed(); // heterogeneous Vec<BoxFuture>
 
 		acceptors.push(bound_acceptor);
 	}

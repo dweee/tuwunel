@@ -1,13 +1,12 @@
 use ruma::{CanonicalJsonObject, events::AnySyncMessageLikeEvent, serde::Raw};
 use serde_json::json;
-use tuwunel_core::{
-	matrix::pdu::{PduCount, PduId, RawPduId},
-	utils::u64_from_u8,
-};
+use tuwunel_core::utils::u64_from_u8;
+use tuwunel_matrix::pdu::{PduCount, PduId, RawPduId};
 
-use super::update_thread_bundle_raw;
+use super::summary::update_thread_bundle_raw;
 
 mod append;
+mod redact;
 
 #[test]
 fn backfilled_activity_key_sorts_before_normal() {

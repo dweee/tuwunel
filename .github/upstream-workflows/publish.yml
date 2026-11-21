@@ -61,6 +61,9 @@ on:
         type: string
         description: For pages deployment
 
+permissions:
+  contents: read
+
 jobs:
   documents:
     if: >
@@ -69,11 +72,11 @@ jobs:
       && !contains(github.ref, '-draft')
 
     name: Documents
-    runs-on: ['X64', 'het']
+    runs-on: ['X64', 'pages-publisher']
     permissions:
       contents: read
-      id-token: write
-      pages: write
+      id-token: write # deploy-pages OIDC
+      pages: write # deploy-pages
 
     environment:
       name: github-pages
@@ -82,28 +85,28 @@ jobs:
     steps:
       - id: book
         name: Fetch Book
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-all-x86_64-v1-linux-gnu-book
+          name: release-default-x86_64-v1-linux-gnu-book
           path: pages
 
       - id: docs
         name: Fetch Docs
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-all-x86_64-v1-linux-gnu-docs
+          name: release-default-x86_64-v1-linux-gnu-docs
           path: pages/book
 
       - id: store
         name: Store Pages
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: pages/book
           name: github-pages-${{github.run_attempt}}
 
       - id: deploy
         name: Deploy Pages
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
         with:
           artifact_name: github-pages-${{github.run_attempt}}
 
@@ -115,8 +118,7 @@ jobs:
       && (github.ref == 'refs/heads/main' || contains(github.ref, 'refs/tags/v'))
 
     name: Containers
-    runs-on: ${{matrix.machine}}
-    permissions: write-all
+    runs-on: ["${{matrix.machine}}", "publisher"]
     strategy:
       fail-fast: true
       matrix:
@@ -133,7 +135,7 @@ jobs:
         include: ${{fromJSON(inputs.includes)}}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{inputs.checkout || github.sha}}
           fetch-depth: 1
@@ -141,14 +143,14 @@ jobs:
           persist-credentials: false
 
       - name: GitHub Login
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.ghcr_token }}
 
       - name: DockerHub Login
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: docker.io
           username: ${{ inputs.docker_acct }}
@@ -179,21 +181,20 @@ jobs:
       && inputs.machines
       && inputs.docker_repo != ''
       && contains(fromJSON(inputs.cargo_profiles), fromJSON('["release"]')[0])
-      && contains(fromJSON(inputs.feat_sets), fromJSON('["all"]')[0])
-      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["stable"]')[0])
+      && contains(fromJSON(inputs.feat_sets), fromJSON('["default"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["msrv"]')[0])
       && (github.ref == 'refs/heads/main' || contains(github.ref, 'refs/tags/v'))
 
     name: Bundles
     needs: [containers]
-    runs-on: 'het'
-    permissions: write-all
+    runs-on: 'bundle-publisher'
     strategy:
       fail-fast: true
       matrix:
         bake_target: ${{fromJSON('["docker_io", "ghcr_io"]')}}
         cargo_profile: ${{fromJSON('["release"]')}}
-        feat_set: ${{fromJSON('["all"]')}}
-        rust_toolchain: ${{fromJSON('["stable"]')}}
+        feat_set: ${{fromJSON('["default"]')}}
+        rust_toolchain: ${{fromJSON('["msrv"]')}}
         sys_name: ${{fromJSON(inputs.sys_names)}}
         sys_version: ${{fromJSON(inputs.sys_versions)}}
         rust_target: ${{fromJSON(inputs.rust_targets)}}
@@ -204,14 +205,14 @@ jobs:
 
     steps:
       - name: GitHub Login
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.ghcr_token }}
 
       - name: DockerHub Login
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: docker.io
           username: ${{ inputs.docker_acct }}
@@ -309,7 +310,7 @@ jobs:
       && !contains(github.ref, '-rc')
 
     name: Apt Repository
-    runs-on: 'het'
+    runs-on: 'apt-publisher'
     timeout-minutes: 10
     steps:
       - name: Publish Release
@@ -344,18 +345,17 @@ jobs:
 
     name: Delivery
     needs: [bundles, documents, apt]
-    runs-on: 'het'
-    permissions: write-all
+    runs-on: 'bundle-publisher'
     steps:
       - name: GitHub Login
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.ghcr_token }}
 
       - name: DockerHub Login
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: docker.io
           username: ${{ inputs.docker_acct }}

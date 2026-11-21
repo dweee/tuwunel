@@ -1,5 +1,5 @@
 use axum::extract::State;
-use futures::{FutureExt, join};
+use futures::join;
 use ruma::{
 	api::client::membership::invite_user::{
 		self,
@@ -10,7 +10,7 @@ use ruma::{
 use tuwunel_core::{Err, Result};
 
 use super::banned_room_check;
-use crate::{ClientIp, Ruma, client::utils::invite_check};
+use crate::{ClientIp, Ruma, utils::invite_check};
 
 /// # `POST /_matrix/client/r0/rooms/{roomId}/invite`
 ///
@@ -59,7 +59,6 @@ pub(crate) async fn invite_user_route(
 	services
 		.membership
 		.invite(sender_user, user_id, room_id, reason.as_ref(), false)
-		.boxed()
 		.await?;
 
 	Ok(invite_user::v3::Response {})

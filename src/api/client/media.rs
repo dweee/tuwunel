@@ -36,7 +36,7 @@ pub(crate) async fn get_media_config_route(
 	_body: Ruma<get_media_config::v1::Request>,
 ) -> Result<get_media_config::v1::Response> {
 	Ok(get_media_config::v1::Response {
-		upload_size: ruma_from_usize(services.server.config.max_request_size),
+		upload_size: ruma_from_usize(services.server.config.http.max_request_size),
 	})
 }
 
@@ -58,6 +58,8 @@ pub(crate) async fn create_content_route(
 	body: Ruma<create_content::v3::Request>,
 ) -> Result<create_content::v3::Response> {
 	let user = body.sender_user();
+
+	services.media.check_upload_space().await?;
 
 	let filename = body.filename.as_deref();
 	let content_type = body.content_type.as_deref();
@@ -104,9 +106,11 @@ pub(crate) async fn create_mxc_uri_route(
 		services
 			.server
 			.config
-			.media_create_unused_expiration_time
+			.media
+			.create_unused_expiration_time
 			.saturating_mul(1000),
 	);
+
 	services
 		.media
 		.create_pending(&mxc, user, unused_expires_at)
@@ -133,6 +137,9 @@ pub(crate) async fn create_content_async_route(
 	body: Ruma<create_content_async::v3::Request>,
 ) -> Result<create_content_async::v3::Response> {
 	let user = body.sender_user();
+
+	services.media.check_upload_space().await?;
+
 	let mxc = Mxc {
 		server_name: &body.server_name,
 		media_id: &body.media_id,

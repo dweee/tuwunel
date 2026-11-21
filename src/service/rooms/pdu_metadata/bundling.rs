@@ -3,10 +3,8 @@ use std::collections::BTreeSet;
 use futures::{Stream, StreamExt, TryFutureExt, pin_mut};
 use ruma::{OwnedUserId, UserId, api::Direction, events::room::encrypted::Relation};
 use tuwunel_core::{
-	PduId,
 	arrayvec::ArrayVec,
 	implement,
-	matrix::{Event, Pdu, PduCount, RawPduId},
 	result::LogErr,
 	utils::{
 		BoolExt,
@@ -14,6 +12,7 @@ use tuwunel_core::{
 		u64_from_u8,
 	},
 };
+use tuwunel_matrix::{Event, Pdu, PduCount, PduId, RawPduId};
 
 use super::{
 	ExtractRelatesTo, IgnoredThreadView,
@@ -48,58 +47,29 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> P
 		return pruned;
 	}
 
-	let has_thread = pdu.has_thread_bundle().log_err().unwrap_or(true);
-
-	if has_thread {
-		if pdu
-			.remove_thread_latest_transaction_id_unless_sender(sender_user)
-			.log_err()
-			.is_err()
-		{
-			drop_thread_bundle(&mut pdu);
-		} else {
-			let participated = self
-				.services
-				.threads
-				.user_participated(pdu.event_id(), sender_user)
-				.await;
-
-			let participation = pdu
-				.set_thread_participated(participated)
-				.log_err();
-
-			if thread_result_or_drop(&mut pdu, participation).is_some() {
-				self.erase_thread_latest(sender_user, &mut pdu)
-					.await;
-
-				if self.services.server.config.bundle_edit_relations {
-					self.bundle_thread_latest_edit(sender_user, &mut pdu)
-						.await;
-				}
-			}
-		}
-	}
+	self.bundle_thread_for(sender_user, &mut pdu)
+		.await;
 
 	let replacement = self
 		.services
 		.server
 		.config
-		.bundle_edit_relations
+		.rooms
+		.relations
+		.bundle_edits
 		.then_async(|| self.newest_replacement(&pdu))
 		.await
 		.flatten();
 
-	if let Some(mut replacement) = replacement
+	if let Some(replacement) = replacement
 		&& !self
 			.services
 			.state_accessor
 			.erased_for(sender_user, &replacement)
 			.await
-		&& replacement
-			.remove_transaction_id_unless_sender(Some(sender_user))
-			.log_err()
-			.is_ok()
 	{
+		let replacement = replacement.without_private_unless_sender(Some(sender_user));
+
 		pdu.set_replacement_bundle(&replacement.into_format())
 			.log_err()
 			.ok();
@@ -109,7 +79,9 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> P
 		.services
 		.server
 		.config
-		.bundle_reference_relations
+		.rooms
+		.relations
+		.bundle_references
 		.then_async(|| self.references(&pdu))
 		.await
 		.unwrap_or_default();
@@ -121,6 +93,60 @@ pub async fn bundle_aggregations(&self, sender_user: &UserId, mut pdu: Pdu) -> P
 	}
 
 	pdu
+}
+
+#[implement(Service)]
+#[tracing::instrument(skip_all, level = "trace")]
+async fn bundle_thread_for(&self, sender_user: &UserId, pdu: &mut Pdu) {
+	if pdu
+		.has_thread_bundle()
+		.log_err()
+		.unwrap_or(true)
+		.is_false()
+	{
+		return;
+	}
+
+	if pdu
+		.thread_latest_event()
+		.log_err()
+		.ok()
+		.flatten()
+		.is_none()
+		|| pdu
+			.remove_thread_latest_transaction_id_unless_sender(sender_user)
+			.log_err()
+			.is_err()
+	{
+		drop_thread_bundle(pdu);
+		return;
+	}
+
+	let participated = self
+		.services
+		.threads
+		.user_participated(pdu.event_id(), sender_user)
+		.await;
+
+	let participation = pdu
+		.set_thread_participated(participated)
+		.log_err();
+
+	if thread_result_or_drop(pdu, participation).is_none() {
+		return;
+	}
+
+	self.erase_thread_latest(sender_user, pdu).await;
+
+	let _: Option<()> = self
+		.services
+		.server
+		.config
+		.rooms
+		.relations
+		.bundle_edits
+		.then_async(|| self.bundle_thread_latest_edit(sender_user, pdu))
+		.await;
 }
 
 /// MSC4025: the stored thread bundle carries a full `latest_event` of any
@@ -216,14 +242,8 @@ async fn bundle_thread_latest_edit(&self, sender_user: &UserId, pdu: &mut Pdu) {
 		return;
 	}
 
-	let sanitized = replacement_event
-		.remove_transaction_id_unless_sender(Some(sender_user))
-		.and_then(|()| latest_event.remove_transaction_id_unless_sender(Some(sender_user)))
-		.log_err();
-
-	if thread_result_or_drop(pdu, sanitized).is_none() {
-		return;
-	}
+	replacement_event.remove_private_unless_sender(Some(sender_user));
+	latest_event.remove_private_unless_sender(Some(sender_user));
 
 	let replacement = latest_event
 		.set_replacement_bundle(&replacement_event.into_format())

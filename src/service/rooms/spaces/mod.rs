@@ -8,7 +8,7 @@ mod tests;
 use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, pin_mut};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
 use ruma::{
 	OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
 	api::{
@@ -23,13 +23,14 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Err, Event, Result, implement,
+	Err, Result, implement,
 	utils::{
 		future::{BoolExt, TryExtExt},
 		stream::{BroadbandExt, IterStream, ReadyExt, TryReadyExt},
 	},
 };
 use tuwunel_database::Map;
+use tuwunel_matrix::Event;
 
 use self::cache::Cached;
 pub use self::pagination_token::PaginationToken;
@@ -108,7 +109,7 @@ pub async fn get_summary_and_children(
 
 			| _ =>
 				self.get_summary_and_children_federation(room_id, sender, via)
-					.boxed()
+					.boxed() // cold arm
 					.await,
 		})
 		.await
@@ -204,7 +205,6 @@ async fn is_accessible_child(
 			.state_cache
 			.is_invited(user_id, current_room);
 
-		pin_mut!(is_joined, is_invited);
 		if is_joined.or(is_invited).await {
 			return true;
 		}

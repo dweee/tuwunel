@@ -49,12 +49,11 @@ fn serves_filtered_profile_updates() -> Result {
 	let port = listener.local_addr()?.port();
 
 	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_loopback_listener(port)
 		.with_option("listening=true")
 		// A presence ping would fill a round this test expects to find empty.
-		.with_option("allow_local_presence=false")
-		.with_option("allow_outgoing_presence=false");
+		.with_option("presence.allow_local=false")
+		.with_option("presence.allow_outgoing=false");
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -181,7 +180,54 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	read_failures(&owner, &peer_id, room_id.as_str()).await?;
 	membership_failures(&owner, &owner_id, &peer_id, room_id.as_str()).await?;
-	departed_profile(&owner, &peer, &peer_id, room_id.as_str()).await
+	departed_profile(&owner, &peer, &peer_id, room_id.as_str()).await?;
+	selector_limits(&owner, &owner_id).await
+}
+
+#[tracing::instrument(level = "trace", skip_all)]
+async fn selector_limits(owner: &Client<'_>, owner_id: &UserId) -> Result {
+	owner.sync(Some(&[STATUS; 64]), None).await?;
+
+	for ids in [json!(vec![STATUS; 65]), json!(["a".repeat(256)])] {
+		let filter = json!({ PROFILE_FIELDS: { "ids": ids } });
+		let inline = owner
+			.sync_response(Some(&filter.to_string()), None)
+			.await?;
+
+		assert_eq!(inline.status(), StatusCode::BAD_REQUEST);
+
+		let upload = owner
+			.post_url(&owner.url(&format!("user/{owner_id}/filter")), &filter)
+			.await?;
+
+		assert_eq!(upload.status(), StatusCode::BAD_REQUEST);
+	}
+
+	let filter = json!({ PROFILE_FIELDS: { "ids": [STATUS, "displayname", STATUS] } });
+	let stored = owner
+		.post(&format!("user/{owner_id}/filter"), &filter)
+		.await?;
+
+	let filter_id = field(&stored, "filter_id")?;
+	let retained = owner
+		.services
+		.users
+		.get_filter(owner_id, filter_id)
+		.await?;
+
+	assert_eq!(retained.profile_fields.ids, [
+		ProfileFieldName::DisplayName,
+		ProfileFieldName::from(STATUS)
+	]);
+
+	let response = owner.sync_json(Some(filter_id), None).await?;
+	let inline = owner
+		.sync(Some(&[STATUS, "displayname"]), None)
+		.await?;
+
+	assert_eq!(response.get(USERS), inline.get(USERS));
+
+	Ok(())
 }
 
 #[tracing::instrument(level = "trace", skip_all)]

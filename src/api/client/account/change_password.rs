@@ -1,5 +1,4 @@
 use axum::extract::State;
-use futures::StreamExt;
 use ruma::{
 	OwnedUserId,
 	api::client::{
@@ -8,7 +7,7 @@ use ruma::{
 	},
 	thirdparty::Medium,
 };
-use tuwunel_core::{Err, Error, Result, info, utils::ReadyExt};
+use tuwunel_core::{Err, Error, Result, info};
 
 use crate::{ClientIp, Ruma, router::auth_uiaa};
 
@@ -47,16 +46,14 @@ pub(crate) async fn change_password_route(
 
 	services
 		.users
-		.set_password(&sender_user, Some(&body.new_password))
+		.set_password_if_active(&sender_user, Some(&body.new_password))
 		.await?;
 
 	if body.logout_devices {
 		// A logged-out reset has no current device to preserve.
 		services
 			.users
-			.all_device_ids(&sender_user)
-			.ready_filter(|&id| Some(id) != body.sender_device.as_deref())
-			.for_each(|id| services.users.remove_device(&sender_user, id))
+			.remove_devices(&sender_user, body.sender_device.as_deref())
 			.await;
 	}
 
@@ -98,6 +95,10 @@ async fn redeem_password_reset(
 	else {
 		return Err!(Request(Forbidden("Invalid email identity proof.")));
 	};
+
+	// Deactivation keeps the email binding, and setting a password would
+	// reactivate the account.
+	services.users.deactivated_check(&user_id).await?;
 
 	Ok(user_id)
 }

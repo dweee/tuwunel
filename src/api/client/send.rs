@@ -1,9 +1,7 @@
-use std::collections::BTreeMap;
-
 use axum::extract::State;
-use futures::future::try_join4;
+use futures::future::{try_join, try_join3};
 use ruma::{
-	DeviceId, RoomId, TransactionId, UserId,
+	OwnedEventId, RoomId, UserId,
 	api::client::message::{
 		send_message_event, send_message_event::v3::Response as SendMessageResponse,
 	},
@@ -16,16 +14,17 @@ use ruma::{
 };
 use serde::Deserialize;
 use serde_json::from_str;
-use tuwunel_core::{
-	Err, PduEvent, Result, debug_warn, err,
-	matrix::{Event, pdu::PduBuilder},
-	result::NotFound,
-	utils::string_from_bytes,
-	warn,
+use tuwunel_core::{Err, Result, debug_warn, err, result::NotFound, warn};
+use tuwunel_matrix::{Event, PduEvent, pdu::PduBuilder};
+use tuwunel_service::{
+	Services,
+	transaction_ids::{RoomScope, RoomTxn},
 };
-use tuwunel_service::Services;
 
-use crate::{Ruma, client::utils::is_self_redaction};
+use crate::{
+	Ruma,
+	utils::{is_self_redaction, txnid_event_id, txnid_unsigned},
+};
 
 #[derive(Deserialize)]
 struct ExtractRelatesTo {
@@ -49,10 +48,77 @@ pub(crate) async fn send_message_event_route(
 	let sender_user = body.sender_user();
 	let sender_device = body.sender_device.as_deref();
 	let appservice_info = body.appservice_info.as_ref();
+	let redacts_id =
+		check_send_policy(&services, sender_user, &body.event_type, &body.body.body).await?;
 
+	let state_lock = services.state.mutex.lock(&body.room_id).await;
+	let event_type = body.event_type.to_cow_str();
+	let txn = RoomTxn {
+		user_id: sender_user,
+		device_id: sender_device,
+		txn_id: &body.txn_id,
+		room_id: &body.room_id,
+	};
+
+	let content_checks = check_send_content(
+		&services,
+		sender_user,
+		&body.room_id,
+		&body.event_type,
+		&body.body.body,
+	);
+
+	let (existing_txnid, ()) =
+		try_join(check_existing_txnid(&services, txn, &event_type), content_checks).await?;
+
+	if let Some(existing_txnid) = existing_txnid {
+		return Ok(existing_txnid);
+	}
+
+	let content = from_str(body.body.body.json().get())
+		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
+
+	let pdu = PduBuilder {
+		event_type: body.event_type.clone().into(),
+		content,
+		unsigned: txnid_unsigned(&body.txn_id).into(),
+		timestamp: appservice_info.and(body.timestamp),
+		redacts: redacts_id,
+		..Default::default()
+	};
+
+	let event_id = services
+		.timeline
+		.build_and_append_pdu(pdu, sender_user, &body.room_id, &state_lock)
+		.await?;
+
+	services.transaction_ids.add_room_txnid(
+		txn,
+		RoomScope::Send(&event_type),
+		event_id.as_bytes(),
+	);
+
+	drop(state_lock);
+
+	Ok(SendMessageResponse { event_id })
+}
+
+/// Applies the sender's policy for sending a message event, before the room
+/// lock.
+///
+/// Refuses encrypted events when encryption is disabled, local redactions
+/// when the server disables them, and a suspended sender's events other than
+/// self-redactions. Returns the target of a redaction for the top-level
+/// `redacts` field.
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn check_send_policy(
+	services: &Services,
+	sender_user: &UserId,
+	event_type: &MessageLikeEventType,
+	content: &Raw<AnyMessageLikeEventContent>,
+) -> Result<Option<OwnedEventId>> {
 	// Forbid m.room.encrypted if encryption is disabled
-	if body.event_type == MessageLikeEventType::RoomEncrypted && !services.config.allow_encryption
-	{
+	if *event_type == MessageLikeEventType::RoomEncrypted && !services.config.encryption.allow {
 		return Err!(Request(Forbidden("Encryption has been disabled")));
 	}
 
@@ -61,28 +127,26 @@ pub(crate) async fn send_message_event_route(
 	// `redacts_id(...)` resolves regardless of room version. Mirrors the
 	// /redact handler.
 	let redaction_content = || {
-		body.body
-			.body
+		content
 			.deserialize_as_unchecked::<RoomRedactionEventContent>()
 			.inspect_err(|_| {
 				debug_warn!(
 					%sender_user,
-					event = %body.body.body.json(),
+					event = %content.json(),
 					"Client sent invalid redaction event"
 				);
 			})
 			.ok()
 	};
 
-	let redacts_id = body
-		.event_type
+	let redacts_id = event_type
 		.eq(&MessageLikeEventType::RoomRedaction)
 		.then(redaction_content)
 		.flatten()
 		.and_then(|content| content.redacts);
 
-	if body.event_type == MessageLikeEventType::RoomRedaction
-		&& services.config.disable_local_redactions
+	if *event_type == MessageLikeEventType::RoomRedaction
+		&& services.config.rooms.redaction.disable_local
 		&& !services.admin.user_is_admin(sender_user).await
 	{
 		warn!(
@@ -95,7 +159,7 @@ pub(crate) async fn send_message_event_route(
 	}
 
 	if services.users.is_suspended(sender_user).await {
-		if body.event_type != MessageLikeEventType::RoomRedaction {
+		if *event_type != MessageLikeEventType::RoomRedaction {
 			return Err!(Request(UserSuspended(
 				"Cannot send non-redaction events while suspended."
 			)));
@@ -103,7 +167,7 @@ pub(crate) async fn send_message_event_route(
 
 		let is_self = match &redacts_id {
 			| None => false,
-			| Some(redacts_id) => is_self_redaction(&services, sender_user, redacts_id).await,
+			| Some(redacts_id) => is_self_redaction(services, sender_user, redacts_id).await,
 		};
 
 		if !is_self {
@@ -111,63 +175,29 @@ pub(crate) async fn send_message_event_route(
 		}
 	}
 
-	let state_lock = services.state.mutex.lock(&body.room_id).await;
-	let event_type = body.event_type.to_cow_str();
+	Ok(redacts_id)
+}
 
-	let (existing_txnid, ..) = try_join4(
-		check_existing_txnid(
-			&services,
-			sender_user,
-			sender_device,
-			&body.txn_id,
-			&body.room_id,
-			&event_type,
-		),
-		check_duplicate_reaction(&services, &body.event_type, sender_user, &body.body.body),
-		check_public_call_invite(&services, &body.event_type, &body.room_id),
-		check_nested_thread(&services, &body.body.body),
+/// Applies the room's content rules for sending a message event, under the
+/// room lock.
+///
+/// Refuses a duplicate reaction, a call invite in a public room, and a thread
+/// rooted at an event that itself carries a relation.
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn check_send_content(
+	services: &Services,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	event_type: &MessageLikeEventType,
+	content: &Raw<AnyMessageLikeEventContent>,
+) -> Result {
+	try_join3(
+		check_duplicate_reaction(services, event_type, sender_user, content),
+		check_public_call_invite(services, event_type, room_id),
+		check_nested_thread(services, content),
 	)
-	.await?;
-
-	if let Some(existing_txnid) = existing_txnid {
-		return Ok(existing_txnid);
-	}
-
-	let mut unsigned = BTreeMap::new();
-	unsigned.insert("transaction_id".to_owned(), body.txn_id.to_string().into());
-
-	let content = from_str(body.body.body.json().get())
-		.map_err(|e| err!(Request(BadJson("Invalid JSON body: {e}"))))?;
-
-	let event_id = services
-		.timeline
-		.build_and_append_pdu(
-			PduBuilder {
-				event_type: body.event_type.clone().into(),
-				content,
-				unsigned: Some(unsigned),
-				timestamp: appservice_info.and(body.timestamp),
-				redacts: redacts_id,
-				..Default::default()
-			},
-			sender_user,
-			&body.room_id,
-			&state_lock,
-		)
-		.await?;
-
-	services.transaction_ids.add_room_txnid(
-		sender_user,
-		sender_device,
-		&body.txn_id,
-		&body.room_id,
-		&event_type,
-		event_id.as_bytes(),
-	);
-
-	drop(state_lock);
-
-	Ok(send_message_event::v3::Response { event_id })
+	.await
+	.map(|((), (), ())| ())
 }
 
 async fn check_public_call_invite(
@@ -244,20 +274,19 @@ async fn check_nested_thread(
 	Err!(Request(Unknown("Cannot start threads from an event with a relation.")))
 }
 
-/// Check if this is a new transaction id. Returns Some when the transaction id
-/// exists and the send must then be terminated by returning the contained
-/// result.
+/// Check if this is a new transaction id.
+///
+/// Returns Some when the transaction id exists and the send must then be
+/// terminated by returning the contained result.
 async fn check_existing_txnid(
 	services: &Services,
-	sender_user: &UserId,
-	sender_device: Option<&DeviceId>,
-	txn_id: &TransactionId,
-	room_id: &RoomId,
+	txn: RoomTxn<'_>,
 	event_type: &str,
 ) -> Result<Option<SendMessageResponse>> {
+	let scope = RoomScope::Send(event_type);
 	let response = services
 		.transaction_ids
-		.existing_room_txnid(sender_user, sender_device, txn_id, room_id, event_type)
+		.existing_room_txnid(txn, scope)
 		.await;
 
 	if let Some(response) = response.optional()? {
@@ -266,7 +295,7 @@ async fn check_existing_txnid(
 
 	let response = services
 		.transaction_ids
-		.existing_txnid(sender_user, sender_device, txn_id)
+		.existing_txnid(txn.user_id, txn.device_id, txn.txn_id)
 		.await;
 
 	let Some(response) = response.optional()? else {
@@ -287,28 +316,19 @@ async fn check_existing_txnid(
 		return Ok(None);
 	};
 
-	if !legacy_txnid_matches(&pdu, room_id, event_type, sender_user) {
+	if !legacy_txnid_matches(&pdu, txn.room_id, event_type, txn.user_id) {
 		return Ok(None);
 	}
 
-	services.transaction_ids.add_room_txnid(
-		sender_user,
-		sender_device,
-		txn_id,
-		room_id,
-		event_type,
-		event_id.as_bytes(),
-	);
+	services
+		.transaction_ids
+		.add_room_txnid(txn, scope, event_id.as_bytes());
 
 	Ok(Some(response))
 }
 
 fn txnid_response(response: &[u8]) -> Result<SendMessageResponse> {
-	let event_id = string_from_bytes(response)?
-		.try_into()
-		.map_err(|_| err!(Database("Invalid event_id in txn_id data: {response:?}.")))?;
-
-	Ok(SendMessageResponse { event_id })
+	txnid_event_id(response).map(SendMessageResponse::new)
 }
 
 fn legacy_txnid_response(response: &[u8]) -> Result<Option<SendMessageResponse>> {

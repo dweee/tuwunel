@@ -2,7 +2,7 @@ use std::{fmt::Write, net::IpAddr};
 
 use axum::extract::State;
 use ruma::{
-	DeviceId, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
+	DeviceId, OwnedUserId, UserId,
 	api::client::{
 		account::register::{self, LoginType, RegistrationKind},
 		uiaa::{AuthFlow, AuthType, UiaaInfo},
@@ -17,7 +17,10 @@ use tuwunel_service::{
 };
 
 use super::{SESSION_ID_LENGTH, is_matrix_appservice_irc};
-use crate::{ClientIp, Ruma};
+use crate::{
+	ClientIp, Ruma,
+	utils::{bind_new_account_email, check_email_domain},
+};
 
 const RANDOM_USER_ID_LENGTH: usize = 10;
 
@@ -46,7 +49,11 @@ pub(crate) async fn register_route(
 	body: Ruma<register::v3::Request>,
 ) -> Result<register::v3::Response> {
 	let is_guest = body.kind == RegistrationKind::Guest;
-	let emergency_mode_enabled = services.config.emergency_password.is_some();
+	let emergency_mode_enabled = services
+		.config
+		.authentication
+		.emergency_password
+		.is_some();
 
 	gate_registration_allowed(services, &body, is_guest)?;
 
@@ -68,7 +75,22 @@ pub(crate) async fn register_route(
 
 	check_appservice_namespace(services, &body, &user_id, emergency_mode_enabled).await?;
 
+	let device_id = body
+		.device_id
+		.as_deref()
+		.filter(|_| !is_guest && !body.inhibit_login);
+
+	// Checked before anything is stored, so a refused ID leaves the name free.
+	services
+		.users
+		.check_device_id(&user_id, device_id)
+		.await?;
+
 	let email_association = enforce_uiaa(services, &body, is_guest).await?;
+
+	if let Some(ref association) = email_association {
+		check_email_domain(&services, &association.address)?;
+	}
 
 	let password = if is_guest { None } else { body.password.as_deref() };
 
@@ -103,8 +125,6 @@ pub(crate) async fn register_route(
 		});
 	}
 
-	let device_id = if is_guest { None } else { body.device_id.as_deref() };
-
 	// Generate new token for the device
 	let (access_token, expires_in) = services
 		.users
@@ -128,7 +148,9 @@ pub(crate) async fn register_route(
 
 	debug_info!(%user_id, %device_id, "User account was created");
 
-	if body.appservice_info.is_none() && (!is_guest || services.config.log_guest_registrations) {
+	if body.appservice_info.is_none()
+		&& (!is_guest || services.config.admin.room.log_guest_registrations)
+	{
 		announce_new_user(services, &user_id, &body, is_guest, &client).await?;
 	}
 
@@ -152,7 +174,7 @@ fn gate_registration_allowed(
 		.as_deref()
 		.unwrap_or("");
 
-	if !services.config.allow_registration && body.appservice_info.is_none() {
+	if !services.config.registration.enable && body.appservice_info.is_none() {
 		info!(
 			%is_guest,
 			%user,
@@ -163,13 +185,26 @@ fn gate_registration_allowed(
 		return Err!(Request(Forbidden("Registration has been disabled.")));
 	}
 
-	if is_guest && !services.config.allow_guest_registration {
+	if is_guest && !services.config.registration.guests.enable {
 		debug_warn!(
 			%device_name,
 			"Guest registration disabled, rejecting guest registration attempt"
 		);
 
 		return Err!(Request(GuestAccessForbidden("Guest registration is disabled.")));
+	}
+
+	if !is_guest
+		&& body.appservice_info.is_none()
+		&& !services.config.allows_password_registration()
+	{
+		debug_warn!(
+			%user,
+			%device_name,
+			"Rejecting registration attempt as password login is disabled"
+		);
+
+		return Err!(Request(Forbidden("Password registration has been disabled.")));
 	}
 
 	Ok(())
@@ -198,6 +233,7 @@ async fn resolve_registration_user_id(
 
 	if services
 		.config
+		.registration
 		.forbidden_usernames
 		.is_match(username)
 		&& !emergency_mode_enabled
@@ -240,6 +276,11 @@ async fn resolve_registration_user_id(
 		return Err!(Request(UserInUse("User ID is not available.")));
 	}
 
+	services
+		.users
+		.check_creation(&proposed_user_id)
+		.await?;
+
 	Ok(proposed_user_id)
 }
 
@@ -264,7 +305,8 @@ async fn check_appservice_namespace(
 	} else if services
 		.appservice
 		.is_exclusive_user_id(user_id)
-		.await && !emergency_mode_enabled
+		.await
+		&& !emergency_mode_enabled
 	{
 		return Err!(Request(Exclusive("Username is reserved by an appservice.")));
 	}
@@ -327,12 +369,24 @@ async fn enforce_uiaa(
 				| true =>
 					services
 						.uiaa
-						.try_auth_registration(&server_user, server_device, auth, &uiaainfo)
+						.try_auth_registration(
+							&server_user,
+							server_device,
+							auth,
+							&uiaainfo,
+							body.rate_limit_ip.ok(),
+						)
 						.await?,
 				| false =>
 					services
 						.uiaa
-						.try_auth(&server_user, server_device, auth, &uiaainfo)
+						.try_auth(
+							&server_user,
+							server_device,
+							auth,
+							&uiaainfo,
+							body.rate_limit_ip.ok(),
+						)
 						.await?,
 			};
 
@@ -435,35 +489,9 @@ async fn bind_registration_email(
 		return;
 	};
 
-	if let Err(e) = try_bind_registration_email(services, user_id, association).await {
-		warn!(%user_id, "Skipping registration email binding: {e}");
+	if let Err(error) = bind_new_account_email(&services, user_id, &association.address).await {
+		warn!(%user_id, %error, "Skipping registration email binding");
 	}
-}
-
-async fn try_bind_registration_email(
-	services: crate::State,
-	user_id: &UserId,
-	association: &Association,
-) -> Result {
-	if services
-		.threepid
-		.user_id_for_email(&association.address)
-		.await?
-		.is_some_and(|bound| bound != user_id)
-	{
-		warn!(%user_id, "Skipping registration email binding: address bound to another user");
-
-		return Ok(());
-	}
-
-	let now = MilliSecondsSinceUnixEpoch::now();
-
-	services
-		.threepid
-		.put_binding(user_id, &association.address, Medium::Email, now, now)
-		.await;
-
-	Ok(())
 }
 
 async fn announce_new_user(

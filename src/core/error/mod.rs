@@ -21,7 +21,7 @@ use std::{
 
 // Aliased so the variants already spelling this path qualified stay clean
 // under unused_qualifications.
-use ruma::api::error::ErrorKind as MatrixErrorKind;
+use ruma::api::error::{ErrorKind as MatrixErrorKind, UnknownTokenErrorData};
 
 pub use self::{err::visit, log::*};
 use crate::utils::{assert_ref_unwind_safe, assert_send, assert_sync, assert_unwind_safe};
@@ -133,13 +133,6 @@ pub enum Error {
 	/// text is forwarded unchanged.
 	#[error(transparent)]
 	CapacityError(#[from] arrayvec::CapacityError),
-
-	/// Reports failure to parse Cargo manifest data.
-	///
-	/// Automatic conversion preserves the original source error. Its display
-	/// text is forwarded unchanged.
-	#[error(transparent)]
-	CargoToml(#[from] cargo_toml::Error),
 
 	/// Reports a command-line parsing or presentation failure.
 	///
@@ -369,12 +362,10 @@ pub enum Error {
 	#[error("There was a problem with the '{0}' directive in your configuration: {1}")]
 	Config(&'static str, Cow<'static, str>),
 
-	/// Reports a resource conflict.
-	///
-	/// This variant currently represents an already occupied room alias. HTTP
-	/// response mapping emits a conflict status.
+	/// Reports a resource conflict, such as an occupied room alias or an action
+	/// on a finalised delayed event, which answers with a conflict status.
 	#[error("{0}")]
-	Conflict(Cow<'static, str>), // This is only needed for when a room alias already exists
+	Conflict(Cow<'static, str>),
 
 	/// Reports an invalid Matrix content-disposition header.
 	///
@@ -539,6 +530,18 @@ impl Error {
 		crate::err!(Database(error!("{message}")))
 	}
 
+	/// Constructs the `M_UNKNOWN_TOKEN` error refusing an access or refresh
+	/// token.
+	///
+	/// `soft_logout` tells the client it may log in again on the same device,
+	/// keeping its session, rather than starting over.
+	#[must_use]
+	pub fn unknown_token(soft_logout: bool, message: &'static str) -> Self {
+		let kind = MatrixErrorKind::UnknownToken(UnknownTokenErrorData { soft_logout });
+
+		Self::BadRequest(kind, message)
+	}
+
 	/// Produces an error message safe for public responses.
 	///
 	/// Database and I/O details are replaced with generic text to avoid leaking
@@ -572,7 +575,7 @@ impl Error {
 	pub fn kind(&self) -> ruma::api::error::ErrorKind {
 		use ruma::api::error::{
 			ErrorKind,
-			ErrorKind::{FeatureDisabled, NotJson, Unknown},
+			ErrorKind::{FeatureDisabled, InvalidParam, NotJson, Unknown},
 		};
 
 		match self {
@@ -584,6 +587,7 @@ impl Error {
 			| Self::RequestStatus(kind, ..) => kind.clone(),
 			| Self::Federation(_, error) | Self::Ruma(error) =>
 				response::ruma_error_kind(error).clone(),
+			| Self::Path(rejection) if rejection.status().is_client_error() => InvalidParam,
 			| _ => Unknown,
 		}
 	}
@@ -598,7 +602,7 @@ impl Error {
 
 		match self {
 			| Self::AuthCheck(..) => StatusCode::FORBIDDEN,
-			| Self::Conflict(_) => StatusCode::CONFLICT, // room alias exists
+			| Self::Conflict(_) => StatusCode::CONFLICT,
 			| Self::Federation(_, error) | Self::Ruma(error) => error.status_code,
 			| Self::FeatureDisabled(..)
 			| Self::CanonicalJson(..)
@@ -609,6 +613,7 @@ impl Error {
 			| Self::Request(kind, _, code) => response::status_code(kind, *code),
 			| Self::Io(error) => response::io_error_code(error.kind()),
 			| Self::HttpJson(code, ..) | Self::RequestStatus(.., code) => *code,
+			| Self::Path(rejection) => rejection.status(),
 			| Self::Reqwest(error) => error
 				.status()
 				.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -623,6 +628,36 @@ impl Error {
 	/// nested `Option`.
 	#[inline]
 	pub fn is_not_found(&self) -> bool { self.status_code() == http::StatusCode::NOT_FOUND }
+
+	/// Tests whether this is a potentially transient I/O failure.
+	///
+	/// Interrupted, busy, timed-out, incomplete, and unclassified I/O failures
+	/// may succeed on retry. Missing data, corruption, and invalid input do not
+	/// qualify.
+	#[inline]
+	pub fn is_transient_io(&self) -> bool {
+		matches!(
+			self,
+			Self::Io(error) if matches!(
+				error.kind(),
+				IoErrorKind::Interrupted
+					| IoErrorKind::ResourceBusy
+					| IoErrorKind::TimedOut
+					| IoErrorKind::WouldBlock
+					| IoErrorKind::Other
+			)
+		)
+	}
+
+	/// Tests whether this error is a missing record rather than any 404.
+	///
+	/// Only `Request` with the `NotFound` kind matches, which is what the
+	/// database returns for an absent key. An I/O not-found and every other
+	/// error mapping to 404 do not, so a storage fault never reads as absence.
+	#[inline]
+	pub fn is_missing(&self) -> bool {
+		matches!(self, Self::Request(MatrixErrorKind::NotFound, ..))
+	}
 
 	/// Tests whether this error reports an interrupted operation.
 	///

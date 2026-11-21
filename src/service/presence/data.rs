@@ -4,7 +4,7 @@ use futures::Stream;
 use ruma::{UInt, UserId, events::presence::PresenceEvent, presence::PresenceState};
 use tuwunel_core::{
 	Result, debug_warn, implement, utils,
-	utils::{ReadyExt, result::NotFound, stream::TryIgnore},
+	utils::{ReadyExt, result::NotFound, stream::TryIgnore, u64_from_u8},
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
@@ -146,13 +146,24 @@ impl Data {
 		since: u64,
 		to: Option<u64>,
 	) -> impl Stream<Item = (&UserId, u64, &[u8])> + Send + '_ {
+		let upper = to
+			.and_then(|to| to.checked_add(1))
+			.map(u64::to_be_bytes);
+
 		self.presenceid_presence
-			.raw_stream()
+			.raw_stream_range(&since.to_be_bytes(), upper.as_ref().map(AsRef::as_ref))
 			.ignore_err()
-			.ready_filter_map(move |(key, presence)| {
-				let (count, user_id) = presenceid_parse(key).ok()?;
-				(count > since && to.is_none_or(|to| count <= to))
-					.then_some((user_id, count, presence))
+			.ready_filter_map(|(key, presence)| {
+				let (count, user_id) = key.split_at_checked(size_of::<u64>())?;
+
+				Some((u64_from_u8(count), user_id, presence))
+			})
+			.ready_take_while(move |(count, ..)| to.is_none_or(|to| *count <= to))
+			.ready_filter(move |(count, ..)| *count > since)
+			.ready_filter_map(|(count, user_id, presence)| {
+				user_id_from_bytes(user_id)
+					.ok()
+					.map(|user_id| (user_id, count, presence))
 			})
 	}
 }
@@ -211,15 +222,6 @@ fn presenceid_key(count: u64, user_id: &UserId) -> Vec<u8> {
 	key.extend_from_slice(&count.to_be_bytes());
 	key.extend_from_slice(user_id.as_bytes());
 	key
-}
-
-#[inline]
-fn presenceid_parse(key: &[u8]) -> Result<(u64, &UserId)> {
-	let (count, user_id) = key.split_at(8);
-	let user_id = user_id_from_bytes(user_id)?;
-	let count = utils::u64_from_u8(count);
-
-	Ok((count, user_id))
 }
 
 /// Parses a `UserId` from bytes.

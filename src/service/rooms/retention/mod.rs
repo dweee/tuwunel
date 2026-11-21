@@ -11,10 +11,10 @@ use futures::{Stream, TryStreamExt};
 use ruma::{CanonicalJsonObject, EventId};
 use tuwunel_core::{
 	Result, debug_info, expected, implement,
-	matrix::pdu::PduEvent,
-	utils::{TryReadyExt, time::now},
+	utils::{BoolExt as _, TryReadyExt, time::now},
 };
 use tuwunel_database::{Deserialized, Json, Map};
+use tuwunel_matrix::pdu::PduEvent;
 
 use crate::rooms::timeline::RoomMutexGuard;
 
@@ -44,7 +44,12 @@ impl crate::Service for Service {
 
 	async fn worker(self: Arc<Self>) -> Result {
 		loop {
-			let retention_seconds = self.services.config.redaction_retention_seconds;
+			let retention_seconds = self
+				.services
+				.config
+				.rooms
+				.redaction
+				.retention_seconds;
 
 			if retention_seconds != 0 {
 				debug_info!("Cleaning up retained events");
@@ -113,7 +118,14 @@ pub async fn save_original_pdu(
 	pdu: &CanonicalJsonObject,
 	_state_lock: &RoomMutexGuard,
 ) {
-	if !self.services.config.save_unredacted_events {
+	if self
+		.services
+		.config
+		.rooms
+		.redaction
+		.save_unredacted_events
+		.is_false()
+	{
 		return;
 	}
 

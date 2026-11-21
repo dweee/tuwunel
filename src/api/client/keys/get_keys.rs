@@ -26,6 +26,7 @@ use tuwunel_core::{
 		json,
 		stream::{BroadbandExt, ReadyExt},
 	},
+	warn,
 };
 use tuwunel_service::{
 	Services,
@@ -75,7 +76,11 @@ pub(crate) async fn get_keys_route(
 	.await
 }
 
-pub(crate) async fn get_keys_helper<F>(
+/// Queries device and cross-signing keys for the requested users.
+///
+/// The signature predicate filters returned signatures, and the display-name
+/// switch selects configured device names rather than device IDs.
+pub async fn get_keys_helper<F>(
 	services: &Services,
 	sender_user: Option<&UserId>,
 	device_keys_input: &DeviceLists,
@@ -297,6 +302,7 @@ where
 	let result = match result {
 		| Err(fault) => Err(fault),
 		| Ok(response) => {
+			let response = retain_origin_users(&origin, response);
 			let keys =
 				process_federation_response(services, sender_user, allowed_signatures, response)
 					.await;
@@ -306,6 +312,29 @@ where
 	};
 
 	Outcome { origin, elapsed, result }
+}
+
+/// Drops the keys of users who do not belong to the server that answered.
+///
+/// A server is only authoritative for its own users; any other entry, local
+/// users included, would otherwise be stored or served as that user's keys.
+fn retain_origin_users(
+	origin: &ServerName,
+	mut response: FederationResponse,
+) -> FederationResponse {
+	response
+		.device_keys
+		.retain(|user, _| user.server_name().eq(origin));
+
+	response
+		.master_keys
+		.retain(|user, _| user.server_name().eq(origin));
+
+	response
+		.self_signing_keys
+		.retain(|user, _| user.server_name().eq(origin));
+
+	response
 }
 
 async fn process_federation_response<F>(
@@ -345,9 +374,11 @@ where
 	}
 }
 
-/// Merges signatures from our cached copy of the user's master key (if any)
-/// onto the remote-supplied master key, persists the merged copy to our
-/// database, and returns the merged Raw value for the response.
+/// Merges our cached signatures onto a remote-supplied master key.
+///
+/// The returned copy carries only the cached signatures the requester may see,
+/// while the stored copy carries every signature of our cached key. A failed
+/// store is logged and leaves the returned copy as it is.
 async fn merge_remote_master_key<F>(
 	services: &Services,
 	sender_user: Option<&UserId>,
@@ -358,28 +389,37 @@ async fn merge_remote_master_key<F>(
 where
 	F: Fn(&UserId) -> bool + Send + Sync,
 {
-	let (master_key_id, mut master_key) = parse_master_key(user, &master_key_raw)?;
+	let (row_key, master_key) = parse_master_key(user, &master_key_raw)?;
 	let our_raw = services
 		.users
-		.get_key(&master_key_id, sender_user, user, allowed_signatures)
+		.get_key(&row_key, sender_user, user, allowed_signatures)
 		.await;
 
+	let master_key = merge_signatures(user, master_key, our_raw);
+	let raw = json::to_raw(&master_key)?;
+
+	services
+		.users
+		.store_remote_master_key(user, &master_key_raw)
+		.await
+		.inspect_err(|error| warn!(%user, %error, "Not storing a master key from federation."))
+		.ok();
+
+	Ok(raw)
+}
+
+fn merge_signatures(
+	user: &UserId,
+	mut master_key: CrossSigningKey,
+	our_raw: Result<Raw<CrossSigningKey>>,
+) -> CrossSigningKey {
 	if let Ok(our_raw) = our_raw
 		&& let Ok((_, mut ours)) = parse_master_key(user, &our_raw)
 	{
 		master_key.signatures.append(&mut ours.signatures);
 	}
 
-	let raw = json::to_raw(&master_key)?;
-
-	// Don't notify: a notification would trigger another key request resulting
-	// in an endless loop.
-	services
-		.users
-		.add_cross_signing_keys(user, &Some(raw.clone()), &None, &None, false)
-		.await?;
-
-	Ok(raw)
+	master_key
 }
 
 fn add_unsigned_device_display_name(
@@ -431,5 +471,32 @@ fn into_response(self) -> get_keys::v3::Response {
 		master_keys: self.master_keys,
 		self_signing_keys: self.self_signing_keys,
 		user_signing_keys: self.user_signing_keys,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::{server_name, user_id};
+	use serde_json::json;
+
+	use super::*;
+
+	#[test]
+	fn drops_keys_of_users_on_other_servers() {
+		let remote = user_id!("@bob:remote.example");
+		let users = [remote, user_id!("@alice:local.example"), user_id!("@carol:third.example")];
+		let devices = |user: &UserId| (user.to_owned(), BTreeMap::new());
+		let key = |user: &UserId| (user.to_owned(), Raw::from_json_value(&json!({})));
+		let response = FederationResponse {
+			device_keys: users.map(devices).into(),
+			master_keys: users.map(key).into(),
+			self_signing_keys: users.map(key).into(),
+		};
+
+		let response = retain_origin_users(server_name!("remote.example"), response);
+
+		assert!(response.device_keys.keys().eq([remote]));
+		assert!(response.master_keys.keys().eq([remote]));
+		assert!(response.self_signing_keys.keys().eq([remote]));
 	}
 }

@@ -5,13 +5,14 @@ use const_str::format as const_format;
 use http::StatusCode;
 use ruma::UserId;
 use serde::Deserialize;
+use tuwunel_api::router::ACCOUNT_HEAD;
 use tuwunel_core::{Err, Result, err, utils::html::escape as html_escape};
 use tuwunel_service::{Services, oauth::server::AuthRequest};
 use url::{Url, form_urlencoded::Serializer};
 
 use super::{
-	account::{ACCOUNT_HEAD, account_error_response, account_html_response},
-	consume_login_token, peek_login_token, redirect_allowlisted,
+	account::{account_error_response, account_html_response},
+	consume_login_token, peek_login_token, redirect_allowlisted, require_account_usable,
 };
 use crate::ClientIp;
 
@@ -192,17 +193,18 @@ impl Approval<'_> {
 /// Whether the authorization code goes out without asking the user first.
 ///
 /// Two conditions waive the prompt: the operator turned it off with
-/// `oidc_require_client_approval`, or listed this redirect target in the
+/// `authentication.oidc.require_client_approval`, or listed this redirect target in
+/// the
 /// registration allowlist. Neither holds on a server running open dynamic
 /// registration, where an attacker can register a client of their own and phish
 /// an authorization link. An initial access token deliberately does not waive
 /// it, since closing registration says nothing about the clients that were
 /// already registered when it closed.
 fn approval_waived(services: &Services, redirect_uri: &str) -> bool {
-	let config = &services.config;
+	let config = &services.config.authentication.oidc;
 
-	!config.oidc_require_client_approval
-		|| redirect_allowlisted(&config.oidc_registration_allowed_redirect_hosts, redirect_uri)
+	!config.require_client_approval
+		|| redirect_allowlisted(&config.registration_allowed_redirect_hosts, redirect_uri)
 }
 
 /// Mint the authorization code for an approved sign-in.
@@ -225,7 +227,8 @@ async fn accept_code(services: &Services, params: &CompleteParams) -> Result<Res
 ///
 /// The request is retired before the code exists, so a resubmitted form finds
 /// nothing to mint against. The login token is spent on the same pass, which
-/// makes this the one-shot tail of both entry points.
+/// makes this the one-shot tail of both entry points; a request that vanished
+/// or changed since it was read keeps the token, as a refused peek does.
 async fn release_code(
 	services: &Services,
 	auth_req: &AuthRequest,
@@ -249,11 +252,17 @@ async fn release_code(
 			.as_deref()
 			== Some("native");
 
-	oidc.remove_auth_request(&params.oidc_req_id);
+	let auth_req = oidc
+		.take_auth_request(&params.oidc_req_id, auth_req)
+		.await?;
 
 	let user_id = consume_login_token(services, Some(&params.login_token)).await?;
-	let code = oidc.create_auth_code(auth_req, user_id);
-	let redirect_url = code_redirect(redirect_url, auth_req, &code);
+
+	// Account-state refusal also retires the request and spends the login token.
+	require_account_usable(services, &user_id).await?;
+
+	let code = oidc.create_auth_code(&auth_req, user_id);
+	let redirect_url = code_redirect(redirect_url, &auth_req, &code);
 	let html = if needs_interstitial(&redirect_url, native) {
 		complete_continue_html(redirect_url.as_str())
 	} else {
@@ -290,14 +299,15 @@ fn with_fragment(mut url: Url, fragment: &str) -> Url {
 
 /// Discard a refused authorization.
 ///
-/// Both single-use credentials are burned, so a refusal cannot be resumed by
-/// replaying the form. The request is removed without being read, since nothing
-/// here needs its contents.
+/// Both single-use credentials are burned even when the request is stale, so a
+/// refusal cannot be resumed by replaying the form. The request is retired
+/// without being read, since nothing here needs its contents.
 async fn refuse_code(services: &Services, params: &CompleteParams) -> Result<Response> {
 	services
 		.oauth
 		.get_server()?
-		.remove_auth_request(&params.oidc_req_id);
+		.retire_auth_request(&params.oidc_req_id)
+		.await;
 
 	consume_login_token(services, Some(&params.login_token))
 		.await
@@ -323,14 +333,14 @@ fn complete_continue_html(redirect_url: &str) -> String {
 		<html lang="en">
 			<head>
 				{ACCOUNT_HEAD}
-				<title>Continue</title>
+				<title>Finish signing in · Tuwunel</title>
 			</head>
-			<body>
-				<h1>Almost there</h1>
-				<p>Continue to return to your app and finish signing in.</p>
-				<div class="nav">
-					<a href="{href}">Continue</a>
-				</div>
+			<body class="auth-page">
+				<main class="auth-card auth-complete" aria-labelledby="auth-title">
+					<h1 id="auth-title">Finish signing in</h1>
+					<p class="auth-description">Continue to your app to complete sign-in.</p>
+					<a class="auth-continue-link" href="{href}">Continue</a>
+				</main>
 			</body>
 		</html>"#
 	)
@@ -411,6 +421,8 @@ mod tests {
 
 		assert!(html.contains(r#"href="io.element.android:"#));
 		assert!(html.contains("&amp;"));
+		assert!(html.contains("auth-card auth-complete"));
+		assert!(html.contains("Finish signing in"));
 		assert!(html.contains("Continue"));
 		assert!(!html.contains("http-equiv=\"refresh\""));
 	}

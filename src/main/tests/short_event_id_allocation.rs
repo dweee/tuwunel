@@ -8,9 +8,9 @@ use tokio::time::{sleep, timeout};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
 	Err, Result, err,
-	pdu::PduBuilder,
 	ruma::{OwnedRoomId, UserId, events::room::message::RoomMessageEventContent},
 };
+use tuwunel_matrix::pdu::PduBuilder;
 use tuwunel_service::{Services, users::Register};
 
 #[test]
@@ -20,14 +20,11 @@ fn discarded_build_allocates_no_short_id() -> Result {
 
 	let db_path = Args::test_database_path("short-event-id-allocation");
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	let mut args = Args::default_test(&["fresh", "cleanup"])
+		.with_database_path(&db_path)
+		.with_loopback_listener(port);
 
-	args.option.extend([
-		format!("database_path={db_path:?}"),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
-		"listening=true".to_owned(),
-	]);
+	args.option.extend(["listening=true".to_owned()]);
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;

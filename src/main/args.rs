@@ -10,7 +10,7 @@ use std::{
 use clap::{ArgAction, Parser, builder::RangedU64ValueParser};
 use tuwunel_core::{
 	Err, Result,
-	config::{Figment, FigmentValue},
+	config::{Config, Figment, FigmentValue},
 	err, implement, is_true, toml,
 	utils::{available_parallelism, random_string},
 };
@@ -174,9 +174,18 @@ pub struct Args {
 		long,
 		hide(true),
 		env = "TOKIO_MAX_IO_EVENTS_PER_TICK",
-		default_value = "512"
+		default_value = "256"
 	)]
 	pub kernel_events_per_tick: usize,
+
+	/// Override the tokio max_io_events_per_busy_tick.
+	#[arg(
+		long,
+		hide(true),
+		env = "TOKIO_MAX_IO_EVENTS_PER_BUSY_TICK",
+		default_value = "64"
+	)]
+	pub kernel_events_per_busy_tick: usize,
 
 	/// Set the poll histogram bucket size, in microseconds (tokio_unstable).
 	///
@@ -324,19 +333,53 @@ pub fn default_test(name: &[&str]) -> Self {
 		.with_database_path(&test_database_root().join(random_string(32)))
 }
 
+/// Returns arguments for a maintenance-mode test on its own database.
+///
+/// The `fresh` and `cleanup` harnesses clear the database before the boot and
+/// remove it afterwards. The server boots without listening, so the test drives
+/// the services directly.
+#[implement(Args)]
+#[must_use]
+pub fn maintenance_test(database_path: &Path) -> Self {
+	Self::default_test(&["fresh", "cleanup"])
+		.with_maintenance()
+		.with_database_path(database_path)
+}
+
+/// Returns these arguments with an IPv4 loopback listener configured.
+///
+/// The address and port overrides are appended together, preserving existing
+/// arguments and allowing later overrides to take precedence.
+#[implement(Args)]
+#[must_use]
+pub fn with_loopback_listener(self, port: u16) -> Self {
+	self.with_option("http.listen.address=[\"127.0.0.1\"]")
+		.with_option(format!("http.listen.port={port}"))
+}
+
 /// Returns these arguments with the database path override appended.
 ///
-/// The path is quoted as a TOML basic string, escaping backslashes and quotes,
-/// so any platform path survives the option parser.
+/// The path is escaped through `with_path_option`, so any platform path parses.
 #[implement(Args)]
 #[must_use]
 pub fn with_database_path(self, path: &Path) -> Self {
+	self.with_path_option("database_path", path)
+}
+
+/// Returns these arguments with a path-valued option override appended.
+///
+/// The path is quoted as a TOML basic string, escaping backslashes and quotes,
+/// so any platform path survives the option parser. The key is written as given,
+/// so it must already be a valid, possibly dotted, option name.
+#[implement(Args)]
+#[must_use]
+pub fn with_path_option(self, key: &str, path: &Path) -> Self {
 	let escaped = path
 		.to_string_lossy()
 		.replace('\\', "\\\\")
 		.replace('"', "\\\"");
 
-	self.with_option(format!("database_path=\"{escaped}\""))
+	self.with_option(format!("{key}=\"{escaped}\""))
 }
 
 /// Returns a dedicated database path for a named test.
@@ -425,24 +468,24 @@ pub fn update(mut config: Figment, args: &Args) -> Result<Figment> {
 	}
 
 	if args.read_only {
-		config = config.join(("rocksdb_read_only", true));
+		config = config.join(("rocksdb.read_only", true));
 	}
 
 	if args.maintenance || args.read_only {
 		config = config.join(("maintenance", true));
 		config = config.join(("listening", false));
-		config = config.join(("startup_netburst", false));
+		config = config.join(("sending.startup_netburst", false));
 	}
 
 	#[cfg(feature = "console")]
 	// Indicate the admin console should be spawned automatically if the
 	// configuration file hasn't already.
 	if args.console {
-		config = config.join(("admin_console_automatic", true));
+		config = config.join(("admin.console_automatic", true));
 	}
 
 	// Execute commands after any commands listed in configuration file
-	config = config.adjoin(("admin_execute", &args.execute));
+	config = config.adjoin(("admin.execute", &args.execute));
 
 	// Update config with names of any functional-tests
 	config = config.adjoin(("test", &args.test));
@@ -471,7 +514,7 @@ pub fn update(mut config: Figment, args: &Args) -> Result<Figment> {
 		let val = toml::from_str::<FigmentValue>(option)?;
 
 		// Figment::merge() overrides existing
-		config = config.merge((path, val.find(path)));
+		config = config.merge(Config::normalize((path, val.find(path)))?);
 	}
 
 	Ok(config)
@@ -479,9 +522,202 @@ pub fn update(mut config: Figment, args: &Args) -> Result<Figment> {
 
 #[cfg(test)]
 mod tests {
-	use std::ffi::OsString;
+	use std::{
+		env::{current_exe, var_os},
+		ffi::{OsStr, OsString},
+		iter::empty,
+		process::Command,
+	};
 
-	use super::{Args, Figment, Parser, RESTORE_KEY, Result, update};
+	use clap::CommandFactory;
+	use tuwunel_core::utils::sys::command_without_env_prefixes;
+
+	use super::{Args, Config, Figment, Parser, RESTORE_KEY, Result, update};
+
+	#[test]
+	fn environment_cli_precedence_and_configured_array_adjoin() {
+		const CHILD: &str = "CONFIG_HIERARCHY_ARGS_CHILD";
+		if var_os(CHILD).is_none() {
+			let output = environment_command()
+				.args([
+					"--exact",
+					"args::tests::environment_cli_precedence_and_configured_array_adjoin",
+				])
+				.env(CHILD, "1")
+				.env("TUWUNEL_SERVER_NAME", "example.com")
+				.env("TUWUNEL_ROCKSDB", "{checksums=false}")
+				.env("TUWUNEL_ADMIN_EXECUTE", "[configured]")
+				.env("TUWUNEL_TEST", "[configured-test]")
+				.output()
+				.expect("environment test child launched");
+
+			assert!(
+				output.status.success(),
+				"environment test child failed: {}\n{}{}",
+				output.status,
+				String::from_utf8_lossy(&output.stdout),
+				String::from_utf8_lossy(&output.stderr),
+			);
+
+			return;
+		}
+
+		let configured = Config::load(empty()).expect("environment source");
+		let arguments = [
+			"tuwunel",
+			"--execute",
+			"command-line",
+			"--test=command-test",
+			"-O",
+			"rocksdb_checksums=true",
+		];
+
+		let raw = updated(&arguments, configured.clone()).expect("CLI update");
+
+		assert!(
+			raw.extract_inner::<bool>("rocksdb.checksums")
+				.unwrap()
+		);
+
+		let commands = raw
+			.extract_inner::<Vec<String>>("admin.execute")
+			.unwrap();
+
+		assert_eq!(commands, ["configured", "command-line"]);
+
+		let tests = raw.extract_inner::<Vec<String>>("test").unwrap();
+
+		assert_eq!(tests, ["configured-test", "command-test"]);
+
+		let invalid = updated(&["tuwunel", "-O", "rocksdb.checksums='invalid'"], configured)
+			.expect("CLI raw input accepted");
+
+		let error = Config::new(&invalid)
+			.err()
+			.expect("typed CLI error")
+			.to_string();
+
+		assert!(error.contains("rocksdb.checksums"));
+		assert!(!error.contains("TUWUNEL_ROCKSDB"));
+	}
+
+	fn environment_command() -> Command {
+		// Preserve the loader environment required by the Nix check phase.
+		let executable = current_exe().expect("test executable found");
+		let command = Command::new(executable);
+
+		command_without_env_prefixes(command, &["CONDUIT_", "CONDUWUIT_", "TUWUNEL_"])
+	}
+
+	#[test]
+	fn mixed_config_spellings_keep_cli_occurrence_order() {
+		for options in [
+			["rocksdb_checksums=true", "rocksdb.checksums=false"],
+			["rocksdb.checksums=true", "rocksdb_checksums=false"],
+			["rocksdb_checksums=true", "rocksdb_checksums=false"],
+			["rocksdb.checksums=true", "rocksdb.checksums=false"],
+		] {
+			let raw = updated(&["tuwunel", "-O", options[0], "-O", options[1]], Figment::new())
+				.expect("ordered overrides accepted");
+
+			assert!(
+				!raw.extract_inner::<bool>("rocksdb.checksums")
+					.unwrap()
+			);
+
+			assert!(!raw.contains("rocksdb_checksums"));
+		}
+	}
+
+	#[test]
+	fn read_only_flag_keeps_join_precedence_after_normalization() {
+		let configured = Config::normalize(("rocksdb_read_only", false)).unwrap();
+		let raw = updated(&["tuwunel", "--read-only"], Figment::from(configured)).unwrap();
+
+		assert!(
+			!raw.extract_inner::<bool>("rocksdb.read_only")
+				.unwrap()
+		);
+
+		let raw = updated(&["tuwunel", "--read-only"], Figment::new()).unwrap();
+
+		assert!(
+			raw.extract_inner::<bool>("rocksdb.read_only")
+				.unwrap()
+		);
+
+		assert!(raw.extract_inner::<bool>("maintenance").unwrap());
+		assert!(!raw.extract_inner::<bool>("listening").unwrap());
+	}
+
+	#[test]
+	fn maintenance_flags_keep_configured_values_and_explicit_overrides() {
+		for flag in ["--maintenance", "--read-only"] {
+			let configured = Config::normalize(("startup_netburst", true)).unwrap();
+			let configured = Figment::from(configured)
+				.merge(("maintenance", false))
+				.merge(("listening", true));
+
+			let raw = updated(&["tuwunel", flag], configured).unwrap();
+
+			assert!(!raw.extract_inner::<bool>("maintenance").unwrap());
+			assert!(raw.extract_inner::<bool>("listening").unwrap());
+			assert!(
+				raw.extract_inner::<bool>("sending.startup_netburst")
+					.unwrap()
+			);
+
+			let raw = updated(&["tuwunel", flag], Figment::new()).unwrap();
+
+			assert!(raw.extract_inner::<bool>("maintenance").unwrap());
+			assert!(!raw.extract_inner::<bool>("listening").unwrap());
+			assert!(
+				!raw.extract_inner::<bool>("sending.startup_netburst")
+					.unwrap()
+			);
+
+			let raw = updated(
+				&["tuwunel", flag, "-O", "sending.startup_netburst=true"],
+				Figment::new(),
+			)
+			.unwrap();
+
+			assert!(
+				raw.extract_inner::<bool>("sending.startup_netburst")
+					.unwrap()
+			);
+		}
+	}
+
+	#[cfg(feature = "console")]
+	#[test]
+	fn console_flag_keeps_join_precedence_after_normalization() {
+		let configured = Config::normalize(("admin_console_automatic", false)).unwrap();
+		let raw = updated(&["tuwunel", "--console"], Figment::from(configured)).unwrap();
+
+		assert!(
+			!raw.extract_inner::<bool>("admin.console_automatic")
+				.unwrap()
+		);
+
+		let raw = updated(&["tuwunel", "--console"], Figment::new()).unwrap();
+
+		assert!(
+			raw.extract_inner::<bool>("admin.console_automatic")
+				.unwrap()
+		);
+
+		let raw = updated(
+			&["tuwunel", "--console", "-O", "admin.console_automatic=false"],
+			Figment::new(),
+		)
+		.unwrap();
+
+		assert!(
+			!raw.extract_inner::<bool>("admin.console_automatic")
+				.unwrap()
+		);
+	}
 
 	#[test]
 	fn the_restore_argument_sets_the_key() {
@@ -656,6 +892,25 @@ mod tests {
 
 			Args::try_parse_from(["tuwunel".into(), long(option), "1".into()])
 				.expect("one histogram bucket accepted");
+		}
+	}
+
+	#[test]
+	fn io_batch_options_keep_their_contract() {
+		let command = Args::command();
+
+		for (id, env, default) in [
+			("kernel_events_per_tick", "TOKIO_MAX_IO_EVENTS_PER_TICK", "256"),
+			("kernel_events_per_busy_tick", "TOKIO_MAX_IO_EVENTS_PER_BUSY_TICK", "64"),
+		] {
+			let option = command
+				.get_arguments()
+				.find(|option| option.get_id().eq(id))
+				.expect("option declared");
+
+			assert!(option.is_hide_set(), "{id} is hidden from help");
+			assert_eq!(option.get_env().and_then(OsStr::to_str), Some(env));
+			assert_eq!(option.get_default_values(), [default]);
 		}
 	}
 }

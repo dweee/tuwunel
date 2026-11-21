@@ -4,6 +4,8 @@ mod get_global_account_data;
 mod get_room_account_data;
 mod set_global_account_data;
 mod set_room_account_data;
+#[cfg(test)]
+mod tests;
 
 use ruma::{
 	RoomId, UserId,
@@ -30,7 +32,9 @@ fn assert_account_data_owner(
 	appservice_info: Option<&RegistrationInfo>,
 	message: &str,
 ) -> Result {
-	if sender_user != user_id && appservice_info.is_none() {
+	if sender_user != user_id
+		&& !appservice_info.is_some_and(|registration| registration.is_user_match(user_id))
+	{
 		return Err!(Request(Forbidden("{message}")));
 	}
 
@@ -44,18 +48,7 @@ async fn set_account_data(
 	event_type_s: &str,
 	data: &RawJsonValue,
 ) -> Result {
-	if event_type_s == RoomAccountDataEventType::FullyRead.to_cow_str() {
-		return Err!(Request(BadJson(
-			"This endpoint cannot be used for marking a room as fully read (setting \
-			 m.fully_read)"
-		)));
-	}
-
-	if event_type_s == GlobalAccountDataEventType::PushRules.to_cow_str() {
-		return Err!(Request(BadJson(
-			"This endpoint cannot be used for setting/configuring push rules."
-		)));
-	}
+	validate_event_type(event_type_s)?;
 
 	let data: serde_json::Value = serde_json::from_str(data.get())
 		.map_err(|e| err!(Request(BadJson(warn!("Invalid JSON provided: {e}")))))?;
@@ -72,6 +65,23 @@ async fn set_account_data(
 			}),
 		)
 		.await
+}
+
+fn validate_event_type(event_type: &str) -> Result {
+	if event_type == RoomAccountDataEventType::FullyRead.to_cow_str() {
+		return Err!(Request(BadJson(
+			"This endpoint cannot be used for marking a room as fully read (setting \
+			 m.fully_read)"
+		)));
+	}
+
+	if event_type == GlobalAccountDataEventType::PushRules.to_cow_str() {
+		return Err!(Request(BadJson(
+			"This endpoint cannot be used for setting/configuring push rules."
+		)));
+	}
+
+	Ok(())
 }
 
 /// MSC3391: tombstoned account data carries `content: {}`. Sync delta

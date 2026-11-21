@@ -15,7 +15,7 @@ use ruma::{
 };
 use serde::Deserialize;
 use tuwunel_core::{
-	Event, debug_warn, err, implement,
+	debug_warn, err, implement,
 	itertools::Itertools,
 	smallvec::SmallVec,
 	utils::{
@@ -23,6 +23,7 @@ use tuwunel_core::{
 		stream::{BroadbandExt, WidebandExt},
 	},
 };
+use tuwunel_matrix::Event;
 
 use super::SendingResult;
 use crate::{
@@ -210,8 +211,15 @@ async fn txn_part(&self, info: &RegistrationInfo, msc3202: bool, event: &Sending
 				return Part::None;
 			};
 
-			let sender =
-				(msc3202 && info.is_user_match(pdu.sender())).then(|| pdu.sender().to_owned());
+			let own_user = info.is_user_match(pdu.sender());
+			let sender = (msc3202 && own_user).then(|| pdu.sender().to_owned());
+
+			// The appservice is the client that sent its own users' events.
+			let pdu = if own_user {
+				pdu
+			} else {
+				pdu.without_private_unless_sender(None)
+			};
 
 			Part::Pdu(pdu.to_format(), sender)
 		},

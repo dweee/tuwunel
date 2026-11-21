@@ -19,10 +19,6 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Error, Result, at, err,
-	matrix::{
-		event::{Event, RelationTypeEqual},
-		pdu::{PduCount, PduId},
-	},
 	utils::{
 		BoolExt,
 		math::usize_from_ruma_bounded,
@@ -30,9 +26,13 @@ use tuwunel_core::{
 		stream::{ReadyExt, WidebandExt},
 	},
 };
+use tuwunel_matrix::{
+	event::{Event, RelationTypeEqual},
+	pdu::{PduCount, PduId},
+};
 use tuwunel_service::Services;
 
-use crate::{Ruma, client::is_ignored_pdu};
+use crate::{Ruma, is_ignored_pdu};
 
 /// # `GET /_matrix/client/r0/rooms/{roomId}/relations/{eventId}/{relType}/{eventType}`
 pub(crate) async fn get_relating_events_with_rel_type_and_event_type_route(
@@ -187,7 +187,7 @@ async fn paginate_relations_with_filter(
 			.get_relations(shortroomid, count, from, dir, Some(sender_user))
 			.map(move |(count, pdu)| (depth, count, pdu))
 			.ready_filter(|(_, count, _)| matches!(count, PduCount::Normal(_)))
-			.boxed()
+			.boxed() // Unpin for select_all
 	};
 
 	let events = unfold(select_all(once(fetch(0, target.count))), async |mut relations| {
@@ -213,7 +213,7 @@ async fn paginate_relations_with_filter(
 	.wide_filter_map(async |(depth, count, pdu)| {
 		services
 			.state_accessor
-			.user_can_see_event(sender_user, pdu.room_id(), pdu.event_id())
+			.user_can_see_event(sender_user, &pdu)
 			.await
 			.then_some((depth, count, pdu))
 	})

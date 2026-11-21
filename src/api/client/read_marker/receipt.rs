@@ -4,16 +4,14 @@ use axum::extract::State;
 use ruma::{
 	MilliSecondsSinceUnixEpoch,
 	api::client::receipt::create_receipt::{self, v3::ReceiptType as CreateReceiptType},
-	events::{
-		RoomAccountDataEventType,
-		fully_read::{FullyReadEvent, FullyReadEventContent},
-		receipt::{Receipt, ReceiptEvent, ReceiptEventContent, ReceiptThread, ReceiptType},
-	},
+	events::receipt::{Receipt, ReceiptEvent, ReceiptEventContent, ReceiptThread, ReceiptType},
 };
 use tuwunel_core::{Err, Result};
 use tuwunel_service::presence::Ping;
 
-use super::{reset_and_refresh_badge, set_private_marker};
+use super::{
+	ensure_receipt_visible, reset_and_refresh_badge, set_fully_read, set_private_marker,
+};
 use crate::{ClientIp, Ruma};
 
 /// # `POST /_matrix/client/r0/rooms/{roomId}/receipt/{receiptType}/{eventId}`
@@ -25,13 +23,19 @@ pub(crate) async fn create_receipt_route(
 	body: Ruma<create_receipt::v3::Request>,
 ) -> Result<create_receipt::v3::Response> {
 	let sender_user = body.sender_user();
+	let fully_read = matches!(body.receipt_type, CreateReceiptType::FullyRead);
 
 	// MSC3771: thread_id MUST NOT be provided with `m.fully_read`.
-	if matches!(&body.receipt_type, CreateReceiptType::FullyRead)
-		&& !matches!(body.thread, ReceiptThread::Unthreaded)
-	{
+	if fully_read && !matches!(body.thread, ReceiptThread::Unthreaded) {
 		return Err!(Request(InvalidParam(
 			"thread_id must not be set for m.fully_read receipts"
+		)));
+	}
+
+	// MSC4446: only the fully-read marker may move backwards.
+	if body.allow_backward && !fully_read {
+		return Err!(Request(InvalidParam(
+			"allow_backward is only allowed to be true for m.fully_read."
 		)));
 	}
 
@@ -70,20 +74,29 @@ pub(crate) async fn create_receipt_route(
 		}
 	}
 
+	if matches!(body.receipt_type, CreateReceiptType::Read | CreateReceiptType::ReadPrivate) {
+		ensure_receipt_visible(&services, &body.room_id, sender_user, &body.event_id).await?;
+	}
+
 	let advanced = match body.receipt_type {
+		| CreateReceiptType::ReadPrivate =>
+			set_private_marker(
+				&services,
+				&body.room_id,
+				sender_user,
+				&body.event_id,
+				&body.thread,
+			)
+			.await?,
 		| CreateReceiptType::FullyRead => {
-			let fully_read_event = FullyReadEvent {
-				content: FullyReadEventContent { event_id: body.event_id.clone() },
-			};
-			services
-				.account_data
-				.update(
-					Some(&body.room_id),
-					sender_user,
-					RoomAccountDataEventType::FullyRead,
-					&serde_json::to_value(fully_read_event)?,
-				)
-				.await?;
+			set_fully_read(
+				&services,
+				&body.room_id,
+				sender_user,
+				&body.event_id,
+				body.allow_backward,
+			)
+			.await?;
 
 			false
 		},
@@ -122,15 +135,6 @@ pub(crate) async fn create_receipt_route(
 
 			advanced
 		},
-		| CreateReceiptType::ReadPrivate =>
-			set_private_marker(
-				&services,
-				&body.room_id,
-				sender_user,
-				&body.event_id,
-				&body.thread,
-			)
-			.await?,
 		| _ => {
 			return Err!(Request(InvalidParam(warn!(
 				"Received unknown read receipt type: {}",

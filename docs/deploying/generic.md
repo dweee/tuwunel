@@ -46,8 +46,8 @@ Nix to build tuwunel as this has the most
 guaranteed reproducibiltiy and easiest to get a build environment and output
 going. This also allows easy cross-compilation.
 
-You can run the `nix build -L .#static-x86_64-linux-musl-all-features` or
-`nix build -L .#static-aarch64-linux-musl-all-features` commands based
+You can run the `nix build -L .#static-x86_64-linux-musl` or
+`nix build -L .#static-aarch64-linux-musl` commands based
 on architecture to cross-compile the necessary static binary located at
 `result/bin/tuwunel`. This is reproducible with the static binaries produced
 in our CI.
@@ -56,7 +56,9 @@ If wanting to build using standard Rust toolchains, make sure you install:
 - `liburing-dev` on the compiling machine, and `liburing` on the target host
 - LLVM and libclang for RocksDB
 
-You can build Tuwunel using `cargo build --release --all-features`
+You can build Tuwunel using `cargo build --release`. See
+[Build Features](../development/build-features.md) for the features a plain
+build includes and how to change them.
 
 A plain build targets the baseline architecture, which is the `-v1-` equivalent
 and gets RocksDB's software CRC32C. Pass `-C target-cpu=` to get the hardware
@@ -65,7 +67,7 @@ stays on the machine that built it, or a named architecture such as `broadwell`
 when it does not.
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo build --release --all-features
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 Add `--locked` to build against the committed `Cargo.lock`. Without it Cargo
@@ -240,10 +242,12 @@ the legacy fallback behavior.
 
 Use `ip_source = "connect_info"` only when Tuwunel accepts direct TCP
 connections and should use the TCP peer address. Do not use `connect_info` for
-Unix-socket deployments; leave `ip_source` unset there.
+Unix-socket deployments, which have no TCP peer address.
 
 If Tuwunel is behind a trusted reverse proxy, set `ip_source` to match the
-header that proxy controls. Caddy, Nginx, and Traefik usually use
+header that proxy controls, including when the proxy connects over the Unix
+socket. Without it, password attempts from a local proxy or the Unix socket get
+no per-address limit. Caddy, Nginx, and Traefik usually use
 `ip_source = "rightmost_x_forwarded_for"`. Cloudflare and cloudflared
 deployments can use `ip_source = "cf_connecting_ip"` when Cloudflare supplies
 that header.

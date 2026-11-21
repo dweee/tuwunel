@@ -10,7 +10,7 @@ use ipaddress::{IPAddress, ipv4::from_u32 as ipv4_from_u32};
 use reqwest::{Client, ClientBuilder, Url, dns::Resolve, header::HeaderValue, redirect::Policy};
 use tuwunel_core::{
 	Config, Err, Result, config::proxy::ProxySnapshot, debug, either::Either, err,
-	error::error_chain, implement, trace,
+	error::error_chain, implement, trace, utils::math::u64_from_usize_saturating,
 };
 use url::Host;
 
@@ -21,17 +21,50 @@ mod tests;
 
 type DisableEncoding = fn(ClientBuilder) -> ClientBuilder;
 
+/// The outbound HTTP clients, one per purpose.
+///
+/// Built once on first use for the service's proxy snapshot; each carries its
+/// own resolver, timeouts and connection pool.
 pub struct Clients {
+	/// General HTTP requests using ordinary DNS resolution.
 	pub default: Client,
+
+	/// URL previews with interface selection and address validation.
 	pub url_preview: Client,
+
+	/// External media downloads with address and redirect validation.
 	pub extern_media: Client,
+
+	/// Server discovery through well-known documents with bounded timeouts.
 	pub well_known: Client,
-	pub federation: Client,
-	pub synapse: Client,
-	pub sender: Client,
+
+	/// Federation requests with the configured federation timeout and idle pool.
+	pub federation: Federation,
+
+	/// Federation requests with the extended Synapse read timeout.
+	pub synapse: Federation,
+
+	/// Outbound federation transactions with the sender timeout and one idle
+	/// connection per host.
+	pub sender: Federation,
+
+	/// Application service requests using their configured resolver and timeouts.
 	pub appservice: Client,
+
+	/// Push gateway requests with address and redirect validation.
 	pub pusher: Client,
+
+	/// OAuth provider requests with redirects disabled.
 	pub oauth: Client,
+}
+
+/// Separate DNS resolvers and connection pools for direct and SRV routes.
+///
+/// Route selection keeps requests with identical URL authorities from reusing
+/// a connection opened for the other DNS route.
+pub struct Federation {
+	direct: Client,
+	srv: Client,
 }
 
 pub struct Service {
@@ -58,6 +91,17 @@ impl crate::Service for Service {
 
 		probe_tls(config, &proxy)?;
 
+		let cidr_range_denylist = config
+			.network
+			.http
+			.ip_range_denylist
+			.iter()
+			.map(IPAddress::parse)
+			.inspect(|cidr| trace!("Denied CIDR range: {cidr:?}"))
+			.collect::<Result<Vec<_>, String>>()
+			.map(Arc::from)
+			.map_err(|e| err!(Config("network.http.ip_range_denylist", e)))?;
+
 		Ok(Arc::new(Self {
 			clients: LazyLock::new(Box::new({
 				let services = args.services.clone();
@@ -66,18 +110,18 @@ impl crate::Service for Service {
 			})),
 
 			proxy,
-			cidr_range_denylist: config
-				.ip_range_denylist
-				.iter()
-				.map(IPAddress::parse)
-				.inspect(|cidr| trace!("Denied CIDR range: {cidr:?}"))
-				.collect::<Result<Vec<_>, String>>()
-				.map(Arc::from)
-				.map_err(|e| err!(Config("ip_range_denylist", e)))?,
+			cidr_range_denylist,
 		}))
 	}
 
 	fn name(&self) -> &str { service::make_name(std::module_path!()) }
+}
+
+impl Federation {
+	#[inline]
+	pub(crate) fn for_srv(&self, srv: bool) -> &Client {
+		if srv { &self.srv } else { &self.direct }
+	}
 }
 
 /// Fails startup when an HTTPS client cannot be constructed.
@@ -113,64 +157,65 @@ fn make_clients(services: &Services) -> Result<Clients> {
 		}};
 	}
 
-	Ok(Clients {
-		default: with!(cb => cb.dns_resolver(Arc::clone(&services.resolver.resolver))),
+	let federation = make_federation(services, |cb| {
+		let transport = &services.config.federation.transport;
 
-		url_preview: with!("preview", cb => preview_builder(services, cb)?),
+		cb.read_timeout(Duration::from_secs(transport.timeout))
+			.pool_max_idle_per_host(transport.idle_per_host.into())
+			.pool_idle_timeout(Duration::from_secs(transport.idle_timeout))
+			.redirect(Policy::none())
+	})?;
 
-		extern_media: with!(cb => cb
+	let synapse = make_federation(services, |cb| {
+		cb.read_timeout(Duration::from_secs(305))
+			.pool_max_idle_per_host(0)
+			.redirect(Policy::none())
+	})?;
+
+	let sender = make_federation(services, |cb| {
+		cb.read_timeout(Duration::from_secs(services.config.sending.timeout))
+			.timeout(Duration::from_secs(services.config.sending.timeout))
+			.pool_max_idle_per_host(1)
+			.pool_idle_timeout(Duration::from_secs(services.config.sending.idle_timeout))
+			.redirect(Policy::none())
+	})?;
+
+	let default = with!(cb => cb.dns_resolver(Arc::clone(&services.resolver.resolver)));
+
+	let url_preview = with!("preview", cb => preview_builder(services, cb)?);
+
+	let extern_media = with!(cb => cb
 			.dns_resolver(Validating::new(
 				Arc::clone(&services.resolver.resolver),
 				Arc::clone(&services.client.cidr_range_denylist),
 				services.client.proxy.shared_hosts(),
 			))
-			.redirect(guarded_redirect(services, 3))),
+			.redirect(guarded_redirect(services, 3)));
 
-		well_known: with!(cb => cb
+	let well_known = with!(cb => cb
 			.dns_resolver(Arc::clone(&services.resolver.resolver))
 			.connect_timeout(Duration::from_secs(
-				services.config.well_known_conn_timeout,
+				services.config.network.discovery.conn_timeout,
 			))
-			.read_timeout(Duration::from_secs(services.config.well_known_timeout))
-			.timeout(Duration::from_secs(services.config.well_known_timeout))
+			.read_timeout(Duration::from_secs(services.config.network.discovery.timeout))
+			.timeout(Duration::from_secs(services.config.network.discovery.timeout))
 			.pool_max_idle_per_host(0)
-			.redirect(Policy::limited(4))),
+			// Discovery always starts over HTTPS; this refuses redirects to plain HTTP.
+			.https_only(true)
+			.redirect(guarded_redirect(services, 4)));
 
-		federation: with!(cb => cb
-			.dns_resolver(Arc::clone(&services.resolver.resolver.hooked))
-			.read_timeout(Duration::from_secs(services.config.federation_timeout))
-			.pool_max_idle_per_host(services.config.federation_idle_per_host.into())
-			.pool_idle_timeout(Duration::from_secs(
-				services.config.federation_idle_timeout,
-			))
-			.redirect(Policy::limited(3))),
+	Ok(Clients {
+		default,
+		url_preview,
+		extern_media,
 
-		synapse: with!(cb => cb
-			.dns_resolver(Arc::clone(&services.resolver.resolver.hooked))
-			.read_timeout(Duration::from_secs(305))
-			.pool_max_idle_per_host(0)
-			.redirect(Policy::limited(3))),
+		well_known,
 
-		sender: with!(cb => cb
-			.dns_resolver(Arc::clone(&services.resolver.resolver.hooked))
-			.read_timeout(Duration::from_secs(services.config.sender_timeout))
-			.timeout(Duration::from_secs(services.config.sender_timeout))
-			.pool_max_idle_per_host(1)
-			.pool_idle_timeout(Duration::from_secs(
-				services.config.sender_idle_timeout,
-			))
-			.redirect(Policy::limited(2))),
+		federation,
+		synapse,
+		sender,
 
-		appservice: with!(cb => cb
-			.dns_resolver(appservice_resolver(services))
-			.connect_timeout(Duration::from_secs(5))
-			.read_timeout(Duration::from_secs(services.config.appservice_timeout))
-			.timeout(Duration::from_secs(services.config.appservice_timeout))
-			.pool_max_idle_per_host(1)
-			.pool_idle_timeout(Duration::from_secs(
-				services.config.appservice_idle_timeout,
-			))
-			.redirect(Policy::limited(2))),
+		appservice: with!(cb => appservice_builder(services, cb)),
 
 		pusher: with!(cb => cb
 			.dns_resolver(Validating::new(
@@ -180,7 +225,7 @@ fn make_clients(services: &Services) -> Result<Clients> {
 			))
 			.pool_max_idle_per_host(1)
 			.pool_idle_timeout(Duration::from_secs(
-				services.config.pusher_idle_timeout,
+				services.config.push.idle_timeout,
 			))
 			.redirect(guarded_redirect(services, 2))),
 
@@ -191,13 +236,49 @@ fn make_clients(services: &Services) -> Result<Clients> {
 	})
 }
 
+#[cfg(unix)]
+pub(crate) fn make_appservice_unix(services: &Services, path: &str) -> Result<Client> {
+	let builder = base(&services.config, &services.client.proxy, None)?;
+	let client = appservice_builder(services, builder)
+		.no_proxy()
+		.unix_socket(path)
+		.build()?;
+
+	Ok(client)
+}
+
+fn appservice_builder(services: &Services, builder: ClientBuilder) -> ClientBuilder {
+	builder
+		.dns_resolver(appservice_resolver(services))
+		.connect_timeout(Duration::from_secs(5))
+		.read_timeout(Duration::from_secs(services.config.appservice_client.timeout))
+		.timeout(Duration::from_secs(services.config.appservice_client.timeout))
+		.pool_max_idle_per_host(1)
+		.pool_idle_timeout(Duration::from_secs(services.config.appservice_client.idle_timeout))
+		.redirect(Policy::limited(2))
+}
+
+fn make_federation(
+	services: &Services,
+	configure: impl Fn(ClientBuilder) -> ClientBuilder,
+) -> Result<Federation> {
+	let builder = || base(&services.config, &services.client.proxy, None);
+	let direct = builder()?.dns_resolver(Arc::clone(&services.resolver.resolver));
+	let srv = builder()?.dns_resolver(Arc::clone(&services.resolver.resolver.hooked));
+
+	Ok(Federation {
+		direct: configure(direct).build()?,
+		srv: configure(srv).build()?,
+	})
+}
+
 /// Construction for the URL preview client: bound to the configured
 /// interface and resolving through the CIDR-validating resolver.
 ///
 /// The configured User-Agent is applied per request rather than here, so a
 /// configuration reload takes effect without rebuilding the client.
 fn preview_builder(services: &Services, builder: ClientBuilder) -> Result<ClientBuilder> {
-	let interface = &services.config.url_preview_bound_interface;
+	let interface = &services.config.media.url_preview.bound_interface;
 
 	let bind_addr = interface.clone().and_then(Either::left);
 	let bind_iface = interface.clone().and_then(Either::right);
@@ -236,9 +317,23 @@ fn valid_cidr_range_url(denylist: &[IPAddress], url: &Url) -> bool {
 		| Some(Host::Domain(_)) | None => return true,
 	};
 
-	let ip = ipaddress_from_std(ip);
+	valid_cidr_range_ip(denylist, ip)
+}
 
-	denylist.iter().all(|cidr| !cidr.includes(&ip))
+/// Checks an address against a CIDR denylist.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) connects to its embedded
+/// IPv4 address, so it must pass the IPv4 ranges as well as the IPv6 ones.
+pub(crate) fn valid_cidr_range_ip(denylist: &[IPAddress], ip: IpAddr) -> bool {
+	let allowed = |ip: IpAddr| {
+		let ip = ipaddress_from_std(ip);
+
+		denylist.iter().all(|cidr| !cidr.includes(&ip))
+	};
+
+	let canonical = ip.to_canonical();
+
+	allowed(ip) && (canonical == ip || allowed(canonical))
 }
 
 fn base(config: &Config, proxy: &ProxySnapshot, name: Option<&str>) -> Result<ClientBuilder> {
@@ -248,22 +343,22 @@ fn base(config: &Config, proxy: &ProxySnapshot, name: Option<&str>) -> Result<Cl
 		.unwrap_or_else(|| user_agent.try_into())?;
 
 	let builder = Client::builder()
-		.connect_timeout(Duration::from_secs(config.request_conn_timeout))
-		.read_timeout(Duration::from_secs(config.request_timeout))
-		.timeout(Duration::from_secs(config.request_total_timeout))
-		.pool_idle_timeout(Duration::from_secs(config.request_idle_timeout))
-		.pool_max_idle_per_host(config.request_idle_per_host.into())
+		.connect_timeout(Duration::from_secs(config.network.http.conn_timeout))
+		.read_timeout(Duration::from_secs(config.network.http.timeout))
+		.timeout(Duration::from_secs(config.network.http.total_timeout))
+		.pool_idle_timeout(Duration::from_secs(config.network.http.idle_timeout))
+		.pool_max_idle_per_host(config.network.http.idle_per_host.into())
 		.user_agent(user_agent)
 		.redirect(Policy::limited(6))
-		.danger_accept_invalid_certs(config.allow_invalid_tls_certificates)
+		.danger_accept_invalid_certs(config.network.http.allow_invalid_tls_certificates)
 		.connection_verbose(cfg!(debug_assertions))
 		// Check if env var is set to avoid locking the keyfile mutex on every connection open
 		.tls_sslkeylogfile(std::env::var_os("SSLKEYLOGFILE").is_some());
 
 	let encodings: [(bool, DisableEncoding); 3] = [
-		(config.request_gzip, ClientBuilder::no_gzip),
-		(config.request_brotli, ClientBuilder::no_brotli),
-		(config.request_zstd, ClientBuilder::no_zstd),
+		(config.network.http.gzip, ClientBuilder::no_gzip),
+		(config.network.http.brotli, ClientBuilder::no_brotli),
+		(config.network.http.zstd, ClientBuilder::no_zstd),
 	];
 
 	let builder = encodings
@@ -284,7 +379,7 @@ pub async fn read_response_capped(
 	limit: usize,
 ) -> Result<Bytes> {
 	let mut body = match response.content_length() {
-		| Some(len) if len > limit.try_into().unwrap_or(u64::MAX) => {
+		| Some(len) if len > u64_from_usize_saturating(limit) => {
 			debug!(%len, %limit, "rejecting response: advertised body exceeds limit");
 			return Err!(BadServerResponse(
 				"Response body length {len} exceeds the {limit} byte limit"
@@ -338,7 +433,13 @@ fn builder_interface(builder: ClientBuilder, config: Option<&str>) -> Result<Cli
 }
 
 fn appservice_resolver(services: &Services) -> Arc<dyn Resolve> {
-	if services.server.config.dns_passthru_appservices {
+	if services
+		.server
+		.config
+		.network
+		.dns
+		.passthru_appservices
+	{
 		services.resolver.resolver.passthru.clone()
 	} else {
 		services.resolver.resolver.clone()
@@ -365,20 +466,17 @@ pub fn valid_cidr_range(&self, ip: &IPAddress) -> bool {
 		.all(|cidr| !cidr.includes(ip))
 }
 
+#[implement(Service)]
 #[inline]
 #[must_use]
-#[implement(Service)]
 pub fn valid_cidr_range_ip(&self, ip: IpAddr) -> bool {
-	let addr = ipaddress_from_std(ip);
-	self.cidr_range_denylist
-		.iter()
-		.all(|cidr| !cidr.includes(&addr))
+	valid_cidr_range_ip(&self.cidr_range_denylist, ip)
 }
 
 /// Checks an HTTP URL against the CIDR denylist when its host is an IP literal.
 ///
-/// Domain names pass here because the validating resolver screens their
-/// addresses later, immediately before connection.
+/// Domain names pass here and remain subject to each consumer's resolution
+/// policy.
 #[implement(Service)]
 #[inline]
 #[must_use]

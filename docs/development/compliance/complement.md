@@ -4,15 +4,15 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 
 ## Counts
 
-- Test groups: 218. Passing: **86.7%**
-  - ✅ `pass`: 189
-  - 🟨 `some`: 12
-  - ❌ `fail`: 17
+- Test groups: 224. Passing: **86.6%**
+  - ✅ `pass`: 194
+  - 🟨 `some`: 9
+  - 🟥 `fail`: 21
   - ⬛ `skip`: 0
 
-- Subtests: 606. Passing: **81.2%**
-  - ✅ `pass`: 492
-  - ❌ `fail`: 106
+- Subtests: 627. Passing: **83.7%**
+  - ✅ `pass`: 525
+  - 🟥 `fail`: 94
   - ⬛ `skip`: 8
 
 ## All Top-Level Tests
@@ -41,23 +41,23 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 | ✅ | – | `Content` |
 | ✅ | – | `ContentCSAPIMediaV1` |
 | ✅ | – | `ContentMediaV1` |
-| ❌ | – | `CorruptedAuthChain` |
+| 🟥 | – | `CorruptedAuthChain` |
 | ✅ | – | `CumulativeJoinLeaveJoinSync` |
 | ✅ | 4/0/0 | `DeactivateAccount` |
-| 🟨 | 6/7/1 | `DelayedEvents` |
+| ✅ | 24/0/1 | `DelayedEvents` |
 | ✅ | 1/0/0 | `DeletingDeviceRemovesDeviceLocalNotificationSettings` |
 | ✅ | – | `DemotingUsersViaUsersDefault` |
 | 🟨 | 8/2/0 | `DeviceListUpdates` |
 | ✅ | 2/0/0 | `DeviceListsUpdateOverFederation` |
-| ❌ | – | `DeviceListsUpdateOverFederationOnRoomJoin` |
+| 🟥 | – | `DeviceListsUpdateOverFederationOnRoomJoin` |
 | ✅ | 7/0/0 | `DeviceManagement` |
 | ✅ | – | `DisplayNameUpdate` |
 | ✅ | 3/0/0 | `E2EKeyBackupReplaceRoomKeyRules` |
 | ✅ | 3/0/0 | `Event` |
 | ✅ | 2/0/0 | `EventAuth` |
-| ❌ | – | `EventRelationships` |
+| 🟥 | – | `EventRelationships` |
 | ✅ | – | `FederatedClientSpaces` |
-| ❌ | – | `FederatedEventRelationships` |
+| 🟥 | – | `FederatedEventRelationships` |
 | ✅ | 2/0/0 | `FederationKeyUploadQuery` |
 | ✅ | – | `FederationRedactSendsWithoutEvent` |
 | ✅ | – | `FederationRejectInvite` |
@@ -73,7 +73,7 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 | ✅ | – | `FetchHistoricalSharedEvent` |
 | ✅ | – | `FetchMessagesFromNonExistentRoom` |
 | ✅ | – | `Filter` |
-| ❌ | – | `FilterMessagesByRelType` |
+| 🟥 | – | `FilterMessagesByRelType` |
 | ✅ | – | `ForwardExtremityPrune` |
 | ✅ | – | `GapFillingAuthorizedStateEvent` |
 | ✅ | – | `GapFillingDeepChain` |
@@ -89,7 +89,7 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 | ✅ | 4/0/0 | `InboundCanReturnMissingEvents` |
 | ✅ | – | `InboundFederationKeys` |
 | ✅ | 2/0/0 | `InboundFederationProfile` |
-| ❌ | – | `InboundFederationRejectsEventsWithRejectedAuthEvents` |
+| 🟥 | – | `InboundFederationRejectsEventsWithRejectedAuthEvents` |
 | ✅ | 11/0/0 | `InviteFiltering` |
 | ✅ | – | `InviteFromIgnoredUsersDoesNotAppearInSync` |
 | ✅ | – | `IsDirectFlagFederation` |
@@ -112,15 +112,19 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 | ✅ | – | `LeakyTyping` |
 | ✅ | – | `LeaveEventInviteRejection` |
 | ✅ | – | `LeaveEventVisibility` |
-| 🟨 | 2/3/0 | `LeftRoomFixture` |
+| ✅ | 5/0/0 | `LeftRoomFixture` |
 | ✅ | 2/0/0 | `LocalPngThumbnail` |
 | ✅ | 8/0/0 | `Login` |
 | ✅ | 4/0/0 | `Logout` |
-| ❌ | – | `MSC3389RedactionPreservesPlainRelation` |
-| ❌ | – | `MSC3389RedactionPreservesRelation` |
+| 🟥 | – | `MSC3389RedactionPreservesPlainRelation` |
+| 🟥 | – | `MSC3389RedactionPreservesRelation` |
 | ✅ | – | `MSC3389RedactionStripsRelationInOlderVersions` |
-| ❌ | – | `MSC3757OwnedState` |
+| 🟥 | – | `MSC3757OwnedState` |
 | ✅ | – | `MSC3967` |
+| 🟥 | – | `MSC4242JoinLeaveRejoinPublicRoom` |
+| 🟥 | – | `MSC4242JoinPublicRoomWithRejectedStateDAGEvents` |
+| 🟥 | – | `MSC4242RejectionCascadesOnRejoin` |
+| 🟥 | – | `MSC4242RejoinMergesOldAndNewStateDAGBranches` |
 | ✅ | 11/0/0 | `MSC4289PrivilegedRoomCreators` |
 | ✅ | – | `MSC4289PrivilegedRoomCreators_Additional` |
 | ✅ | – | `MSC4289PrivilegedRoomCreators_AdditionalCreatorsAndInvited` |
@@ -134,24 +138,26 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 | ✅ | – | `MSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms` |
 | ✅ | – | `MSC4297StateResolutionV2_1_includes_conflicted_subgraph` |
 | ✅ | – | `MSC4297StateResolutionV2_1_starts_from_empty_set` |
-| ❌ | 0/2/0 | `MSC4308ThreadSubscriptionsSlidingSync` |
-| ✅ | – | `MSC4311FullCreateEventOnStrippedState` |
-| ❌ | 0/6/0 | `MSC4429ProfileUpdates` |
+| 🟥 | 0/2/0 | `MSC4308ThreadSubscriptionsSlidingSync` |
+| ✅ | 3/0/0 | `MSC4311FullEventsOnStrippedStateFederation` |
+| ✅ | 2/0/0 | `MSC4311RejectInvalidStrippedStateFederation` |
+| ✅ | 5/0/0 | `MSC4311StrippedStateClientAPI` |
+| 🟥 | 0/6/0 | `MSC4429ProfileUpdates` |
 | ✅ | – | `MediaConfig` |
 | ✅ | 25/0/0 | `MediaFilenames` |
 | ✅ | 4/0/0 | `MediaWithoutFileName` |
 | ✅ | 4/0/0 | `MediaWithoutFileNameCSMediaV1` |
 | 🟨 | 3/2/0 | `MembersLocal` |
-| ❌ | – | `MembershipOnEvents` |
+| 🟥 | – | `MembershipOnEvents` |
 | 🟨 | 3/2/0 | `MessagesOverFederation` |
 | ✅ | – | `NetworkPartitionOrdering` |
 | ✅ | – | `NotPresentUserCannotBanOthers` |
 | ✅ | – | `OlderLeftRoomsNotInLeaveSection` |
-| ❌ | – | `OutboundFederationEventSizeGetMissingEvents` |
-| ❌ | – | `OutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6` |
+| 🟥 | – | `OutboundFederationEventSizeGetMissingEvents` |
+| 🟥 | – | `OutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6` |
 | ✅ | 1/0/0 | `OutboundFederationProfile` |
 | ✅ | – | `OutboundFederationSend` |
-| ❌ | 0/59/6 | `PartialStateJoin` |
+| 🟥 | 0/59/6 | `PartialStateJoin` |
 | ✅ | 1/0/0 | `PollsLocalPushRules` |
 | ✅ | 3/0/0 | `PowerLevels` |
 | ✅ | 5/0/0 | `Presence` |
@@ -169,7 +175,7 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 | ✅ | – | `RelationsPaginationSync` |
 | ✅ | – | `RemoteAliasRequestsUnderstandUnicode` |
 | ✅ | 2/0/0 | `RemotePngThumbnail` |
-| ❌ | 0/2/0 | `RemotePresence` |
+| 🟥 | 0/2/0 | `RemotePresence` |
 | ✅ | – | `RemoteTyping` |
 | ✅ | 4/0/0 | `RemovingAccountData` |
 | ✅ | 1/0/0 | `RequestEncodingFails` |
@@ -188,7 +194,7 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 | ✅ | 15/0/0 | `RoomCreate` |
 | ✅ | 6/0/0 | `RoomCreationReportsEventsToMyself` |
 | ✅ | 9/0/0 | `RoomDeleteAlias` |
-| 🟨 | 6/2/0 | `RoomForget` |
+| ✅ | 8/0/0 | `RoomForget` |
 | ✅ | – | `RoomImageRoundtrip` |
 | ✅ | 10/0/0 | `RoomMembers` |
 | ✅ | – | `RoomMessagesLazyLoading` |
@@ -216,7 +222,7 @@ Tuwunel runs the [Complement](https://github.com/matrix-org/complement) Matrix h
 | ✅ | 2/0/0 | `SyncTimelineGap` |
 | ✅ | – | `TentativeEventualJoiningAfterRejecting` |
 | 🟨 | 1/7/0 | `ThreadSubscriptions` |
-| ❌ | – | `ThreadedReceipts` |
+| 🟥 | – | `ThreadedReceipts` |
 | ✅ | – | `ThreadsEndpoint` |
 | ✅ | – | `ToDeviceMessages` |
 | ✅ | 1/0/0 | `ToDeviceMessagesOverFederation` |

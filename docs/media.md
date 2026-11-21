@@ -19,6 +19,33 @@ all of these features, as well as the storage backends that back them.
 | `media_create_unused_expiration_time` | `86400` | Seconds before an unused pending MXC URI is expired and removed (default: 24 hours). |
 | `media_rc_create_per_second` | `10` | Maximum media-create requests per second from a single user before rate limiting applies. |
 | `media_rc_create_burst_count` | `50` | Maximum burst size for media-create rate limiting per user. |
+| `media_upload_min_free_space` | `1 GiB` | Writable space below which uploads are refused. Accepts SI/IEC units, e.g. `"10 GiB"`. `0` disables the check. |
+
+### Refusing uploads when storage is short of space
+
+Media is what fills a disk, and by default it is stored beside the database,
+which cannot be written once the disk is full. So an upload is refused while
+the filesystem of any [local storage provider](media/storage.md) it would be
+written to has less space available than `media_upload_min_free_space`. The
+space counted is what an unprivileged process may still write, which leaves
+out the blocks a filesystem reserves for privileged ones; on Unix, per-user
+quotas are not counted. The size of the upload itself is not counted either:
+an upload is taken whenever the space available is at least the option's
+value, so keep it well above `max_request_size`.
+
+A refused upload is answered `403` with `M_RESOURCE_LIMIT_EXCEEDED` before
+anything is written, and the server logs a warning naming the storage path
+and the space left on it. The `admin_contact` the specification requires that
+error to carry is empty; clients find the server's contacts through
+[support discovery](https://spec.matrix.org/latest/client-server-api/#getwell-knownmatrixsupport).
+
+Nothing else is refused. Messages are sent and read as before, existing media
+is served, and media fetched from other servers, URL previews and thumbnails
+are still stored. Uploads resume as soon as the space is back, with nothing
+restarted. A storage provider that is not a directory is never the reason for
+a refusal, and neither is a filesystem whose available space cannot be read,
+though the server logs a warning when it cannot read one. Set the option to `0` to turn the check off, for instance on a network mount
+that reports no free space.
 
 ## Legacy media endpoints
 
@@ -246,20 +273,34 @@ frame will do.
 
 ### Containers
 
-The published images carry no decoder. Installing ffmpeg on our own Debian
-base, with `--no-install-recommends`, costs about 190 MB of codec libraries,
-and bundling that would charge every deployment for a feature that is off by
-default. So the program is yours to supply. Two ways, and the second needs no
-image of your own.
+The published images carry no decoder. Installing ffmpeg from Debian, with
+`--no-install-recommends`, adds about 470 MB of codec libraries, and bundling
+that would charge every deployment for a feature that is off by default. So the
+program is yours to supply. Two ways, and the second needs no image of your
+own.
 
-Derive an image. The runtime is Debian, so this is the whole of it:
+Build an image. The published image is built `FROM scratch`: it holds the
+tuwunel binary and a CA bundle, and no shell or package manager to install
+anything with. The binary is statically linked, so start from Debian and copy
+it in:
 
 ```dockerfile
-FROM ghcr.io/matrix-construct/tuwunel:latest
+FROM debian:trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg \
+ && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
  && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/matrix-construct/tuwunel:latest /usr/bin/tuwunel /usr/bin/tuwunel
+EXPOSE 8008 8448
+ENTRYPOINT ["tuwunel"]
+HEALTHCHECK --interval=30s --timeout=15s --start-period=1800s CMD ["tuwunel", "--health-check"]
 ```
+
+The last three lines restate what the published image declares, which a new
+base does not inherit, and `ca-certificates` stands in for its CA bundle.
+Podman keeps the `HEALTHCHECK` only when it builds with `--format docker`;
+otherwise pass the probe when you run the container, as [Health checking
+outside a quadlet](deploying/podman-systemd.md#health-checking-outside-a-quadlet)
+shows.
 
 Or mount a decoder in. Because tuwunel runs a program rather than linking a
 library, a statically linked ffmpeg build is just a file the container needs to
@@ -302,7 +343,8 @@ with it.
 ## URL previews
 
 URL previews are disabled unless at least one allowlist is configured.
-All allowlist checks are evaluated before the denylist check. The
+The denylist is checked before the allowlists, except that `"*"` in any
+allowlist admits every URL without consulting the denylist. The
 [URL Previews](media/url-previews.md) page covers user agents, the spider
 budget, caching, and troubleshooting an empty preview.
 
@@ -311,8 +353,8 @@ budget, caching, and troubleshooting an empty preview.
 | `url_preview_domain_explicit_allowlist` | `[]` | Exact domain matches allowed for previewing. `"google.com"` matches `https://google.com` but not `https://subdomain.google.com`. Set to `["*"]` to allow all domains. |
 | `url_preview_domain_contains_allowlist` | `[]` | Substring domain matches. `"google.com"` matches any URL whose domain contains that string — including unrelated domains. Set to `["*"]` to allow all domains. |
 | `url_preview_url_contains_allowlist` | `[]` | Substring match against the full URL (not just the domain). Set to `["*"]` to allow all URLs. |
-| `url_preview_domain_explicit_denylist` | `[]` | Exact domain matches explicitly blocked. The denylist is checked first. Setting to `["*"]` has no effect. |
-| `url_preview_check_root_domain` | `false` | When enabled, domain allowlist checks are applied to the root domain. Allows all subdomains of any allowed domain — e.g. allowing `wikipedia.org` also allows `en.m.wikipedia.org`. |
+| `url_preview_domain_explicit_denylist` | `[]` | Exact domain matches explicitly blocked. The denylist is checked first, unless an allowlist holds `"*"`. Setting to `["*"]` has no effect. |
+| `url_preview_check_root_domain` | `false` | When enabled, a host no allowlist admits is checked again with its first label removed, against the explicit denylist and allowlist. This reaches one level of subdomain only: with `wikipedia.org` in `url_preview_domain_explicit_allowlist`, `en.wikipedia.org` is allowed but `en.m.wikipedia.org` is not. |
 | `url_preview_max_spider_size` | `786432` | Maximum bytes read from a page when generating a preview (default: 768 KiB). A page whose OpenGraph tags sit past this point yields an empty preview. |
 | `url_preview_max_media_size` | `52428800` | Maximum size of a single media item fetched or relayed for a URL preview: the og:image measurement fetch and the lazy-media relay. Media larger than this is not registered, and an over-cap relay is refused (default: 50 MiB). |
 | `url_preview_cache_ttl` | `86400` | Seconds a generated preview is cached before the page is fetched again, empty previews included (default: 24 hours). Raise it to spare origins in a room whose history is read often, lower it to pick up changed OpenGraph metadata sooner. |

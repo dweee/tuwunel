@@ -13,12 +13,7 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Err, PduId, Result, at, err,
-	matrix::{
-		event::{Event, Matches},
-		pdu::{PduCount, PduEvent},
-	},
-	ref_at,
+	Err, Result, at, err, ref_at,
 	smallvec::SmallVec,
 	utils::{
 		BoolExt, IterStream, ReadyExt,
@@ -26,6 +21,11 @@ use tuwunel_core::{
 		result::LogErr,
 		stream::{BroadbandExt, TryIgnore, WidebandExt},
 	},
+};
+use tuwunel_matrix::{
+	PduId,
+	event::{Event, Matches},
+	pdu::{PduCount, PduEvent},
 };
 use tuwunel_service::{
 	Services,
@@ -37,18 +37,34 @@ use tuwunel_service::{
 	},
 };
 
+use super::visibility_filter;
 use crate::Ruma;
 
 /// Shared inputs for [`get_messages`], the pagination core behind both the
 /// client-server `/messages` route and the admin room-messages endpoint.
-pub(crate) struct MessagesArgs<'a> {
+pub struct MessagesArgs<'a> {
+	/// Room whose timeline is paginated.
 	pub room_id: &'a RoomId,
+
+	/// User requesting the timeline page.
 	pub sender_user: &'a UserId,
+
+	/// Requesting device used for lazy-loading membership state.
 	pub sender_device: Option<&'a DeviceId>,
+
+	/// Optional starting pagination token.
 	pub from: Option<&'a str>,
+
+	/// Optional stopping pagination token.
 	pub to: Option<&'a str>,
+
+	/// Direction in which to paginate the timeline.
 	pub dir: Direction,
+
+	/// Requested maximum number of returned timeline events.
 	pub limit: Option<UInt>,
+
+	/// Filter for timeline events and membership state.
 	pub filter: &'a RoomEventFilter,
 
 	/// Skip the room-visibility gate and the per-event visibility and ignore
@@ -109,9 +125,10 @@ pub(crate) async fn get_message_events_route(
 }
 
 /// Paginates a room's timeline, applying the request filter and (unless
-/// `bypass_visibility`) the per-user visibility and ignore filters. Powers the
-/// client-server `/messages` route and its admin bypass twin.
-pub(crate) async fn get_messages(
+/// `bypass_visibility`) the per-user visibility and ignore filters.
+///
+/// Powers the client-server `/messages` route and its admin bypass twin.
+pub async fn get_messages(
 	services: &Services,
 	args: MessagesArgs<'_>,
 ) -> Result<get_message_events::v3::Response> {
@@ -233,7 +250,9 @@ pub(crate) async fn get_messages(
 		.map(IterStream::stream)
 		.into_stream()
 		.flatten()
-		.broad_filter_map(async |user_id| get_member_event(services, room_id, &user_id).await)
+		.broad_filter_map(async |user_id| {
+			get_member_event(services, sender_user, room_id, &user_id).await
+		})
 		.collect()
 		.await;
 
@@ -307,12 +326,14 @@ where
 
 async fn get_member_event(
 	services: &Services,
+	sender_user: &UserId,
 	room_id: &RoomId,
 	user_id: &UserId,
 ) -> Option<Raw<AnyStateEvent>> {
 	services
 		.state_accessor
 		.room_state_get(room_id, &StateEventType::RoomMember, user_id.as_str())
+		.map_ok(|event| event.without_private_unless_sender(Some(sender_user)))
 		.map_ok(Event::into_format)
 		.await
 		.ok()
@@ -412,21 +433,6 @@ where
 }
 
 #[inline]
-pub(crate) async fn visibility_filter(
-	services: &Services,
-	item: PdusIterItem,
-	user_id: &UserId,
-) -> Option<PdusIterItem> {
-	let (_, pdu) = &item;
-
-	services
-		.state_accessor
-		.user_can_see_event(user_id, pdu.room_id(), pdu.event_id())
-		.await
-		.then_some(item)
-}
-
-#[inline]
 pub(crate) fn event_filter(item: PdusIterItem, filter: &RoomEventFilter) -> Option<PdusIterItem> {
 	let (_, pdu) = &item;
 	filter.matches(pdu).then_some(item)
@@ -457,7 +463,7 @@ pub(crate) async fn annotate_membership(
 
 /// `annotate_membership` consume-and-return adapter for stream chains.
 #[inline]
-pub(crate) async fn with_membership(
+pub async fn with_membership(
 	services: &Services,
 	mut pdu: PduEvent,
 	user_id: &UserId,

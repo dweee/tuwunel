@@ -2,41 +2,84 @@ use std::collections::HashSet;
 
 use futures::{
 	FutureExt, StreamExt, TryFutureExt,
-	future::{join, join3},
+	future::{join, join4},
 	stream::once,
 };
 use ruma::{
 	OwnedUserId, RoomId,
-	api::client::sync::sync_events::{DeviceLists, v5::response},
+	api::client::sync::sync_events::{DeviceLists, v5::response::E2EE},
 	events::{
 		StateEventType, TimelineEventType,
 		room::member::{MembershipState, RoomMemberEventContent},
 	},
 };
 use tuwunel_core::{
-	Result, error,
-	matrix::{Event, pdu::PduCount},
-	pair_of,
+	Result, error, pair_of,
 	utils::{
 		BoolExt, FutureBoolExt, IterStream, ReadyExt, TryFutureExtExt,
 		future::{OptionFutureExt, OptionStream, ReadyBoolExt},
 		stream::BroadbandExt,
 	},
 };
+use tuwunel_matrix::{Event, pdu::PduCount};
 use tuwunel_service::sync::Connection;
 
-use super::{SyncInfo, share_encrypted_room};
+use super::{SyncInfo, joined_since, share_encrypted_room};
 
 #[tracing::instrument(name = "e2ee", level = "trace", skip_all)]
-pub(super) async fn collect(
-	sync_info: SyncInfo<'_>,
-	conn: &Connection,
-) -> Result<response::E2EE> {
+pub(super) async fn collect(sync_info: SyncInfo<'_>, conn: &Connection) -> Result<(E2EE, bool)> {
 	let SyncInfo { services, sender_user, sender_device, .. } = sync_info;
 	let Some(sender_device) = sender_device else {
-		return Ok(response::E2EE::default());
+		return Ok(Default::default());
 	};
 
+	let device_lists = sync_info
+		.previous_connection_pos
+		.is_some()
+		.then_async(|| device_lists(sync_info, conn))
+		.map(Option::unwrap_or_default);
+
+	let keys_changed = services
+		.users
+		.last_one_time_keys_update(sender_user)
+		.map(|since| since > conn.globalsince);
+
+	let device_one_time_keys_count = services
+		.users
+		.count_one_time_keys(sender_user, sender_device);
+
+	let device_unused_fallback_key_types = services
+		.users
+		.unused_fallback_key_algorithms(sender_user, sender_device)
+		.collect::<Vec<_>>()
+		.map(Some);
+
+	let (
+		device_lists,
+		keys_changed,
+		device_one_time_keys_count,
+		device_unused_fallback_key_types,
+	) = join4(
+		device_lists,
+		keys_changed,
+		device_one_time_keys_count,
+		device_unused_fallback_key_types,
+	)
+	.boxed() // size firewall
+	.await;
+
+	let response = E2EE {
+		device_lists,
+		device_one_time_keys_count,
+		device_unused_fallback_key_types,
+	};
+
+	Ok((response, keys_changed))
+}
+
+#[tracing::instrument(level = "trace", skip_all)]
+async fn device_lists(sync_info: SyncInfo<'_>, conn: &Connection) -> DeviceLists {
+	let SyncInfo { services, sender_user, .. } = sync_info;
 	let keys_changed = services
 		.users
 		.keys_changed(sender_user, conn.globalsince, Some(conn.next_batch))
@@ -61,45 +104,19 @@ pub(super) async fn collect(
 	let left = left
 		.into_iter()
 		.stream()
-		.filter_map(async |user_id| {
-			share_encrypted_room(services, sender_user, &user_id, None)
+		.broad_filter_map(async |user_id| {
+			share_encrypted_room(services, sender_user, &user_id)
 				.await
 				.is_false()
 				.then_some(user_id)
 		})
-		.collect();
+		.collect()
+		.await;
 
-	let device_one_time_keys_count = services
-		.users
-		.last_one_time_keys_update(sender_user)
-		.then(|since| {
-			since.gt(&conn.globalsince).then_async(|| {
-				services
-					.users
-					.count_one_time_keys(sender_user, sender_device)
-			})
-		})
-		.map(Option::unwrap_or_default);
-
-	let device_unused_fallback_key_types = services
-		.users
-		.unused_fallback_key_algorithms(sender_user, sender_device)
-		.collect::<Vec<_>>()
-		.map(Some);
-
-	let (left, device_one_time_keys_count, device_unused_fallback_key_types) =
-		join3(left, device_one_time_keys_count, device_unused_fallback_key_types)
-			.boxed()
-			.await;
-
-	Ok(response::E2EE {
-		device_one_time_keys_count,
-		device_unused_fallback_key_types,
-		device_lists: DeviceLists {
-			changed: changed.into_iter().collect(),
-			left,
-		},
-	})
+	DeviceLists {
+		changed: changed.into_iter().collect(),
+		left,
+	}
 }
 
 #[tracing::instrument(level = "trace", skip_all, fields(room_id), ret)]
@@ -122,7 +139,7 @@ async fn collect_room(
 
 	let (current_shortstatehash, device_list_changed) =
 		join(current_shortstatehash, room_keys_changed)
-			.boxed()
+			.boxed() // erase region
 			.await;
 
 	let lists = (device_list_changed, HashSet::new());
@@ -158,22 +175,20 @@ async fn collect_room(
 	if !current_encrypted
 		&& services
 			.config
+			.encryption
 			.device_key_update_encrypted_rooms_only
 	{
 		return Ok(lists);
 	}
 
-	let joined_since_last_sync = services
-		.state_cache
-		.get_joined_count(room_id, sender_user)
-		.map_ok_or(false, |count| count > conn.globalsince);
+	let joined_since_last_sync = joined_since(services, room_id, sender_user, conn.globalsince);
 
 	// A plaintext room bursts only on the sender's own join.
 	let newly_encrypted = current_encrypted
 		.then_async(|| encrypted_at(since_shortstatehash).is_false())
 		.unwrap_or_default();
 
-	// The keyed membership read leads; the state lookup trails it.
+	// The join check leads; the state lookup trails.
 	let members_burst = joined_since_last_sync
 		.is_false()
 		.and(newly_encrypted.is_false())
@@ -187,7 +202,7 @@ async fn collect_room(
 			.ready_filter(|&user_id| user_id != sender_user)
 			.map(ToOwned::to_owned)
 			.map(|user_id| (MembershipState::Join, user_id))
-			.boxed()
+			.boxed() // Unpin for into_future
 			.into_future()
 	});
 
@@ -214,15 +229,11 @@ async fn collect_room(
 			Some((content.membership, user_id))
 		})
 		.chain(joined_members_burst.stream())
-		.fold(lists, async |(mut changed, mut left), (membership, user_id)| {
+		.ready_fold(lists, |(mut changed, mut left), (membership, user_id)| {
 			use MembershipState::*;
 
-			let should_add = async |user_id| {
-				!share_encrypted_room(services, sender_user, user_id, Some(room_id)).await
-			};
-
 			match membership {
-				| Join if should_add(&user_id).await => changed.insert(user_id),
+				| Join => changed.insert(user_id),
 				| Leave => left.insert(user_id),
 				| _ => false,
 			};
@@ -230,6 +241,5 @@ async fn collect_room(
 			(changed, left)
 		})
 		.map(Ok)
-		.boxed()
 		.await
 }

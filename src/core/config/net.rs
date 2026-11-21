@@ -7,7 +7,14 @@ use either::{
 use ruma::ServerName;
 use serde::Deserialize;
 
-use crate::{Result, err, implement, utils::BoolExt};
+use crate::{
+	Err, Result,
+	arrayvec::ArrayString,
+	err, implement,
+	utils::{BoolExt, string::to_array_string},
+};
+
+type PermissionDigits = ArrayString<10>;
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(transparent)]
@@ -29,9 +36,10 @@ pub(super) struct ListeningAddr {
 /// invalid octal digit produces a configuration error.
 #[implement(super::Config)]
 pub fn get_unix_socket_perms(&self) -> Result<u32> {
-	let octal_perms = self.unix_socket_perms.to_string();
-	let socket_perms = u32::from_str_radix(&octal_perms, 8)
-		.map_err(|_| err!(Config("unix_socket_perms", "failed to convert octal permissions")))?;
+	let octal_perms: PermissionDigits = to_array_string(self.http.listen.unix_socket_perms);
+	let socket_perms = u32::from_str_radix(&octal_perms, 8).map_err(|_| {
+		err!(Config("http.listen.unix_socket_perms", "failed to convert octal permissions"))
+	})?;
 
 	Ok(socket_perms)
 }
@@ -60,37 +68,84 @@ pub fn get_bind_addrs(&self) -> Vec<SocketAddr> {
 
 #[implement(super::Config)]
 fn get_bind_hosts(&self) -> Vec<IpAddr> {
-	self.address.as_ref().map_or_else(
-		|| {
-			self.unix_socket_path
+	self.http
+		.listen
+		.address
+		.as_ref()
+		.map(|address| match &address.addrs {
+			| Left(addr) => vec![*addr],
+			| Right(addrs) => addrs.clone(),
+		})
+		.unwrap_or_else(|| {
+			self.http
+				.listen
+				.unix_socket_path
 				.is_none()
 				.then(|| vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()])
 				.unwrap_or_default()
-		},
-		|address| match &address.addrs {
-			| Left(addr) => vec![*addr],
-			| Right(addrs) => addrs.clone(),
-		},
-	)
+		})
 }
 
 #[implement(super::Config)]
 fn get_bind_ports(&self) -> Vec<u16> {
-	match &self.port.ports {
+	match &self.http.listen.port.ports {
 		| Left(port) => vec![*port],
 		| Right(ports) => ports.clone(),
 	}
 }
 
 /// Whether the addresses to bind come from the built-in default rather than
-/// the `address` option.
+/// the `http.listen.address` option.
 ///
 /// The default is a guess that both loopback families exist on the host, so
 /// one of them failing to bind is tolerable where a configured address is not.
 #[implement(super::Config)]
 #[inline]
 #[must_use]
-pub fn is_address_defaulted(&self) -> bool { self.address.is_none() }
+pub fn is_address_defaulted(&self) -> bool { self.http.listen.address.is_none() }
+
+/// Refuses a request that needs federation while federation is disabled.
+///
+/// Inbound and outbound requests fail with the same 403 `M_FORBIDDEN`, since
+/// the refusal enforces the operator's setting rather than reporting a fault.
+#[implement(super::Config)]
+#[inline]
+pub fn require_federation(&self) -> Result {
+	self.federation
+		.enable
+		.into_option()
+		.ok_or_else(|| err!(Request(Forbidden("Federation is disabled."))))
+}
+
+/// Refuses federation with a remote server while federation is disabled or
+/// the configuration forbids that server.
+///
+/// The forbidden-server check always permits the local server name. Either
+/// refusal fails with the same 403 `M_FORBIDDEN` for inbound and outbound
+/// requests.
+#[implement(super::Config)]
+pub fn require_remote_permitted(&self, server_name: &ServerName) -> Result {
+	self.require_federation()?;
+
+	if !self.is_remote_permitted(server_name) {
+		return Err!(Request(Forbidden(debug_warn!(
+			"Federation with {server_name} is not allowed."
+		))));
+	}
+
+	Ok(())
+}
+
+/// Determines whether federation with a remote server is allowed.
+///
+/// `require_remote_permitted` wraps this check; call this directly where
+/// refusals are too frequent to build an error each time.
+#[implement(super::Config)]
+#[inline]
+#[must_use]
+pub fn is_remote_permitted(&self, server_name: &ServerName) -> bool {
+	self.federation.enable && !self.is_forbidden_remote_server_name(server_name)
+}
 
 /// Determines whether a remote server name is forbidden.
 ///
@@ -104,17 +159,20 @@ pub fn is_forbidden_remote_server_name(&self, server_name: &ServerName) -> bool 
 	}
 
 	let deny_list_active = self
+		.federation
 		.forbidden_remote_server_names
 		.is_empty()
 		.is_false();
 
 	let allow_list_active = self
+		.federation
 		.allowed_remote_server_names_experimental
 		.is_empty()
 		.is_false();
 
 	if deny_list_active
 		&& self
+			.federation
 			.forbidden_remote_server_names
 			.is_match(server_name.host())
 	{
@@ -122,9 +180,11 @@ pub fn is_forbidden_remote_server_name(&self, server_name: &ServerName) -> bool 
 	}
 
 	if allow_list_active
-		&& !self
+		&& self
+			.federation
 			.allowed_remote_server_names_experimental
 			.is_match(server_name.host())
+			.is_false()
 	{
 		return true;
 	}

@@ -7,11 +7,15 @@ created.
 ## Enabling registration
 
 Set `allow_registration = true` to enable registration. On its own this is not
-enough — you must also configure at least one of the following:
+enough; you must also configure at least one of the following:
 
 - A registration token (recommended)
+- [Required email at registration](#requiring-email-at-registration), with an
+  SMTP `connection_uri` set
 - The open-registration confirmation flag (not recommended)
-- One or more [identity providers](providers.md)
+
+Password registration also needs `login_with_password` left at its default of
+`true`. With it disabled, only identity providers can register new accounts.
 
 ### Token-based registration
 
@@ -34,7 +38,7 @@ allow_registration = true
 registration_token_file = "/etc/tuwunel/.reg_tokens"
 ```
 
-Both options can be set at the same time; the file takes priority.
+Both options can be set at the same time; tokens from both are accepted.
 
 **Admin-issued tokens** — generate short-lived or single-use tokens from the
 admin room without touching the config file:
@@ -122,16 +126,95 @@ accounts were created.
 
 | Option | Default | Description |
 |---|---|---|
-| `login_with_password` | `true` | Accept username and password login. Set to `false` to enforce SSO-only login. |
+| `login_with_password` | `true` | Accept username and password login. Set to `false` to enforce SSO-only login; password registration is then refused too, while identity providers can still register new accounts. |
 | `login_via_token` | `true` | Accept `m.login.token` login tokens. Disabling this can break SSO flows where the server issues a token to complete the login. |
 | `login_via_existing_session` | `true` | Allow an authenticated session to mint a login token that a second client can use to log in. Requires interactive re-authentication. Disable if you want to prevent clients from spawning additional sessions this way. |
+
+## Login rate limits
+
+Password sign-in uses three token buckets. A refused attempt gets
+`M_LIMIT_EXCEEDED`, with a `retry_after_ms` unless a limit's table is full.
+
+- **Wrong passwords:** each account and client address pair has its own budget.
+  An attempt reserves a token before checking the password and returns it on
+  success; wrong passwords and unknown accounts keep it. Once exhausted, that
+  pair is refused until a token refills, including attempts with the correct
+  password. Attempts from another address still have their own allowance.
+  Concurrent attempts each reserve a token, so they cannot bypass the limit.
+- **Client addresses:** all password attempts from one address share a broader
+  budget across accounts, charged before verification and kept on success too.
+  This bounds password spraying and password-verification work.
+- **Successful sign-ins:** only a verified password consumes the account's
+  sign-in budget. Wrong guesses never consume it, but an account that has
+  signed in too often is refused even with the correct password.
+
+Public `/login` and the built-in OIDC login page share the first two budgets.
+Password re-entry for sensitive actions (UIAA) has separate failed-attempt and
+address budgets with the same settings, so public login attempts cannot
+exhaust its allowance. The successful-sign-in budget does not apply to UIAA.
+LDAP binds made by `/login` remain outside these limits; an account not found
+in LDAP that falls back to local password checking is limited.
+
+IPv4 addresses have individual budgets. IPv4-mapped IPv6 addresses use their
+IPv4 identity, and other IPv6 addresses share budgets within each /64.
+Clients sharing a NAT address also share its address budget. By default the
+address comes from the socket peer. A loopback peer, such as a reverse proxy
+connecting over loopback or any client of the Unix socket, stands for every
+client behind it, so its attempts are not limited per address and keep only
+the failed-attempt and successful-sign-in limits. Behind a reverse proxy,
+configure `http.ip_source`, restrict backend access to trusted proxies, and
+have the proxy replace the selected forwarding header with a verified address;
+this also applies the address budget behind a local proxy or the Unix socket.
+Do not accept client-supplied forwarding headers unchanged. A proxy that
+connects from a non-loopback address, including a container on a bridge
+network, gives all its users one address and allowance unless it forwards the
+client address. Password login and password UIAA require the selected source
+even for loopback peers and peers listed in `http.ip_source_trusted_subnets`;
+they do not use those peers' usual extraction bypass. A missing or invalid
+selected source refuses authentication. At startup and on reload, a warning
+says when a Unix socket or loopback listener has no per-address limit.
+
+Each limit has its own config section, shown here with its defaults:
+
+```toml
+[global.rate_limiting.login.failed]
+per_second = 0.17
+burst_count = 3
+
+[global.rate_limiting.login.account]
+per_second = 0.003
+burst_count = 5
+
+[global.rate_limiting.login.address]
+per_second = 1.0
+burst_count = 20
+```
+
+The failed-attempt budget allows three wrong passwords per account/address
+pair, then about one attempt every six seconds. The address budget allows
+20 attempts across accounts, then one per second. The account budget allows
+five successful sign-ins, then about one every five and a half minutes.
+Setting either `burst_count` or `per_second` to `0` disables that limit.
+
+Separating addresses prevents guesses from one address from exhausting an
+account's allowance at another address. It also means distributed guesses
+from different addresses have separate failed-attempt budgets. Users sharing
+an address or IPv6 /64 can still affect one another. Existing sessions and
+non-password login methods (`m.login.token`, SSO and JWT) are unaffected.
+
+Each table holds at most 65536 entries in memory and resets on restart.
+Fully refilled buckets can be removed to make room; buckets still limiting
+are retained. Full failed-attempt and address tables admit untracked pairs
+and addresses until room frees up, while retaining limits for existing
+entries. A full successful-sign-in table refuses untracked accounts.
+Table exhaustion logs a warning.
 
 ## Token and session lifetimes
 
 | Option | Default | Description |
 |---|---|---|
 | `login_token_ttl` | `120000` | Lifetime of `m.login.token` tokens in milliseconds (default: 2 minutes). |
-| `access_token_ttl` | `604800` | Lifetime of access tokens in seconds for clients that support refresh tokens. After expiry the client is soft-logged-out until it refreshes (default: 7 days). |
+| `access_token_ttl` | `604800` | Lifetime of access tokens in seconds for clients that support refresh tokens. After expiry the client is soft-logged-out until it refreshes. [`jwt.expire_access_token`](jwt.md#session-lifetime) applies it to JWT logins too (default: 7 days). |
 | `openid_token_ttl` | `3600` | Lifetime of OpenID 1.0 tokens in seconds. These are used for Matrix account integrations such as Vector Integrations in Element, **not** for OIDC/OpenID Connect logins (default: 1 hour). |
 
 ## Emergency password

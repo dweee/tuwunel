@@ -1,7 +1,7 @@
 use std::{
 	collections::HashSet,
 	ffi::{OsStr, OsString},
-	fs, io,
+	io,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::Instant,
@@ -16,7 +16,7 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Database, Map};
 
-use crate::Services;
+use crate::{Services, integrity::media_files::listing};
 
 struct MediaStorage<'a> {
 	database: &'a Arc<Database>,
@@ -25,8 +25,9 @@ struct MediaStorage<'a> {
 }
 
 /// Migrates a media directory from legacy base64 file names to sha2 file names.
-/// All errors are fatal. Upon success the database is keyed to not perform this
-/// again.
+///
+/// All errors are fatal. The caller stamps the database only once this
+/// succeeds, so a pass that fails runs again on the next boot.
 pub(crate) async fn migrate_sha256_media(services: &Services) -> Result {
 	let db = &services.db;
 	let config = &services.server.config;
@@ -51,13 +52,12 @@ pub(crate) async fn migrate_sha256_media(services: &Services) -> Result {
 	for (old_path, path) in changes {
 		if old_path.exists() {
 			tokio::fs::rename(&old_path, &path).await?;
-			if config.media_compat_file_link {
+			if config.media.compat_file_link {
 				symlink_file(&path, &old_path).await?;
 			}
 		}
 	}
 
-	db["global"].insert(b"feat_sha256_media", []);
 	info!("Finished applying sha256_media");
 	Ok(())
 }
@@ -79,11 +79,11 @@ pub(crate) async fn checkup_sha256_media(services: &Services) -> Result {
 	let timer = Instant::now();
 
 	let dir = media.get_media_dir();
-	let files: HashSet<OsString> = fs::read_dir(dir)
+	let files: HashSet<OsString> = listing(&dir)
 		.inspect_err(inspect_debug_log)
 		.into_iter()
 		.flatten()
-		.filter_map(|ent| ent.map_or(None, |ent| Some(ent.path().into_os_string())))
+		.filter_map(Result::ok)
 		.collect();
 
 	for key in media.db.get_all_media_keys().await {
@@ -125,7 +125,7 @@ async fn handle_media_check(
 			.is_ok_and(|md| md.is_symlink())
 	};
 
-	if config.prune_missing_media && !old_exists && !new_exists {
+	if config.media.prune_missing && !old_exists && !new_exists {
 		error!(
 			media_id = ?encode_key(key), ?new_path, ?old_path,
 			"Media is missing at all paths. Removing from database..."
@@ -138,7 +138,7 @@ async fn handle_media_check(
 		txn.execute();
 	}
 
-	if config.media_compat_file_link && !old_exists && new_exists {
+	if config.media.compat_file_link && !old_exists && new_exists {
 		debug_warn!(
 			media_id = ?encode_key(key), ?new_path, ?old_path,
 			"Media found but missing legacy link. Fixing..."
@@ -147,7 +147,7 @@ async fn handle_media_check(
 		symlink_file(&new_path, &old_path).await?;
 	}
 
-	if config.media_compat_file_link && !new_exists && old_exists {
+	if config.media.compat_file_link && !new_exists && old_exists {
 		debug_warn!(
 			media_id = ?encode_key(key), ?new_path, ?old_path,
 			"Legacy media found without sha256 migration. Fixing..."
@@ -162,7 +162,7 @@ async fn handle_media_check(
 		symlink_file(&new_path, &old_path).await?;
 	}
 
-	if !config.media_compat_file_link && old_exists && old_is_symlink().await {
+	if !config.media.compat_file_link && old_exists && old_is_symlink().await {
 		debug_warn!(
 			media_id = ?encode_key(key), ?new_path, ?old_path,
 			"Legacy link found but compat disabled. Cleansing symlink..."

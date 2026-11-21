@@ -64,8 +64,8 @@ pub(crate) struct Get {
 /// to keep later cursor movements nonblocking. The worker returns the
 /// positioned iterator state through the response sender.
 pub(crate) struct Seek {
-	pub(crate) map: Arc<Map>,
 	pub(crate) state: stream::State<'static>,
+	pub(crate) map: Arc<Map>,
 	pub(crate) dir: Direction,
 	pub(crate) key: Option<KeyBuf>,
 	pub(crate) res: Option<ResultSender<stream::State<'static>>>,
@@ -326,7 +326,7 @@ fn worker_init(&self, id: usize, chan_id: usize) {
 		.topology
 		.iter()
 		.enumerate()
-		.filter(|_| self.server.config.db_pool_affinity)
+		.filter(|_| self.server.config.database.pool.affinity)
 		.filter_map(|(core_id, &queue_id)| (chan_id == queue_id).then_some(core_id));
 
 	// affinity is empty (no-op) if there's only one queue

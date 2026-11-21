@@ -13,12 +13,12 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, at,
-	matrix::{
-		Event,
-		pdu::{PduCount, PduEvent},
-	},
 	result::{FlatOk, LogErr},
 	utils::stream::TryWidebandExt,
+};
+use tuwunel_matrix::{
+	Event,
+	pdu::{PduCount, PduEvent},
 };
 use tuwunel_service::rooms::pdu_metadata::IgnoredThreadView;
 
@@ -74,7 +74,7 @@ pub(crate) async fn get_threads_route(
 		.try_filter_map(async |(count, pdu)| {
 			Ok(services
 				.state_accessor
-				.user_can_see_event(sender_user, room_id, &pdu.event_id)
+				.user_can_see_event(sender_user, &pdu)
 				.await
 				.then_some((count, pdu)))
 		})

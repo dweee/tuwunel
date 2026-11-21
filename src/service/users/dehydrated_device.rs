@@ -45,6 +45,11 @@ pub async fn set_dehydrated_device(&self, user_id: &UserId, request: Request) ->
 		return Err!("A hydrated device already exists with that ID.");
 	}
 
+	// Checked before removing the existing device, so a refused replacement
+	// leaves it in place.
+	self.check_device_id(user_id, Some(&request.device_id))
+		.await?;
+
 	if let Ok(existing_id) = existing_id {
 		self.remove_device(user_id, &existing_id).await;
 	}
@@ -71,7 +76,7 @@ pub async fn set_dehydrated_device(&self, user_id: &UserId, request: Request) ->
 
 	trace!(device_keys = ?request.device_keys);
 	self.add_device_keys(user_id, &device_id, &request.device_keys)
-		.await;
+		.await?;
 
 	trace!(one_time_keys = ?request.one_time_keys);
 	self.add_one_time_keys(

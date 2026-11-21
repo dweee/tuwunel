@@ -10,14 +10,14 @@ Tuwunel plays two roles here, and they are easy to confuse:
 - **As an authorization server**, Tuwunel is what a Matrix client authenticates
   against. It issues authorization codes, access tokens, and refresh tokens,
   and it publishes OAuth discovery metadata. That is what this page documents.
-- **As a relying party**, Tuwunel does not collect passwords itself. It
-  delegates authentication of the human to a configured upstream identity
-  provider (GitHub, Google, Keycloak, Authelia, your own Matrix Authentication
-  Service, and so on), covered on the [Identity Providers](providers.md) page.
+- **As a relying party**, Tuwunel can delegate authentication to a configured
+  upstream identity provider (GitHub, Google, Keycloak, Authelia, your own
+  Matrix Authentication Service, and so on), covered on the
+  [Identity Providers](providers.md) page. Native authentication instead
+  checks local account passwords.
 
 So the OIDC server is the Matrix-facing OAuth layer, while the actual login
-happens at whichever identity provider you configure. Next-gen auth needs both
-halves in place.
+happens through either native authentication or an upstream identity provider.
 
 ## Standards implemented
 
@@ -81,13 +81,13 @@ this:
 2. The client (registering itself first if needed, see
    [Dynamic client registration](#dynamic-client-registration)) sends the user
    to `GET /_tuwunel/oidc/authorize` with a PKCE `code_challenge`.
-3. Tuwunel validates the request and redirects the browser to the upstream
-   identity provider's SSO flow
+3. Tuwunel validates the request. With native authentication enabled, the
+   browser sees a page offering password login and each configured upstream
+   provider. Otherwise Tuwunel redirects to the default provider's SSO flow
    (`/_matrix/client/v3/login/sso/redirect/<provider>`). A client may request a
-   specific provider with an `idp_id` query parameter; otherwise the default
-   provider is used.
-4. The user authenticates with that provider. The provider redirects back, and
-   Tuwunel finishes the exchange at `GET /_tuwunel/oidc/_complete`.
+   specific provider with an `idp_id` query parameter to skip the chooser.
+4. The user signs in with a local password or an upstream provider. Tuwunel
+   finishes the exchange at `GET /_tuwunel/oidc/_complete`.
 5. Tuwunel returns an authorization code to the client, which the client
    exchanges at `POST /_tuwunel/oidc/token` for an access token, a refresh
    token, and (when `openid` was requested) an ID token.
@@ -97,9 +97,9 @@ later step-up actions (see [Cross-signing protection](#cross-signing-protection)
 re-authenticate against the same provider.
 
 When native authentication is enabled and the request selects no upstream
-provider (or carries `prompt=create`), step 3 instead serves a local
-login/registration page at `GET /_tuwunel/oidc/native`. The user authenticates
-against a local account and the flow rejoins at `_complete` exactly as above.
+provider, step 3 serves the local login/registration page at
+`GET /_tuwunel/oidc/native`. The user can authenticate against a local account
+or choose one of the configured providers. The flow rejoins at `_complete`.
 See [Native authentication](#native-authentication).
 
 ## Endpoints
@@ -189,26 +189,47 @@ behavior, so an existing deployment is unaffected until you opt in.
 
 | Option | Default | Description |
 |---|---|---|
-| `access_token_ttl` | `604800` | Access-token lifetime in seconds (7 days). After expiry a refresh-capable client is soft-logged-out until it refreshes. Shared with legacy refresh-token logins. |
+| `access_token_ttl` | `604800` | Access-token lifetime in seconds (7 days). After expiry a refresh-capable client is soft-logged-out until it refreshes. Shared with legacy refresh-token logins, and with JWT logins under [`jwt.expire_access_token`](jwt.md#session-lifetime). |
 | `refresh_token_ttl` | `0` | Refresh-token lifetime in seconds. `0` disables refresh-token expiry entirely. A typical enabled value is `259200` (three days). |
 | `refresh_token_idle_only` | `true` | When `true`, each successful refresh slides the deadline forward, so a session in continuous use never expires. When `false`, the deadline is fixed at first issuance and the user must re-authenticate after `refresh_token_ttl` regardless of activity. |
 | `refresh_token_hard_logout` | `false` | When `false`, an expired refresh token is rejected with `soft_logout: true`, letting the client keep its E2EE keys and resume the same device after re-auth. When `true`, expiry deletes the device entirely and signals `soft_logout: false`, so the next session is a fresh device. |
-| `refresh_token_reuse_grace` | `15` | Grace window in seconds for a benign double-submit. If a just-rotated refresh token is replayed within this window while its successor is still current, Tuwunel treats it as a client that lost the rotated response and reissues, rather than revoking. Set to `0` to treat every replay strictly. |
+| `refresh_token_reuse_grace` | `15` | Time in seconds during which a client can retry a refresh after losing the response. Set to `0` to disable this grace window. See the retry behavior below. |
 | `refresh_token_reuse_revoke` | `true` | When `true`, a refresh token replayed outside the grace window removes the device. When `false`, the replay is rejected but the device is left intact, which an operator fronting another OAuth client may prefer. |
+
+When a client retries with a refresh token that has already been used, Tuwunel
+can issue a fresh access token and keep the replacement refresh token. This
+requires the retry to arrive within `refresh_token_reuse_grace` and the
+replacement token to still be current and unexpired.
+
+If the replacement token has expired, a retry within the grace window triggers
+the logout behavior selected by `refresh_token_hard_logout`. If Tuwunel can no
+longer look up the replacement token, it rejects the retry without changing
+anything.
+
+Two requests can also try to refresh the same token at the same time. The
+request that loses that race can be rejected without revoking the device,
+even when `refresh_token_reuse_grace` is `0`.
 
 ### Native authentication
 
 | Option | Default | Description |
 |---|---|---|
-| `oidc_native_auth` | `false` | When `true`, the OIDC server serves a local login and registration page for clients that select no upstream provider, authenticating against this server's own accounts. Requires `well_known.client`. Coexists with configured identity providers. |
+| `oidc_native_auth` | `false` | When `true`, the OIDC server serves a login and registration page for clients that select no upstream provider. The login page offers local accounts alongside configured identity providers. Requires `well_known.client`. |
 
-With native auth enabled, an authorization request that selects no provider (or
-carries `prompt=create`) is served `GET /_tuwunel/oidc/native` instead of an SSO
-redirect. Registration there enforces the same `allow_registration`,
+With native auth enabled, an authorization request that selects no provider is
+served `GET /_tuwunel/oidc/native` instead of an automatic SSO redirect. With
+`single_sso` or `sso_custom_providers_page` set, the page offers one single
+sign-on entry for the default provider in place of the provider list. Once a
+provider is chosen, the request can only finish through that provider. A
+request with `prompt=create` opens the registration view. Registration there
+enforces the same `allow_registration`,
 registration-token, and `registration_terms` policy as the Matrix registration
 endpoint, and the metadata document advertises `prompt_values_supported =
-["create"]` so clients can offer account creation. Enabling this knob where the
-OIDC server was not already running takes effect on the next restart.
+["create"]` so clients can offer account creation. With
+`login_with_password = false` the page drops its password form and registration
+view, offering only the configured providers, and `create` is not advertised.
+Enabling this knob where the OIDC server was not already running takes effect
+on the next restart.
 
 ### Authorization hardening
 
@@ -224,6 +245,7 @@ OIDC server was not already running takes effect on the next restart.
 |---|---|---|
 | `oidc_registration_access_token` | (unset) | When set, the registration endpoint requires callers to present this value as an `Authorization: Bearer` credential. Matrix clients have no way to supply one, so any value here blocks next-gen auth for every ordinary client. Leave it unset unless the only callers are ones you register yourself. |
 | `oidc_registration_allowed_redirect_hosts` | `[]` | When non-empty, every `redirect_uri` presented at registration must match this list, otherwise the registration is rejected. A `redirect_uri` with a host matches an entry naming that host; a private-use scheme carries no host (RFC 8252, as in `io.element.android:/`) and matches an entry naming the scheme. Matching ignores case. Empty imposes no restriction at registration, and vouches for no client. |
+| `oidc_registration_require_client_uri` | `false` | Refuse a registration that carries no `client_uri`, so every client is held to the host rules in [Accepted redirect URIs](#accepted-redirect-uris). When false, a client may omit it, and one that supplies it is still held to those rules. |
 | `oidc_require_client_approval` | `true` | Show the user an approve/deny page naming the client before an authorization code is issued to a client the operator has not vetted. A client is vetted when its redirect host or private-use scheme appears in `oidc_registration_allowed_redirect_hosts`. |
 
 ### Rate limiting
@@ -256,6 +278,40 @@ private-use scheme, so a deployment serving Element X on both platforms reads:
 ```toml
 oidc_registration_allowed_redirect_hosts = ["element.io", "io.element.android"]
 ```
+
+### Accepted redirect URIs
+
+Registration applies the redirect URI rules of the Matrix specification
+(MSC2966, after RFC 8252 §7), which tie each `redirect_uri` to the host of the
+client's `client_uri`. The binding keeps the website a client names consistent
+with where it receives the sign-in. A request that breaks a rule is refused
+with HTTP 400 and an `invalid_redirect_uri` or `invalid_client_metadata` error
+whose description names the rule.
+
+No `redirect_uri` may carry a fragment. Beyond that, what a client may register
+depends on its `application_type`:
+
+| `application_type` | Redirect URI | Rule |
+|---|---|---|
+| `web` (or absent) | `https` | No userinfo; the host is the `client_uri` host or a subdomain of it. |
+| `native` | Claimed `https` (a universal or app link) | The same rule as `web`. |
+| `native` | `http` on the loopback interface | The host is `localhost`, an IPv4 loopback address such as `127.0.0.1`, or `[::1]`. No port is registered, and any port is accepted at sign-in. |
+| `native` | Private-use scheme | No authority (`com.example.app:/callback`, not `com.example.app://callback`), and the scheme begins with the `client_uri` host in reverse-DNS order (`com.example` or `com.example.app` for `https://example.com`). |
+
+`client_uri` is optional unless `oidc_registration_require_client_uri` is set.
+When present it must be an `https` URL with a host and no userinfo, and
+`logo_uri`, `tos_uri` and `policy_uri` must sit on its host or a subdomain, as
+redirects do. A client that sends no `client_uri` has no host to share, so its
+`https` redirects may name any host and any private-use scheme containing a dot
+is accepted; the approval page then shows the redirect target as the client's
+website.
+
+A web client served from your own domain registers that domain as its
+`client_uri`. One that keeps its vendor's homepage there while redirecting to
+your domain is refused with `redirect_uri host must share the client_uri host`,
+whichever `application_type` it sends. Configure the client with its own
+origin: for FluffyChat Web, set `website`, `logoUrl`, `tos` and `privacyPolicy`
+in its `config.json` to URLs on the domain serving it.
 
 ### Approving an unvetted client
 

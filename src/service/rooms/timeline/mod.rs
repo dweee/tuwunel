@@ -7,6 +7,7 @@
 mod append;
 mod backfill;
 mod build;
+mod checked;
 mod create;
 mod pdus;
 mod purge;
@@ -19,41 +20,49 @@ use std::{fmt::Write, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{
-	FutureExt, TryFutureExt, TryStreamExt,
-	future::{Either, select, select_ok},
+	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
+	future::{Either, select, select_ok, try_join},
 	pin_mut,
 };
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId,
-	UserId, api::Direction, events::room::encrypted::Relation,
+	UserId, api::Direction, events::room::encrypted::Relation, signatures::Verified,
 };
 use serde::Deserialize;
-/// Re-exports the typed and raw persistent timeline identifiers.
-///
-/// Both forms encode a room-local stream position suitable for database keys.
-pub use tuwunel_core::matrix::pdu::{PduId, RawPduId};
 use tuwunel_core::{
 	Err, Error, Result, at, err, implement,
-	matrix::{
-		ShortEventId,
-		pdu::{PduCount, PduEvent},
-	},
 	utils::{
 		MutexMap, MutexMapGuard,
+		future::TryExtExt,
 		result::{LogErr, NotFound},
-		stream::TryReadyExt,
+		stream::{IterStream, TryReadyExt},
 	},
 	warn,
 };
 use tuwunel_database::{Database, Deserialized, Json, Map, Txn};
+/// Re-exports the typed and raw persistent timeline identifiers.
+///
+/// Both forms encode a room-local stream position suitable for database keys.
+pub use tuwunel_matrix::pdu::{PduId, RawPduId};
+use tuwunel_matrix::{
+	ShortEventId,
+	pdu::{PduCount, PduEvent},
+	room::state::resolution::FetchEvent,
+};
 
+pub use self::build::Collision;
 /// Re-exports the standard timeline item and count-key transformation.
 ///
 /// Timeline consumers use these alongside the service's directional streams.
 pub use self::pdus::{PdusIterItem, bias_count};
+pub(crate) use self::{
+	append::Incoming,
+	checked::{Mapped, Position},
+	redact::Restoration,
+};
 use crate::rooms::{
 	short::{ShortRoomId, ShortStateHash},
-	state_res::FetchEvent,
+	threads::RedactedRoot,
 };
 
 /// Provides persistent event lookup, insertion, and room timeline traversal.
@@ -79,11 +88,14 @@ struct Data {
 	db: Arc<Database>,
 }
 
-// Update Relationships
+/// Extracts the relation carried by event content.
+///
+/// Shared by timeline appends and thread summary maintenance.
 #[derive(Deserialize)]
-struct ExtractRelatesTo {
+pub(crate) struct ExtractRelatesTo {
 	#[serde(rename = "m.relates_to")]
-	relates_to: Relation,
+	/// The event's typed relation.
+	pub(crate) relates_to: Relation,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -141,11 +153,60 @@ impl crate::Service for Service {
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub async fn replace_pdu(&self, pdu_id: &RawPduId, pdu_json: &CanonicalJsonObject) -> Result {
+	self.require_pdu(pdu_id).await?;
+
+	self.db.pduid_pdu.raw_put(pdu_id, Json(pdu_json));
+
+	Ok(())
+}
+
+/// Replaces a redacted event and its optional thread root in one batch.
+///
+/// The caller retains the room guard through this write. The root's thread
+/// index changes are part of the same batch.
+#[implement(Service)]
+#[tracing::instrument(skip(self, pdu, root), level = "debug")]
+pub(super) async fn replace_redacted_pdu(
+	&self,
+	pdu_id: &RawPduId,
+	pdu: &CanonicalJsonObject,
+	root: Option<RedactedRoot>,
+) -> Result {
+	self.require_pdu(pdu_id).await?;
+	self.redaction_txn(pdu_id, pdu, root.as_ref())
+		.execute();
+
+	Ok(())
+}
+
+/// Stages a redacted event after its thread root.
+///
+/// The redacted row comes last so it wins when a reply names itself as its root.
+#[implement(Service)]
+fn redaction_txn(
+	&self,
+	pdu_id: &RawPduId,
+	pdu: &CanonicalJsonObject,
+	root: Option<&RedactedRoot>,
+) -> Txn {
+	let mut txn = self.db.db.txn();
+
+	if let Some(root) = root {
+		self.services
+			.threads
+			.stage_redacted_root(&mut txn, root);
+	}
+
+	self.stage_replace_pdu(&mut txn, pdu_id, pdu);
+	txn
+}
+
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+async fn require_pdu(&self, pdu_id: &RawPduId) -> Result {
 	if self.db.pduid_pdu.get(pdu_id).await.is_not_found() {
 		return Err!(Request(NotFound("PDU does not exist.")));
 	}
-
-	self.db.pduid_pdu.raw_put(pdu_id, Json(pdu_json));
 
 	Ok(())
 }
@@ -163,6 +224,33 @@ pub(super) fn stage_replace_pdu(
 	txn.raw_put(&self.db.pduid_pdu, pdu_id, Json(pdu_json));
 }
 
+/// Stores a verified federation event as an outlier unless this server's copy
+/// takes precedence.
+///
+/// An accepted event keeps its copy, and so does any stored event whose new
+/// copy had to be redacted. A copy whose content matches its hash replaces an
+/// outlier, such as one stored from knock state without a hash check.
+#[implement(Service)]
+#[tracing::instrument(skip(self, pdu), level = "debug")]
+pub async fn add_verified_outlier(
+	&self,
+	event_id: &EventId,
+	pdu: &CanonicalJsonObject,
+	verified: &Verified,
+) {
+	let kept = match verified {
+		| Verified::All =>
+			self.non_outlier_pdu_exists(event_id)
+				.is_ok()
+				.await,
+		| Verified::Signatures => self.pdu_exists(event_id).await,
+	};
+
+	if !kept {
+		self.add_pdu_outlier(event_id, pdu);
+	}
+}
+
 /// Stores an event as an outlier outside the accepted room timeline.
 ///
 /// The event is keyed directly by event ID and no accepted-timeline mapping or
@@ -175,13 +263,26 @@ pub fn add_pdu_outlier(&self, event_id: &EventId, pdu: &CanonicalJsonObject) {
 		.raw_put(event_id, Json(pdu));
 }
 
-/// Returns the earliest accepted PDU in a room.
+/// Returns the earliest accepted PDU in a room, backfilled ones included.
 ///
 /// Unknown or empty rooms report the underlying stream's not-found result.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub async fn first_pdu_in_room(&self, room_id: &RoomId) -> Result<PduEvent> {
 	self.first_item_in_room(room_id).await.map(at!(1))
+}
+
+/// Returns the earliest PDU in a room's normal timeline.
+///
+/// Backfilled PDUs sort before it but are skipped, because backfill admits
+/// events with whatever timestamp their origin claims. Rooms without a normal
+/// PDU report not found.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+pub async fn first_normal_pdu_in_room(&self, room_id: &RoomId) -> Result<PduEvent> {
+	self.first_item_after(room_id, Some(PduCount::Normal(0)))
+		.map_ok(at!(1))
+		.await
 }
 
 /// Returns the latest accepted PDU in a room.
@@ -202,7 +303,19 @@ pub async fn latest_pdu_in_room(&self, room_id: &RoomId) -> Result<PduEvent> {
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub async fn first_item_in_room(&self, room_id: &RoomId) -> Result<(PduCount, PduEvent)> {
-	let pdus = self.pdus(None, room_id, None);
+	self.first_item_after(room_id, None).await
+}
+
+/// Returns the first accepted PDU after an exclusive `from` count.
+///
+/// Without a count the room's backfilled PDUs come first.
+#[implement(Service)]
+async fn first_item_after(
+	&self,
+	room_id: &RoomId,
+	from: Option<PduCount>,
+) -> Result<(PduCount, PduEvent)> {
+	let pdus = self.pdus(None, room_id, from);
 
 	pin_mut!(pdus);
 	pdus.try_next()
@@ -275,13 +388,7 @@ pub async fn next_shortstatehash(
 	room_id: &RoomId,
 	after: PduCount,
 ) -> Result<ShortStateHash> {
-	let shortroomid: ShortRoomId = self
-		.services
-		.short
-		.get_shortroomid(room_id)
-		.await
-		.map_err(|e| err!(Request(NotFound("Room {room_id:?} not found: {e:?}"))))?;
-
+	let shortroomid = self.shortroomid(room_id).await?;
 	let after = PduId { shortroomid, count: after };
 
 	let next = PduId {
@@ -297,13 +404,27 @@ pub async fn next_shortstatehash(
 		.await
 }
 
-/// Returns the state snapshot after every room event at or before a count.
+/// Resolves a room's short ID.
 ///
-/// The boundary is inclusive because a client's sync position is often the
-/// count of the newest event it received, and need not belong to this room.
-/// The snapshot precedes the first event strictly after the count, falling
-/// back to current state only when no event follows; a count before the room's
-/// first recorded snapshot is not found.
+/// An unknown room is reported as not found rather than as a storage error.
+#[implement(Service)]
+async fn shortroomid(&self, room_id: &RoomId) -> Result<ShortRoomId> {
+	self.services
+		.short
+		.get_shortroomid(room_id)
+		.map_err(|e| err!(Request(NotFound("Room {room_id:?} not found: {e:?}"))))
+		.await
+}
+
+/// Returns the snapshot preceding the first room event after a count.
+///
+/// An event at the count is treated as already received, because a client's
+/// sync position is often the count of the newest event it received, and need
+/// not belong to this room. Current state stands in when no event follows, and
+/// a count before the room's first recorded snapshot is not found. A remote
+/// event's snapshot precedes it in the event graph rather than in this
+/// timeline, so the boundary suits a client's position, not a point in the
+/// room's own history.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub async fn shortstatehash_after(
@@ -311,13 +432,7 @@ pub async fn shortstatehash_after(
 	room_id: &RoomId,
 	count: PduCount,
 ) -> Result<ShortStateHash> {
-	let shortroomid: ShortRoomId = self
-		.services
-		.short
-		.get_shortroomid(room_id)
-		.map_err(|e| err!(Request(NotFound("Room {room_id:?} not found: {e:?}"))))
-		.await?;
-
+	let shortroomid = self.shortroomid(room_id).await?;
 	let after = PduId { shortroomid, count };
 	let count = match self.next_timeline_count(&after).await {
 		| Ok(count) => count,
@@ -585,6 +700,18 @@ pub async fn get_non_outlier_pdu(&self, event_id: &EventId) -> Result<PduEvent> 
 	self.get_non_outlier(event_id).await
 }
 
+/// Returns the accepted PDU at a room's timeline count.
+///
+/// A count holding no accepted event in the room is not found.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn get_pdu_at(&self, room_id: &RoomId, count: PduCount) -> Result<PduEvent> {
+	let shortroomid = self.shortroomid(room_id).await?;
+	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
+
+	self.get_pdu_from_id(&pdu_id).await
+}
+
 /// Returns a decoded PDU by its accepted timeline ID.
 ///
 /// The accepted row is read directly without consulting the event-ID mapping
@@ -633,20 +760,26 @@ pub async fn get_pdu_json_from_id(&self, pdu_id: &RawPduId) -> Result<CanonicalJ
 /// Deserializes an event from accepted or outlier storage into `T`.
 ///
 /// Both lookups are polled concurrently, so if duplicate rows exist the first
-/// successful lookup determines the returned value.
+/// successful lookup determines the returned value. If both fail, a storage or
+/// decoding error takes precedence over a missing record.
 #[implement(Service)]
 #[inline]
 pub async fn get<T>(&self, event_id: &EventId) -> Result<T>
 where
 	T: for<'de> Deserialize<'de>,
 {
-	let accepted = self.get_non_outlier(event_id);
-	let outlier = self.get_outlier(event_id);
+	// Success takes the short-circuiting branch; only two failures are joined.
+	let invert = |result: Result<T>| result.map_or_else(Ok, Err);
+	let accepted = self.get_non_outlier(event_id).map(invert);
+	let outlier = self.get_outlier(event_id).map(invert);
 
-	pin_mut!(accepted, outlier);
-	select_ok([accepted.left_future(), outlier.right_future()])
+	try_join(accepted, outlier)
+		.map(|result| match result {
+			| Err(value) => Ok(value),
+			| Ok((accepted, outlier)) if accepted.is_missing() => Err(outlier),
+			| Ok((accepted, _)) => Err(accepted),
+		})
 		.await
-		.map(at!(0))
 }
 
 impl FetchEvent for &Service {
@@ -735,6 +868,23 @@ pub async fn pdu_exists<'a>(&'a self, event_id: &'a EventId) -> bool {
 		.await
 		.map(at!(0))
 		.is_ok()
+}
+
+/// Reports whether every event has an accepted timeline row.
+///
+/// The probe stops at the first event without one, and an empty input reports
+/// true; a lookup error counts as absence. The rows are read one at a time, so
+/// callers pass a small set such as one event's references, never a bulk
+/// population.
+#[implement(Service)]
+pub async fn non_outlier_pdus_exist<'a, I>(&self, event_ids: I) -> bool
+where
+	I: Iterator<Item = &'a EventId> + Send,
+{
+	event_ids
+		.stream()
+		.all(|event_id| self.non_outlier_pdu_exists(event_id).is_ok())
+		.await
 }
 
 /// Returns a future that resolves on the next event-to-PDU mapping mutation.

@@ -6,8 +6,16 @@
 
 mod fetch_state;
 mod prune;
+#[cfg(test)]
+mod tests;
 
-use std::{collections::HashMap, fmt::Write, iter::once, sync::Arc};
+use std::{
+	collections::HashMap,
+	fmt::Write,
+	iter::once,
+	ops::Bound::{Excluded, Unbounded},
+	sync::Arc,
+};
 
 use async_trait::async_trait;
 /// Fetches state events through a held map of short state keys.
@@ -28,35 +36,49 @@ use ruma::{
 	CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId, UserId,
 	events::{
 		AnyStrippedStateEvent, StateEventType, TimelineEventType,
-		room::member::{MembershipState, RoomMemberEventContent},
+		room::{
+			create::RoomCreateEventContent,
+			member::{MembershipState, RoomMemberEventContent},
+		},
 	},
 	room_version_rules::AuthorizationRules,
 	serde::Raw,
 };
+use serde::Deserialize;
 use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
-	Event, PduEvent, Result, err,
+	Error, Result, err,
 	error::inspect_debug_log,
 	implement,
-	matrix::{PduCount, RoomVersionRules, StateKey, TypeStateKey, room_version},
 	result::{AndThenRef, FlatOk, NotFound},
 	smallvec::SmallVec,
 	trace,
 	utils::{
-		BoolExt, IterStream, MutexMap, MutexMapGuard, ReadyExt, TryReadyExt, calculate_hash,
+		BoolExt, IterStream, MutexMap, MutexMapGuard, ReadyExt, TryFutureExtExt, TryReadyExt,
+		calculate_hash,
+		hash::sha256::Digest,
 		mutex_map::Guard,
 		stream::{TryBroadbandExt, TryIgnore, WidebandExt},
 	},
 	warn,
 };
 use tuwunel_database::{Deserialized, Ignore, Interfix, Map, Txn};
+use tuwunel_matrix::{
+	Event, PduCount, PduEvent, RoomVersionRules, StateKey, TypeStateKey,
+	room::state::resolution::{StateMap, auth_types_for_event},
+	room_version,
+};
 
 use crate::{
+	integrity::undecodable,
 	rooms::{
 		short::{ShortEventId, ShortStateHash, ShortStateKey},
 		state_cache::{MembershipUpdate, StrippedRoomState},
-		state_compressor::{CompressedState, parse_compressed_state_event},
-		state_res::{StateMap, auth_types_for_event},
+		state_compressor::{
+			CompressedState, CompressedStateEvent, ShortStateInfo, compress_state_event,
+			parse_compressed_state_event,
+		},
+		timeline::Mapped,
 	},
 	services::OnceServices,
 };
@@ -90,6 +112,12 @@ type RoomMutexMap = MutexMap<OwnedRoomId, ()>;
 /// guard when the same operation needs all three.
 pub type RoomMutexGuard = MutexMapGuard<OwnedRoomId, ()>;
 type ForwardExtremities = SmallVec<[OwnedEventId; 1]>;
+type SummaryCell<'a> = (&'a StateEventType, &'a str);
+
+#[derive(Deserialize)]
+struct CreateEvent {
+	content: RoomCreateEventContent,
+}
 
 #[async_trait]
 impl crate::Service for Service {
@@ -140,6 +168,27 @@ pub async fn force_state(
 	_statediffremoved: Arc<CompressedState>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	self.prepare_force_state(room_id, &statediffnew, state_lock)
+		.await?;
+
+	self.install_force_state(room_id, shortstatehash, state_lock);
+
+	Ok(())
+}
+
+/// Replays membership additions before installing a forced state snapshot.
+///
+/// Lookup failures are skipped; membership-effect errors propagate before
+/// joined counts are refreshed. The caller retains the room state guard
+/// through preparation and installation.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn prepare_force_state(
+	&self,
+	room_id: &RoomId,
+	statediffnew: &CompressedState,
+	_state_lock: &RoomMutexGuard,
+) -> Result {
 	statediffnew
 		.iter()
 		.stream()
@@ -172,12 +221,22 @@ pub async fn force_state(
 		.update_joined_count(room_id)
 		.await;
 
-	self.set_room_state(room_id, shortstatehash, state_lock);
-
-	// Forced state may change this room's cached hierarchy summary.
-	self.services.spaces.cache_evict(room_id);
-
 	Ok(())
+}
+
+/// Installs a prepared state snapshot and invalidates its hierarchy summary.
+///
+/// Preparation and any required timeline append must have succeeded under
+/// the same room state guard before installation.
+#[implement(Service)]
+pub(crate) fn install_force_state(
+	&self,
+	room_id: &RoomId,
+	shortstatehash: u64,
+	state_lock: &RoomMutexGuard,
+) {
+	self.set_room_state(room_id, shortstatehash, state_lock);
+	self.services.spaces.cache_evict(room_id);
 }
 
 /// Record the membership transition a replayed `m.room.member` event carries.
@@ -209,6 +268,11 @@ async fn force_member_effects(&self, room_id: &RoomId, pdu: &PduEvent) -> Result
 		.map_ok(Option::flatten)
 		.await?;
 
+	let invite_event = membership_event
+		.membership
+		.eq(&MembershipState::Invite)
+		.then_some(pdu.event_id());
+
 	let count = self.services.globals.next_count();
 
 	self.services
@@ -216,11 +280,13 @@ async fn force_member_effects(&self, room_id: &RoomId, pdu: &PduEvent) -> Result
 		.update_membership(MembershipUpdate {
 			room_id,
 			user_id: &user_id,
+			invite_event,
 			membership_event,
 			sender: &pdu.sender,
 			last_state,
 			invite_via: None,
 			update_joined_count: false,
+			replaced_join: None,
 			count: PduCount::Normal(*count),
 		})
 		.await
@@ -320,23 +386,8 @@ pub async fn set_event_state(
 		(state_ids_compressed, Arc::new(CompressedState::new()))
 	};
 
-	let save_statediff = |txn: &mut Txn, shortstatehash| {
-		self.services
-			.state_compressor
-			.save_state_from_diff(
-				txn,
-				shortstatehash,
-				statediffnew,
-				statediffremoved,
-				1_000_000, // high number because no state will be based on this one
-				states_parents,
-			)
-	};
-
-	let (shortstatehash, _) = self
-		.services
-		.short
-		.get_or_create_shortstatehash(&state_hash, save_statediff)
+	let shortstatehash = self
+		.store_snapshot(&state_hash, states_parents, || (statediffnew, statediffremoved))
 		.await?;
 
 	self.db
@@ -344,6 +395,123 @@ pub async fn set_event_state(
 		.aput::<KEY_LEN, VAL_LEN, _, _>(shorteventid, shortstatehash);
 
 	Ok(shortstatehash)
+}
+
+/// Returns the snapshot after an event: its own snapshot with the event applied.
+///
+/// An event's recorded snapshot precedes it. A state event replaces the entry
+/// under its state key, and the result is stored by hash as a delta from that
+/// snapshot, so a repeated call reuses it. Any other event returns its snapshot
+/// unchanged.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn shortstatehash_after_event<Pdu: Event>(&self, pdu: &Pdu) -> Result<ShortStateHash> {
+	let before = self.pdu_shortstatehash(pdu.event_id()).await?;
+	let Some(state_key) = pdu.state_key() else {
+		return Ok(before);
+	};
+
+	let layers = self
+		.services
+		.state_compressor
+		.load_shortstatehash_info(before)
+		.await?;
+
+	let parent = layers
+		.last()
+		.ok_or_else(|| err!(Database("Snapshot {before} has no layers")))?;
+
+	let (applied, replaced) = self
+		.state_entry_change(pdu, state_key, Some(parent.full_state.as_ref()))
+		.await;
+
+	if replaced == Some(applied) {
+		return Ok(before);
+	}
+
+	// Hashed in the set's sorted order, with the event's entry in place of the one it replaces.
+	let state = parent
+		.full_state
+		.range(..applied)
+		.chain(once(&applied))
+		.chain(
+			parent
+				.full_state
+				.range((Excluded(applied), Unbounded)),
+		)
+		.filter(|event| replaced.as_ref() != Some(*event));
+
+	let state_hash = calculate_hash(state.map(|event| &event[..]));
+
+	self.store_snapshot(&state_hash, layers, || {
+		(Arc::new([applied].into()), Arc::new(replaced.into_iter().collect()))
+	})
+	.await
+}
+
+/// Compresses a state event and finds the entry under its key in a snapshot.
+///
+/// The event's short IDs are allocated when absent, so the compressed entry is
+/// ready to store; a snapshot holds at most one entry under a key.
+#[implement(Service)]
+async fn state_entry_change<Pdu: Event>(
+	&self,
+	pdu: &Pdu,
+	state_key: &str,
+	full_state: Option<&CompressedState>,
+) -> (CompressedStateEvent, Option<CompressedStateEvent>) {
+	let event_type: StateEventType = pdu.event_type().to_cow_str().into();
+	let shortstatekey = self
+		.services
+		.short
+		.get_or_create_shortstatekey(&event_type, state_key)
+		.await;
+
+	let applied = self
+		.services
+		.state_compressor
+		.compress_state_event(shortstatekey, pdu.event_id())
+		.await;
+
+	let start = compress_state_event(shortstatekey, 0);
+	let end = compress_state_event(shortstatekey, u64::MAX);
+	let replaced =
+		full_state.and_then(|full_state| full_state.range(start..=end).next().copied());
+
+	(applied, replaced)
+}
+
+/// Stores a snapshot under its hash as a delta from its parents, unless known.
+///
+/// The delta is built only when the snapshot is new. Nothing is based on it in
+/// turn, so it never becomes a parent itself.
+#[implement(Service)]
+async fn store_snapshot(
+	&self,
+	state_hash: &Digest,
+	parents: Vec<ShortStateInfo>,
+	delta: impl FnOnce() -> (Arc<CompressedState>, Arc<CompressedState>) + Send,
+) -> Result<ShortStateHash> {
+	let save_statediff = |txn: &mut Txn, shortstatehash| {
+		let (added, removed) = delta();
+
+		self.services
+			.state_compressor
+			.save_state_from_diff(
+				txn,
+				shortstatehash,
+				added,
+				removed,
+				1_000_000, // high number because no state will be based on this one
+				parents,
+			)
+	};
+
+	self.services
+		.short
+		.get_or_create_shortstatehash(state_hash, save_statediff)
+		.map_ok(|(shortstatehash, _)| shortstatehash)
+		.await
 }
 
 /// Derives the state snapshot produced by appending a local PDU.
@@ -398,28 +566,15 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 				| _ => Vec::new(),
 			};
 
-			let shortstatekey = self
-				.services
-				.short
-				.get_or_create_shortstatekey(&new_pdu.kind.to_string().into(), state_key)
-				.await;
-
-			let new = self
-				.services
-				.state_compressor
-				.compress_state_event(shortstatekey, &new_pdu.event_id)
-				.await;
-
-			let replaces = states_parents
+			let full_state = states_parents
 				.last()
-				.map(|info| {
-					info.full_state
-						.iter()
-						.find(|bytes| bytes.starts_with(&shortstatekey.to_be_bytes()))
-				})
-				.unwrap_or_default();
+				.map(|info| info.full_state.as_ref());
 
-			if Some(&new) == replaces {
+			let (new, replaces) = self
+				.state_entry_change(new_pdu, state_key, full_state)
+				.await;
+
+			if Some(new) == replaces {
 				return Ok(previous_shortstatehash.expect("must exist"));
 			}
 
@@ -427,21 +582,13 @@ pub async fn append_to_state(&self, new_pdu: &PduEvent) -> Result<u64> {
 			let shortstatehash = self.services.globals.next_count();
 			let mut txn = self.services.db.txn();
 
-			let mut statediffnew = CompressedState::new();
-			statediffnew.insert(new);
-
-			let mut statediffremoved = CompressedState::new();
-			if let Some(replaces) = replaces {
-				statediffremoved.insert(*replaces);
-			}
-
 			self.services
 				.state_compressor
 				.save_state_from_diff(
 					&mut txn,
 					*shortstatehash,
-					Arc::new(statediffnew),
-					Arc::new(statediffremoved),
+					Arc::new([new].into()),
+					Arc::new(replaces.into_iter().collect()),
 					2,
 					states_parents,
 				)?;
@@ -559,42 +706,101 @@ where
 /// Builds stripped invite-state context for a membership event.
 ///
 /// Recommended room state cells are fetched on a best-effort basis, then the
-/// supplied membership event is appended last. Failed state lookups are
-/// omitted from the summary.
+/// supplied membership event is appended last. A cell absent from the current
+/// state is skipped, which is every cell before a room's first snapshot; any
+/// other failed lookup is logged and omitted.
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "debug")]
 pub async fn summary_stripped<Pdu: Event>(&self, event: &Pdu) -> Vec<Raw<AnyStrippedStateEvent>> {
-	let cells = [
-		(&StateEventType::RoomCreate, ""),
-		(&StateEventType::RoomJoinRules, ""),
-		(&StateEventType::RoomCanonicalAlias, ""),
-		(&StateEventType::RoomName, ""),
-		(&StateEventType::RoomAvatar, ""),
-		(&StateEventType::RoomMember, event.sender().as_str()), // Add recommended events
-		(&StateEventType::RoomEncryption, ""),
-		(&StateEventType::RoomTopic, ""),
-	];
-
-	let fetches = cells.into_iter().map(|(event_type, state_key)| {
-		self.services
-			.state_accessor
-			.room_state_get(event.room_id(), event_type, state_key)
-	});
+	let room_id = event.room_id();
+	let fetches = summary_cells(event).map(|cell| self.summary_state_event(room_id, cell));
 
 	join_all(fetches)
 		.await
 		.into_iter()
-		.filter_map(Result::ok)
+		.flatten()
 		.map(Event::into_format)
 		.chain(once(event.to_format()))
 		.collect()
 }
 
+/// The room state cells a membership event's summary recommends.
+///
+/// The sender's member event is recommended only when the event is about
+/// another user, so an invite carries its inviter's (MSC4319). A knock's
+/// sender is its subject, whose earlier membership would precede the knock.
+fn summary_cells<Pdu: Event>(event: &Pdu) -> impl Iterator<Item = SummaryCell<'_>> {
+	let sender = event.sender().as_str();
+	let inviter = event
+		.state_key()
+		.ne(&Some(sender))
+		.then_some((&StateEventType::RoomMember, sender));
+
+	[
+		(&StateEventType::RoomCreate, ""),
+		(&StateEventType::RoomJoinRules, ""),
+		(&StateEventType::RoomCanonicalAlias, ""),
+		(&StateEventType::RoomName, ""),
+		(&StateEventType::RoomAvatar, ""),
+	]
+	.into_iter()
+	.chain(inviter)
+	.chain([(&StateEventType::RoomEncryption, ""), (&StateEventType::RoomTopic, "")])
+}
+
+/// Reads one recommended cell of the room's current state.
+///
+/// The cell's lookup and its event read are separate steps because both report
+/// a miss the same way, and only the first of those is an absent cell.
+#[implement(Service)]
+#[tracing::instrument(level = "trace", skip_all)]
+async fn summary_state_event(&self, room_id: &RoomId, cell: SummaryCell<'_>) -> Option<PduEvent> {
+	let (event_type, state_key) = cell;
+	let event_id = self
+		.services
+		.state_accessor
+		.room_state_get_id(room_id, event_type, state_key)
+		.map(|lookup| summary_event_id(room_id, cell, lookup))
+		.await?;
+
+	self.services
+		.timeline
+		.get_pdu(&event_id)
+		.inspect_err(unreadable_summary_event(room_id, &event_id))
+		.ok()
+		.await
+}
+
+fn summary_event_id(
+	room_id: &RoomId,
+	(event_type, state_key): SummaryCell<'_>,
+	lookup: Result<OwnedEventId>,
+) -> Option<OwnedEventId> {
+	lookup
+		.present()
+		.inspect_err(|error| {
+			warn!(
+				%room_id,
+				%event_type,
+				%state_key,
+				%error,
+				"Omitting unreadable summary state."
+			);
+		})
+		.flat_ok()
+}
+
+fn unreadable_summary_event(room_id: &RoomId, event_id: &EventId) -> impl Fn(&Error) {
+	move |error| warn!(%room_id, %event_id, %error, "Omitting unreadable summary event.")
+}
+
 /// Builds full-PDU invite-state context for a membership event.
 ///
 /// Recommended stored state and the supplied event are formatted for the given
-/// room version as required by MSC4311. Failed state or JSON lookups are
-/// omitted, and the supplied membership event is appended last.
+/// room version as required by MSC4311. A recommended event absent from the
+/// current state is skipped; any other failed lookup, including an event the
+/// state references but storage cannot read as a PDU, is logged and omitted.
+/// The supplied membership event is appended last.
 #[implement(Service)]
 #[tracing::instrument(skip_all, level = "debug")]
 pub async fn summary_pdus<Pdu: Event>(
@@ -603,17 +809,7 @@ pub async fn summary_pdus<Pdu: Event>(
 	event_json: &CanonicalJsonObject,
 	room_version: &RoomVersionId,
 ) -> Vec<Box<RawJsonValue>> {
-	let cells = [
-		(&StateEventType::RoomCreate, ""),
-		(&StateEventType::RoomJoinRules, ""),
-		(&StateEventType::RoomCanonicalAlias, ""),
-		(&StateEventType::RoomName, ""),
-		(&StateEventType::RoomAvatar, ""),
-		(&StateEventType::RoomMember, event.sender().as_str()),
-		(&StateEventType::RoomEncryption, ""),
-		(&StateEventType::RoomTopic, ""),
-	];
-
+	let room_id = event.room_id();
 	let membership = self
 		.services
 		.federation
@@ -621,33 +817,56 @@ pub async fn summary_pdus<Pdu: Event>(
 		.boxed() // query-depth firewall
 		.await;
 
-	cells
+	// A room with a membership event to summarize has a snapshot; a failed read is a fault.
+	let shortstatehash = self
+		.get_room_shortstatehash(room_id)
+		.inspect_err(|error| {
+			warn!(%room_id, %error, "Omitting summary state of an unreadable snapshot.");
+		})
+		.ok()
+		.await;
+
+	shortstatehash
 		.into_iter()
+		.cycle()
+		.zip(summary_cells(event))
 		.stream()
-		.wide_filter_map(async |(event_type, state_key)| {
-			let pdu = self
-				.services
-				.state_accessor
-				.room_state_get(event.room_id(), event_type, state_key)
-				.await
-				.ok()?;
-
-			let pdu_json = self
-				.services
-				.timeline
-				.get_pdu_json(pdu.event_id())
-				.await
-				.ok()?;
-
-			Some(
-				self.services
-					.federation
-					.format_pdu_into(pdu_json, Some(room_version))
-					.await,
-			)
+		.wide_filter_map(|(shortstatehash, cell)| {
+			self.summary_state_pdu(room_id, shortstatehash, cell, room_version)
 		})
 		.chain(once(membership).stream())
 		.collect()
+		.await
+}
+
+#[implement(Service)]
+#[tracing::instrument(level = "trace", skip_all)]
+async fn summary_state_pdu(
+	&self,
+	room_id: &RoomId,
+	shortstatehash: ShortStateHash,
+	cell: SummaryCell<'_>,
+	room_version: &RoomVersionId,
+) -> Option<Box<RawJsonValue>> {
+	let (event_type, state_key) = cell;
+	let event_id = self
+		.services
+		.state_accessor
+		.state_get_id(shortstatehash, event_type, state_key)
+		.map(|lookup| summary_event_id(room_id, cell, lookup))
+		.await?;
+
+	// MSC4311 serves PDUs only, so the row must parse as one before it is formatted.
+	self.services
+		.timeline
+		.get_pdu(&event_id)
+		.and_then(|_| {
+			self.services
+				.federation
+				.get_pdu_into(&event_id, Some(room_version))
+		})
+		.inspect_err(unreadable_summary_event(room_id, &event_id))
+		.ok()
 		.await
 }
 
@@ -670,17 +889,81 @@ pub async fn get_room_version_rules(&self, room_id: &RoomId) -> Result<RoomVersi
 )]
 /// Returns the room version declared by the room's create event.
 ///
-/// Missing or malformed create-event content is reported to the caller.
+/// Only the event's content is decoded, so a create event stored without its
+/// room ID still yields the version. An unreadable accepted event falls back
+/// to outlier storage. Transient storage errors are preserved when neither
+/// copy can be read.
 pub async fn get_room_version(&self, room_id: &RoomId) -> Result<RoomVersionId> {
 	self.services
 		.state_accessor
-		.room_state_get_content(room_id, &StateEventType::RoomCreate, "")
+		.room_state_get_id(room_id, &StateEventType::RoomCreate, "")
+		.and_then(async |create_id| {
+			let outlier = async |accepted: Error| {
+				self.services
+					.timeline
+					.get_outlier(&create_id)
+					.map_err(|outlier| match accepted {
+						| error if error.is_transient_io() => error,
+						| _ => outlier,
+					})
+					.await
+			};
+
+			self.services
+				.timeline
+				.get_non_outlier(&create_id)
+				.or_else(outlier)
+				.await
+		})
+		.map_ok(|create: CreateEvent| create.content.room_version)
+		.map_err(|error| match error {
+			| Error::Io(_) if !error.is_not_found() => error,
+			| error => err!(Request(NotFound("No create event found: {error:?}"))),
+		})
 		.await
-		.as_ref()
-		.map(room_version::from_create_content)
-		.cloned()
-		.map_err(|e| err!(Request(NotFound("No create event found: {e:?}"))))
 }
+
+/// Returns the room version as [`Service::get_room_version`] does, resolving the
+/// room's state and the create event's timeline mapping untrusted.
+///
+/// Damage from the room's state pointer to the create event's timeline mapping is
+/// `Mapped::Damaged` where that function panics, fails or reads a prefix, and the
+/// state is rebuilt from storage alone. The accepted copy of the create event is
+/// read before the outlier, as there. Unlike that function, only a read finding
+/// no row or one that does not decode reports no create event, so any other
+/// failure, a database pool failure included, is returned as itself, the accepted
+/// copy's kept over the outlier's.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip(self))]
+pub(crate) async fn room_version_checked(
+	&self,
+	room_id: &RoomId,
+) -> Result<Mapped<RoomVersionId>> {
+	self.services
+		.state_accessor
+		.room_state_get_id_checked(room_id, &StateEventType::RoomCreate, "")
+		.and_then(async |create_id| match create_id {
+			| Mapped::Damaged => Ok(Mapped::Damaged),
+			| Mapped::Event(create_id) =>
+				self.services
+					.timeline
+					.get_checked_keeping(&create_id, |error| !version_absent(error))
+					.await,
+		})
+		.map_ok(|create: Mapped<CreateEvent>| create.map(|create| create.content.room_version))
+		.map_err(|error| match version_absent(&error) {
+			| true => err!(Request(NotFound("No create event found: {error:?}"))),
+			| false => error,
+		})
+		.await
+}
+
+/// Whether a failed read on the way to a room's version leaves a check with no
+/// version rather than with that failure.
+///
+/// Only a missing record or a row that does not decode does. Every other error,
+/// a storage fault or a database pool failure included, is the read's own.
+pub(crate) fn version_absent(error: &Error) -> bool { error.is_missing() || undecodable(error) }
 
 #[implement(Service)]
 #[tracing::instrument(
@@ -827,9 +1110,8 @@ pub fn get_forward_extremities<'a>(
 )]
 /// Replaces all stored forward extremities for a room.
 ///
-/// Existing rows are removed before the supplied IDs are inserted while the
-/// caller holds the state guard. The wipe and reinsertion are not transactional,
-/// and errors encountered while scanning old rows are ignored.
+/// Deletions and insertions commit in one write batch while the caller holds
+/// the state guard. Errors encountered while scanning old rows are ignored.
 pub async fn set_forward_extremities<'a, I>(
 	&'a self,
 	room_id: &'a RoomId,
@@ -839,17 +1121,22 @@ pub async fn set_forward_extremities<'a, I>(
 	I: Iterator<Item = &'a EventId> + Send + 'a,
 {
 	let prefix = (room_id, Interfix);
-	self.db
-		.roomid_pduleaves
+	let leaves = &self.db.roomid_pduleaves;
+	let txn = leaves
 		.keys_prefix_raw(&prefix)
 		.ignore_err()
-		.ready_for_each(|key| self.db.roomid_pduleaves.remove(key))
+		.ready_fold(self.services.db.txn(), |mut txn, key| {
+			txn.del_raw(leaves, key);
+			txn
+		})
 		.await;
 
-	for event_id in event_ids {
-		let key = (room_id, event_id);
-		self.db.roomid_pduleaves.put_raw(key, event_id);
-	}
+	event_ids
+		.fold(txn, |mut txn, event_id| {
+			txn.put_raw(leaves, (room_id, event_id), event_id);
+			txn
+		})
+		.execute();
 }
 
 /// Deletes every stored forward extremity for a room.

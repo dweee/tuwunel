@@ -4,20 +4,61 @@
 //! or relational content before overwriting the accepted row. These side
 //! effects are coordinated under the caller's room timeline guard.
 
-use ruma::{
-	EventId, RoomId,
-	canonical_json::{RedactedBecause, redact_in_place},
-};
-use tuwunel_core::{Result, err, implement, matrix::event::Event};
+use std::mem::take;
 
-use crate::rooms::{short::ShortRoomId, timeline::RoomMutexGuard};
+use futures::future::join;
+use ruma::{
+	CanonicalJsonObject, CanonicalJsonValue, EventId, RoomId,
+	canonical_json::{RedactedBecause, redact_in_place},
+	events::TimelineEventType,
+	room_version_rules::RedactionRules,
+};
+use tuwunel_core::{
+	Result, err, implement,
+	utils::{BoolExt, OptionExt, result::NotFound, to_canonical_object},
+};
+use tuwunel_matrix::{event::Event, pdu::PRIVATE_UNSIGNED};
+
+use super::Position;
+use crate::{
+	integrity::leading_json,
+	rooms::{
+		short::ShortRoomId,
+		threads::{thread_bundle_mut, thread_root},
+		timeline::RoomMutexGuard,
+	},
+};
+
+/// What recording a redaction on the event it redacts would do.
+///
+/// The unrecorded redactions check decides each redaction through this without
+/// writing, where `restore_redaction` decides and writes under the room's lock.
+pub(crate) enum Restoration {
+	/// Recording it would rewrite the event's row.
+	Due,
+
+	/// Recording it would leave the event as it is.
+	Moot,
+
+	/// A timeline mapping the decision reads does not decode as a PDU id.
+	Malformed,
+
+	/// The event's row is missing or does not decode as the repair reads it, the
+	/// event does not take the redaction, or the redaction does not convert to
+	/// canonical JSON.
+	Unreadable,
+}
 
 /// Replaces an accepted PDU with its room-version redacted form.
 ///
 /// Failure to resolve the event's accepted PDU ID is treated as a successful
-/// no-op. Original retention, search removal, and relation deletion occur
-/// before the accepted row is replaced, so the operation is not atomic if a
-/// later step fails.
+/// no-op. Original retention, search removal, relation deletion, and removal
+/// from unread counts occur before the accepted row is replaced, so the
+/// operation is not atomic if a later step fails. A redacted thread reply is
+/// removed from its root's `m.thread` summary (the count, and the latest event
+/// when it was the latest) in the same write as the accepted row, which also
+/// takes a thread left with no replies off the thread list; a redacted thread
+/// root keeps its summary.
 #[implement(super::Service)]
 #[tracing::instrument(name = "redact", level = "debug", skip(self))]
 pub async fn redact_pdu<Pdu: Event + Send + Sync>(
@@ -33,7 +74,7 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 		return Ok(());
 	};
 
-	let mut pdu = self
+	let pdu = self
 		.get_pdu_json_from_id(&pdu_id)
 		.await
 		.map_err(|e| {
@@ -75,12 +116,475 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 		.delete_typed_relation(&pdu_id, &pdu)
 		.await;
 
-	redact_in_place(
-		&mut pdu,
-		&room_version_rules.redaction,
-		Some(RedactedBecause::from_json(reason.to_canonical_object())),
-	)
-	.map_err(|err| err!("invalid event: {err}"))?;
+	self.services
+		.pusher
+		.redact_pdu(&pdu_id, event_id, &pdu)
+		.await;
 
-	self.replace_pdu(&pdu_id, &pdu).await
+	// Read before redaction strips `m.relates_to`.
+	let root_event_id = pdu.get("content").and_then(thread_root);
+	let keep_thread = root_event_id.as_deref() != Some(event_id);
+	let pdu = redact_keeping_thread(
+		pdu,
+		keep_thread,
+		&room_version_rules.redaction,
+		redacted_because(reason.to_canonical_object()),
+	)?;
+
+	let root = root_event_id
+		.as_deref()
+		.map_async(|root| {
+			self.services
+				.threads
+				.redacted_reply_root(root, &pdu_id, event_id)
+		})
+		.await
+		.flatten();
+
+	self.replace_redacted_pdu(&pdu_id, &pdu, root)
+		.await
+}
+
+/// Records an applied redaction on an accepted PDU that does not carry it.
+///
+/// A database migrated from another homeserver implementation can hold an event
+/// whose content a redaction already removed but which lacks `redacted_because`,
+/// so it reads as unredacted. When the content already equals its redacted
+/// form, the row is rewritten in the form `redact_pdu` leaves, skipping the
+/// steps that need the original content. As with `redact_pdu`, the latest of
+/// several redactions is the one recorded. Returns whether the row was
+/// rewritten.
+#[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip(self, reason, rules, _state_lock))]
+pub async fn restore_redaction<Pdu: Event + Send + Sync>(
+	&self,
+	event_id: &EventId,
+	reason: &Pdu,
+	rules: &RedactionRules,
+	_state_lock: &RoomMutexGuard,
+) -> Result<bool> {
+	let Some(pdu_id) = self.get_pdu_id(event_id).await.optional()? else {
+		return Ok(false);
+	};
+
+	let pdu = self.get_pdu_json_from_id(&pdu_id).await?;
+
+	if !restorable(&pdu, reason.room_id()) {
+		return Ok(false);
+	}
+
+	if let Some(recorded) = recorded_redaction(&pdu)
+		&& !self
+			.redaction_precedes(recorded, reason.event_id())
+			.await?
+	{
+		return Ok(false);
+	}
+
+	let because = to_canonical_object(reason.as_pdu()).map(redacted_because)?;
+	let Some(pdu) = already_redacted(pdu, rules, because)? else {
+		return Ok(false);
+	};
+
+	self.replace_redacted_pdu(&pdu_id, &pdu, None)
+		.await
+		.map(|()| true)
+}
+
+/// Whether the redaction a row records comes before `later` in the timeline.
+///
+/// A missing or malformed record, or a missing timeline position, is kept.
+/// Other lookup failures are returned to the caller.
+#[implement(super::Service)]
+async fn redaction_precedes(
+	&self,
+	recorded: &CanonicalJsonValue,
+	later: &EventId,
+) -> Result<bool> {
+	let Some(recorded) = recorded_event_id(recorded) else {
+		return Ok(false);
+	};
+
+	let (recorded, later) = join(self.get_pdu_count(recorded), self.get_pdu_count(later)).await;
+	let precedes = recorded
+		.optional()?
+		.zip(later.optional()?)
+		.is_some_and(|(recorded, later)| recorded < later);
+
+	Ok(precedes)
+}
+
+/// Decides as [`Service::restore_redaction`] does, writing nothing.
+///
+/// No lock is taken, so the answer describes the rows as they stand. Each
+/// timeline mapping is decoded without trusting it, and the event's row is parsed
+/// as a release build of the stored-event decoder parses it, without a debug
+/// build's assertion that no further record follows the event's. So a mapping
+/// the primitive panics on reads as malformed and a row that decoder fails on as
+/// unreadable; only a failed read is an error.
+#[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn redaction_restoration<Pdu: Event + Send + Sync>(
+	&self,
+	event_id: &EventId,
+	reason: &Pdu,
+	rules: &RedactionRules,
+) -> Result<Restoration> {
+	let pdu_id = match self.pdu_position(event_id).await? {
+		| Position::Absent => return Ok(Restoration::Moot),
+		| Position::Damaged => return Ok(Restoration::Malformed),
+		| Position::At(pdu_id) => pdu_id,
+	};
+
+	let pdu = self
+		.db
+		.pduid_pdu
+		.get(&pdu_id)
+		.await
+		.optional()?
+		.and_then(|pdu| leading_json::<CanonicalJsonObject>(&pdu).ok());
+
+	let Some(pdu) = pdu else {
+		return Ok(Restoration::Unreadable);
+	};
+
+	if !restorable(&pdu, reason.room_id()) {
+		return Ok(Restoration::Moot);
+	}
+
+	if let Some(recorded) = recorded_redaction(&pdu) {
+		let Some(precedes) = self
+			.precedes_checked(recorded, reason.event_id())
+			.await?
+		else {
+			return Ok(Restoration::Malformed);
+		};
+
+		if !precedes {
+			return Ok(Restoration::Moot);
+		}
+	}
+
+	let Ok(because) = to_canonical_object(reason.as_pdu()).map(redacted_because) else {
+		return Ok(Restoration::Unreadable);
+	};
+
+	let restoration = match already_redacted(pdu, rules, because) {
+		| Ok(Some(_)) => Restoration::Due,
+		| Ok(None) => Restoration::Moot,
+		| Err(_) => Restoration::Unreadable,
+	};
+
+	Ok(restoration)
+}
+
+/// Whether the redaction a row records comes before `later`, as
+/// `redaction_precedes` decides it.
+///
+/// Each timeline mapping is decoded untrusted, and `None` means one does not
+/// decode, where that would panic.
+#[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip_all)]
+async fn precedes_checked(
+	&self,
+	recorded: &CanonicalJsonValue,
+	later: &EventId,
+) -> Result<Option<bool>> {
+	let Some(recorded) = recorded_event_id(recorded) else {
+		return Ok(Some(false));
+	};
+
+	let (recorded, later) = join(self.pdu_position(recorded), self.pdu_position(later)).await;
+	let precedes = match (recorded?, later?) {
+		| (Position::Damaged, _) | (_, Position::Damaged) => None,
+		| (Position::At(recorded), Position::At(later)) =>
+			Some(recorded.pdu_count() < later.pdu_count()),
+		| _ => Some(false),
+	};
+
+	Ok(precedes)
+}
+
+/// Whether a stored event in the room is of a type a redaction can apply to.
+///
+/// This server and the implementations it migrates from refuse to redact a
+/// create or server ACL event whatever the sender's power, so no such row was
+/// redacted.
+fn restorable(pdu: &CanonicalJsonObject, room_id: &RoomId) -> bool {
+	let in_room = pdu
+		.get("room_id")
+		.and_then(CanonicalJsonValue::as_str)
+		.is_some_and(|id| id == room_id.as_str());
+
+	let redactable = pdu
+		.get("type")
+		.and_then(CanonicalJsonValue::as_str)
+		.map(TimelineEventType::from)
+		.is_none_or(|kind| {
+			!matches!(kind, TimelineEventType::RoomCreate | TimelineEventType::RoomServerAcl)
+		});
+
+	in_room && redactable
+}
+
+fn recorded_redaction(pdu: &CanonicalJsonObject) -> Option<&CanonicalJsonValue> {
+	pdu.get("unsigned")
+		.and_then(CanonicalJsonValue::as_object)
+		.and_then(|unsigned| unsigned.get("redacted_because"))
+}
+
+fn recorded_event_id(recorded: &CanonicalJsonValue) -> Option<&EventId> {
+	recorded
+		.as_object()
+		.and_then(|recorded| recorded.get("event_id"))
+		.and_then(CanonicalJsonValue::as_str)
+		.and_then(|id| <&EventId>::try_from(id).ok())
+}
+
+/// The redacted form of an event whose content the redaction already removed.
+///
+/// `None` when redacting would still remove content, so no redaction has been
+/// applied to it.
+fn already_redacted(
+	pdu: CanonicalJsonObject,
+	rules: &RedactionRules,
+	because: RedactedBecause,
+) -> Result<Option<CanonicalJsonObject>> {
+	let content = pdu.get("content").cloned();
+	let redacted = redact_keeping_thread(pdu, true, rules, because)?;
+	let unchanged = redacted.get("content") == content.as_ref();
+
+	Ok(unchanged.then_some(redacted))
+}
+
+/// Redacts an event, keeping the unsigned fields private to its sender and, when
+/// asked, its thread summary.
+///
+/// The redaction rewrites `unsigned` wholesale. The private fields still go to
+/// the sender alone, since every serving path strips them for anyone else.
+fn redact_keeping_thread(
+	mut pdu: CanonicalJsonObject,
+	keep_thread: bool,
+	rules: &RedactionRules,
+	because: RedactedBecause,
+) -> Result<CanonicalJsonObject> {
+	let thread = keep_thread.and_then(|| thread_bundle_mut(&mut pdu).map(take));
+	let private = PRIVATE_UNSIGNED.map(|key| unsigned_mut(&mut pdu)?.remove_entry(key));
+
+	redact_in_place(&mut pdu, rules, Some(because))
+		.map_err(|err| err!("invalid event: {err}"))?;
+
+	let relations = thread.map(|thread| {
+		let relations = [("m.thread".into(), CanonicalJsonValue::Object(thread))].into();
+
+		("m.relations".into(), CanonicalJsonValue::Object(relations))
+	});
+
+	if let Some(unsigned) = unsigned_mut(&mut pdu) {
+		unsigned.extend(private.into_iter().flatten().chain(relations));
+	}
+
+	Ok(pdu)
+}
+
+fn unsigned_mut(pdu: &mut CanonicalJsonObject) -> Option<&mut CanonicalJsonObject> {
+	pdu.get_mut("unsigned")
+		.and_then(CanonicalJsonValue::as_object_mut)
+}
+
+/// The redaction as recorded on the event it redacts, without its own `unsigned`.
+///
+/// That field holds what the server knows about the redaction, such as the
+/// sender's transaction id, which is not for the readers of the redacted event.
+fn redacted_because(mut reason: CanonicalJsonObject) -> RedactedBecause {
+	reason.remove("unsigned");
+	RedactedBecause::from_json(reason)
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::{RoomVersionId, room_id};
+	use serde_json::{from_value, json};
+
+	use super::*;
+
+	#[test]
+	fn redaction_keeps_the_targets_private_fields_alone() {
+		let target = object(json!({
+			"type": "m.room.message",
+			"content": { "body": "hello", "msgtype": "m.text" },
+			"unsigned": {
+				"transaction_id": "target-txn",
+				"org.matrix.msc4140.delay_id": "syd_target",
+				"foreign.reference": "$redaction",
+			},
+		}));
+
+		let reason = object(json!({
+			"type": "m.room.redaction",
+			"content": { "redacts": "$target" },
+			"unsigned": { "transaction_id": "redactor-txn" },
+		}));
+
+		let redacted = redact_keeping_thread(target, true, &rules(), redacted_because(reason))
+			.expect("redactable event");
+
+		let expected = object(json!({
+			"transaction_id": "target-txn",
+			"org.matrix.msc4140.delay_id": "syd_target",
+			"redacted_because": {
+				"type": "m.room.redaction",
+				"content": { "redacts": "$target" },
+			},
+		}));
+
+		assert_eq!(unsigned(&redacted), &expected);
+	}
+
+	#[test]
+	fn unredacted_content_is_not_an_already_redacted() {
+		let target = object(json!({
+			"type": "m.room.message",
+			"content": { "body": "hello", "msgtype": "m.text" },
+		}));
+
+		let applied = already_redacted(target, &rules(), because()).expect("redactable event");
+
+		assert!(applied.is_none());
+	}
+
+	#[test]
+	fn emptied_content_is_restored_alone_in_unsigned() {
+		let target = object(json!({
+			"type": "m.room.message",
+			"content": {},
+			"unsigned": { "foreign.reference": "$redaction" },
+		}));
+
+		let redacted = already_redacted(target, &rules(), because())
+			.expect("redactable event")
+			.expect("redaction already applied");
+
+		let unsigned = unsigned(&redacted);
+
+		assert_eq!(unsigned.len(), 1);
+		assert!(unsigned.contains_key("redacted_because"));
+	}
+
+	#[test]
+	fn kept_content_is_an_already_redacted() {
+		let target = object(json!({
+			"type": "m.room.member",
+			"state_key": "@alice:example.org",
+			"content": { "membership": "join" },
+		}));
+
+		let applied = already_redacted(target, &rules(), because()).expect("redactable event");
+
+		assert!(applied.is_some());
+	}
+
+	#[test]
+	fn restored_row_matches_a_native_redaction() {
+		let original = object(json!({
+			"type": "m.room.message",
+			"room_id": "!room:example.org",
+			"sender": "@alice:example.org",
+			"content": { "body": "hello", "msgtype": "m.text" },
+			"unsigned": { "transaction_id": "target-txn" },
+		}));
+
+		let imported = object(json!({
+			"type": "m.room.message",
+			"room_id": "!room:example.org",
+			"sender": "@alice:example.org",
+			"content": {},
+			"unsigned": { "foreign.reference": "$redaction", "transaction_id": "target-txn" },
+		}));
+
+		let native =
+			redact_keeping_thread(original, true, &rules(), because()).expect("redactable event");
+
+		let restored = already_redacted(imported, &rules(), because())
+			.expect("redactable event")
+			.expect("redaction already applied");
+
+		assert_eq!(restored, native);
+	}
+
+	#[test]
+	fn restored_root_keeps_its_thread_summary() {
+		let relations =
+			json!({ "m.thread": { "count": 2, "latest_event": { "event_id": "$reply" } } });
+
+		let target = object(json!({
+			"type": "m.room.message",
+			"content": {},
+			"unsigned": { "m.relations": relations },
+		}));
+
+		let redacted = already_redacted(target, &rules(), because())
+			.expect("redactable event")
+			.expect("redaction already applied");
+
+		assert_eq!(
+			unsigned(&redacted).get("m.relations"),
+			Some(&CanonicalJsonValue::Object(object(relations)))
+		);
+	}
+
+	#[test]
+	fn unredactable_or_foreign_room_rows_are_left_alone() {
+		let room_id = room_id!("!room:example.org");
+		let unrecorded = object(json!({ "room_id": room_id, "content": {} }));
+		let create = object(json!({
+			"type": "m.room.create",
+			"room_id": room_id,
+			"content": { "room_version": "11" },
+		}));
+
+		let elsewhere = object(json!({ "room_id": "!other:example.org", "content": {} }));
+
+		assert!(restorable(&unrecorded, room_id));
+		assert!(!restorable(&create, room_id));
+		assert!(!restorable(&elsewhere, room_id));
+	}
+
+	#[test]
+	fn recorded_redaction_is_found() {
+		let unrecorded = object(json!({ "content": {} }));
+		let recorded = object(json!({
+			"unsigned": { "redacted_because": { "event_id": "$redaction" } },
+		}));
+
+		let nameless = object(json!({ "unsigned": { "redacted_because": {} } }));
+
+		assert!(recorded_redaction(&unrecorded).is_none());
+		assert!(recorded_redaction(&recorded).is_some());
+		assert!(recorded_redaction(&nameless).is_some());
+	}
+
+	fn object(value: serde_json::Value) -> CanonicalJsonObject {
+		from_value(value).expect("canonical JSON object")
+	}
+
+	fn unsigned(pdu: &CanonicalJsonObject) -> &CanonicalJsonObject {
+		pdu.get("unsigned")
+			.and_then(CanonicalJsonValue::as_object)
+			.expect("unsigned object")
+	}
+
+	fn rules() -> RedactionRules {
+		RoomVersionId::V11
+			.rules()
+			.expect("known room version")
+			.redaction
+	}
+
+	fn because() -> RedactedBecause {
+		redacted_because(object(json!({
+			"type": "m.room.redaction",
+			"content": { "redacts": "$target" },
+		})))
+	}
 }

@@ -296,6 +296,133 @@ pub fn filesystem_from_path(_path: &Path) -> Result<Option<Filesystem>> {
 	Err(Error::new(Unsupported, "Filesystem discovery requires statfs.").into())
 }
 
+/// Get the space in bytes a non-privileged process may still write to the
+/// filesystem holding `path`.
+///
+/// Blocks reserved for privileged processes make this smaller than the space
+/// that is free. Per-user quotas are not counted.
+///
+/// Apple's `statvfs(3)` counts blocks in 32 bits, which ends at 16 TiB of
+/// 4 KiB blocks, so `statfs(2)` and its 64-bit count are read there instead.
+#[cfg(target_vendor = "apple")]
+pub fn available_space(path: &Path) -> Result<u64> {
+	use nix::sys::statfs::statfs;
+
+	let stat = statfs(path)?;
+	let available = stat
+		.blocks_available()
+		.saturating_mul(stat.block_size().into());
+
+	Ok(available)
+}
+
+/// Get the space in bytes a non-privileged process may still write to the
+/// filesystem holding `path`.
+///
+/// Blocks reserved for privileged processes make this smaller than the space
+/// that is free. Per-user quotas are not counted.
+///
+/// `statvfs(3)` counts blocks in units of the fragment size.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub fn available_space(path: &Path) -> Result<u64> {
+	use nix::sys::statvfs::statvfs;
+
+	#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+	use crate::utils::math::u64_from_i64_saturating;
+	use crate::utils::math::u64_from_u128_saturating;
+
+	let stat = statvfs(path)?;
+	let blocks = stat.blocks_available();
+
+	// FreeBSD and DragonFly wrap the count once privileged writers overdraw the reserve
+	#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+	let blocks = u64_from_i64_saturating(blocks.cast_signed());
+
+	let available = u128::from(blocks).saturating_mul(stat.fragment_size().into());
+
+	Ok(u64_from_u128_saturating(available))
+}
+
+/// Get the space in bytes the calling user may still write to the volume
+/// holding `path`.
+///
+/// Per-user quotas make this smaller than the space that is free, and it is
+/// the figure a write is refused against. `path` may be any directory on the
+/// volume.
+#[cfg(windows)]
+pub fn available_space(path: &Path) -> Result<u64> {
+	use std::{
+		io::{Error, ErrorKind::InvalidInput},
+		iter::once,
+		os::windows::ffi::OsStrExt,
+		ptr::null_mut,
+	};
+
+	use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+	let directory_name: Vec<u16> = path
+		.as_os_str()
+		.encode_wide()
+		.chain(unc_terminator(path))
+		.chain(once(0))
+		.collect();
+
+	if directory_name
+		.split_last()
+		.is_some_and(|(_, units)| units.contains(&0))
+	{
+		return Err(Error::new(InvalidInput, "Path contains a NUL.").into());
+	}
+
+	let mut available = 0_u64; // GetDiskFreeSpaceExW out-param
+
+	// SAFETY: directory_name is NUL-terminated and outlives the call, available
+	// is a writable u64, and the two values not asked for may be null.
+	let succeeded = unsafe {
+		GetDiskFreeSpaceExW(directory_name.as_ptr(), &raw mut available, null_mut(), null_mut())
+	};
+
+	if succeeded == 0 {
+		return Err(Error::last_os_error().into());
+	}
+
+	Ok(available)
+}
+
+/// Get the backslash a UNC `path` lacks at its end.
+///
+/// `GetDiskFreeSpaceExW` documents that a UNC name must end in one, as in
+/// `\\server\share\`, so it is returned when the path has none. Any other
+/// path gets `None`, since a separator would turn the drive-relative `C:`
+/// into the root `C:\`.
+#[cfg(windows)]
+fn unc_terminator(path: &Path) -> Option<u16> {
+	use std::path::{Component, Prefix};
+
+	let separator = b'\\';
+	let unc = matches!(
+		path.components().next(),
+		Some(Component::Prefix(prefix))
+			if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+	);
+
+	let missing = unc && path.as_os_str().as_encoded_bytes().last() != Some(&separator);
+
+	missing.then_some(separator.into())
+}
+
+/// Get the space in bytes a non-privileged process may still write to the
+/// filesystem holding `path`.
+///
+/// No interface for this is known for the target, so this always returns an
+/// unsupported error.
+#[cfg(not(any(unix, windows)))]
+pub fn available_space(_path: &Path) -> Result<u64> {
+	use std::io::{Error, ErrorKind::Unsupported};
+
+	Err(Error::new(Unsupported, "Available space discovery is not implemented.").into())
+}
+
 /// Get the (major, minor) of the block device on which Path is mounted.
 #[cfg(unix)]
 fn dev_from_path(path: &Path) -> Result<(dev_t, dev_t)> {

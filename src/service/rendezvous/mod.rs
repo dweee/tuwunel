@@ -1,11 +1,12 @@
 //! In-memory rendezvous session exchange.
 //!
-//! The service holds short-lived client rendezvous payloads, conditional validators, and per-client
-//! rate-limit buckets. Sessions are bounded in count and intentionally disappear on restart.
+//! The service holds short-lived client rendezvous payloads, conditional validators, recorded
+//! transactions, and per-client rate-limit buckets. Sessions are bounded in count and intentionally
+//! disappear on restart.
 
 use std::{
 	cmp::max,
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, HashMap, VecDeque},
 	net::IpAddr,
 	str,
 	sync::{Arc, Mutex, RwLock},
@@ -15,7 +16,10 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as b64};
 use bytes::Bytes;
 use http::StatusCode;
-use ruma::api::error::{ErrorKind, LimitExceededErrorData};
+use ruma::{
+	OwnedTransactionId, TransactionId,
+	api::error::{ErrorKind, LimitExceededErrorData},
+};
 use tuwunel_core::{
 	Error, Result,
 	arrayvec::ArrayString,
@@ -34,6 +38,7 @@ pub type SessionId = ArrayString<SESSION_ID_LENGTH>;
 pub type Etag = ArrayString<ETAG_LENGTH>;
 type Sessions = BTreeMap<SessionId, Session>;
 type Ratelimiter = Mutex<HashMap<IpAddr, (Instant, f64)>>;
+type Transactions = VecDeque<(OwnedTransactionId, Etag)>;
 
 /// Stores bounded rendezvous sessions and request rate-limit state.
 ///
@@ -56,6 +61,7 @@ struct Session {
 	created: SystemTime,
 	last_modified: SystemTime,
 	expires_at: SystemTime,
+	transactions: Transactions,
 }
 
 /// HTTP metadata associated with a rendezvous payload.
@@ -98,31 +104,32 @@ pub enum Get {
 
 /// Outcome of conditionally replacing a rendezvous payload.
 ///
-/// Accepted updates return current metadata, including idempotent retries. A stale validator for
-/// different data returns the existing metadata as a precondition failure.
+/// Accepted updates return the metadata of the state they settled on, including idempotent
+/// retries. Each transport defines what counts as a retry, and any other stale validator returns
+/// the existing metadata as a precondition failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Put {
 	/// Replacement or idempotent retry was accepted.
 	Accepted(Meta),
 
-	/// Validator was stale and the submitted payload differed.
+	/// Validator was stale and the request was not a retry.
 	PreconditionFailed(Meta),
 
 	/// Session was absent or expired.
 	NotFound,
 }
 
-/// Conditional validator accepted by the update state machine.
+/// A single send attempt under a sequence token.
 ///
-/// HTTP updates use the quoted entity tag, while protocol sequence-token updates use its unquoted
-/// value.
-#[derive(Clone, Copy)]
-enum Validator<'a> {
-	/// Quoted HTTP entity tag supplied through `If-Match`.
-	Etag(&'a str),
+/// The transaction ID identifies a retry of the attempt within its session, and a client changing
+/// the token or the payload makes a new attempt.
+#[derive(Clone, Copy, Debug)]
+pub struct Attempt<'a> {
+	/// Client-chosen identifier, scoped to the rendezvous session.
+	pub txn_id: &'a TransactionId,
 
-	/// Unquoted protocol sequence token.
-	SequenceToken(&'a str),
+	/// Unquoted token of the state this attempt replaces.
+	pub sequence_token: &'a str,
 }
 
 const SESSION_ID_LENGTH: usize = 32;
@@ -132,6 +139,7 @@ const MILLIS_PER_SECOND: u64 = 1000;
 const MAX_HTTP_DATE_SECONDS: u64 = 253_402_300_799;
 const MONOTONIC_STEP: Duration = Duration::from_millis(1);
 const RATELIMIT_MAP_CAP: usize = 4096;
+const MAX_TRANSACTIONS: usize = 100;
 
 #[cfg(test)]
 mod tests;
@@ -155,8 +163,8 @@ impl crate::Service for Service {
 #[implement(Service)]
 pub fn check_rate_limit(&self, client: IpAddr) -> Result {
 	let config = &self.services.server.config;
-	let rate = f64::from(config.rendezvous_rc_per_second.max(1));
-	let burst = f64::from(config.rendezvous_rc_burst_count.max(1));
+	let rate = f64::from(config.rendezvous.rc_per_second.max(1));
+	let burst = f64::from(config.rendezvous.rc_burst_count.max(1));
 
 	check_bucket_at(&self.ratelimiter, client, rate, burst, Instant::now())
 }
@@ -227,9 +235,9 @@ fn check_bucket_at(
 #[implement(Service)]
 pub fn create(&self, data: Bytes) -> (SessionId, Meta) {
 	let config = &self.services.server.config;
-	let ttl = Duration::from_secs(config.rendezvous_session_ttl);
+	let ttl = Duration::from_secs(config.rendezvous.session_ttl);
 
-	self.create_at(data, SystemTime::now(), ttl, config.rendezvous_max_sessions)
+	self.create_at(data, SystemTime::now(), ttl, config.rendezvous.max_sessions)
 }
 
 #[implement(Service)]
@@ -246,7 +254,7 @@ fn create_at(
 
 	let mut sessions = self.sessions.write().expect("locked for writing");
 
-	sessions.retain(|_, session| session.expires_at > now);
+	sessions.retain(|_, session| session.is_live(now));
 	while sessions.contains_key(id.as_str()) {
 		id = string_array::<SESSION_ID_LENGTH>();
 	}
@@ -269,6 +277,7 @@ fn create_at(
 		created: now,
 		last_modified: now,
 		expires_at,
+		transactions: Transactions::new(),
 	};
 
 	let meta = session.meta();
@@ -297,7 +306,7 @@ fn get_at(&self, id: &str, if_none_match: Option<&str>, now: SystemTime) -> Get 
 		let sessions = self.sessions.read().expect("locked for reading");
 
 		match sessions.get(id) {
-			| Some(session) if session.expires_at > now => {
+			| Some(session) if session.is_live(now) => {
 				return get_outcome(session, if_none_match);
 			},
 			| Some(_) => {},
@@ -308,7 +317,7 @@ fn get_at(&self, id: &str, if_none_match: Option<&str>, now: SystemTime) -> Get 
 	let mut sessions = self.sessions.write().expect("locked for writing");
 	if sessions
 		.get(id)
-		.is_some_and(|session| session.expires_at <= now)
+		.is_some_and(|session| !session.is_live(now))
 	{
 		sessions.remove(id);
 
@@ -323,102 +332,144 @@ fn get_at(&self, id: &str, if_none_match: Option<&str>, now: SystemTime) -> Get 
 /// Conditionally replaces a rendezvous payload using a quoted entity tag.
 ///
 /// A matching validator stores the new payload and advances its metadata. A stale validator accepts
-/// identical data as a retry but rejects different data with the current metadata.
+/// identical data as a retry that only refreshes expiration, and rejects different data with the
+/// current metadata.
 ///
 /// # Panics
 ///
 /// Panics if the session lock has been poisoned.
 #[implement(Service)]
 pub fn put(&self, id: &str, if_match: &str, data: Bytes) -> Put {
-	let ttl = Duration::from_secs(self.services.server.config.rendezvous_session_ttl);
+	let ttl = Duration::from_secs(self.services.server.config.rendezvous.session_ttl);
 
 	self.put_at(id, if_match, data, SystemTime::now(), ttl)
 }
 
 #[implement(Service)]
 fn put_at(&self, id: &str, if_match: &str, data: Bytes, now: SystemTime, ttl: Duration) -> Put {
-	self.put_with_at(id, Validator::Etag(if_match), data, now, ttl)
+	self.update_at(id, now, |session| {
+		match etag_matches(if_match, &session.etag) {
+			| true => session.replace(id, data, now, ttl),
+			| false if data == session.data => session.expires_at = expires_at(now, ttl),
+			| false => return Put::PreconditionFailed(session.meta()),
+		}
+
+		Put::Accepted(session.meta())
+	})
 }
 
-/// Conditionally replaces a rendezvous payload using an unquoted sequence token.
+/// Conditionally replaces a rendezvous payload for one send attempt.
 ///
-/// Update and retry behavior matches [`Self::put`], but the validator is compared with the entity
-/// tag's unquoted value.
+/// A transaction the session has recorded returns its recorded token and changes nothing. Otherwise
+/// the sequence token must match, whatever the data, and a replacement records the transaction.
+/// A session remembers only its newest transactions, so a long-evicted retry is judged as new.
 ///
 /// # Panics
 ///
 /// Panics if the session lock has been poisoned.
 #[implement(Service)]
-pub fn put_token(&self, id: &str, sequence_token: &str, data: Bytes) -> Put {
-	let ttl = Duration::from_secs(self.services.server.config.rendezvous_session_ttl);
+pub fn put_token(&self, id: &str, attempt: Attempt<'_>, data: Bytes) -> Put {
+	let ttl = Duration::from_secs(self.services.server.config.rendezvous.session_ttl);
 
-	self.put_token_at(id, sequence_token, data, SystemTime::now(), ttl)
+	self.put_token_at(id, attempt, data, SystemTime::now(), ttl)
 }
 
 #[implement(Service)]
 fn put_token_at(
 	&self,
 	id: &str,
-	sequence_token: &str,
+	attempt: Attempt<'_>,
 	data: Bytes,
 	now: SystemTime,
 	ttl: Duration,
 ) -> Put {
-	self.put_with_at(id, Validator::SequenceToken(sequence_token), data, now, ttl)
+	self.update_at(id, now, |session| match session.recorded(attempt.txn_id) {
+		| Some(recorded) => Put::Accepted(recorded),
+		| None if attempt.sequence_token != etag_value(&session.etag) =>
+			Put::PreconditionFailed(session.meta()),
+		| None => {
+			session.replace(id, data, now, ttl);
+			session.record(attempt.txn_id);
+
+			Put::Accepted(session.meta())
+		},
+	})
 }
 
-/// Applies the shared conditional-update state machine at a supplied time.
+/// Runs a conditional update on a live session at a supplied time.
 ///
-/// Expired sessions are removed before validation. Successful replacements advance modification
-/// time monotonically, while identical stale retries only refresh expiration.
+/// An expired session is removed and reported as not found before the update can see it.
 #[implement(Service)]
-fn put_with_at(
-	&self,
-	id: &str,
-	validator: Validator<'_>,
-	data: Bytes,
-	now: SystemTime,
-	ttl: Duration,
-) -> Put {
+fn update_at<Update>(&self, id: &str, now: SystemTime, update: Update) -> Put
+where
+	Update: FnOnce(&mut Session) -> Put,
+{
 	let mut sessions = self.sessions.write().expect("locked for writing");
 
 	if sessions
 		.get(id)
-		.is_some_and(|session| session.expires_at <= now)
+		.is_some_and(|session| !session.is_live(now))
 	{
 		sessions.remove(id);
 
 		return Put::NotFound;
 	}
 
-	let Some(session) = sessions.get_mut(id) else {
-		return Put::NotFound;
-	};
+	sessions.get_mut(id).map_or(Put::NotFound, update)
+}
 
-	if !validator.matches(&session.etag) {
-		if data != session.data {
-			return Put::PreconditionFailed(session.meta());
-		}
+/// Looks up the outcome recorded for a transaction of a live session.
+///
+/// A caller can answer a retried send before validating its request. [`Self::put_token`] checks the
+/// record again under the write lock, which settles two racing retries.
+///
+/// # Panics
+///
+/// Panics if the session lock has been poisoned.
+#[implement(Service)]
+pub fn recorded(&self, id: &str, txn_id: &TransactionId) -> Option<Meta> {
+	self.recorded_at(id, txn_id, SystemTime::now())
+}
 
-		session.expires_at = expires_at(now, ttl);
+#[implement(Service)]
+fn recorded_at(&self, id: &str, txn_id: &TransactionId, now: SystemTime) -> Option<Meta> {
+	self.sessions
+		.read()
+		.expect("locked for reading")
+		.get(id)
+		.filter(|session| session.is_live(now))
+		.and_then(|session| session.recorded(txn_id))
+}
 
-		return Put::Accepted(session.meta());
+#[implement(Session)]
+fn recorded(&self, txn_id: &TransactionId) -> Option<Meta> {
+	self.transactions
+		.iter()
+		.find(|(recorded, _)| recorded == txn_id)
+		.map(|(_, etag)| Meta { etag: *etag, ..self.meta() })
+}
+
+#[implement(Session)]
+fn replace(&mut self, id: &str, data: Bytes, now: SystemTime, ttl: Duration) {
+	self.last_modified = next_last_modified(now, self.last_modified);
+	self.etag = etag(id, &data, self.last_modified);
+	self.expires_at = expires_at(now, ttl);
+	self.data = data;
+}
+
+#[implement(Session)]
+fn record(&mut self, txn_id: &TransactionId) {
+	if self.transactions.len() >= MAX_TRANSACTIONS {
+		self.transactions.pop_front();
 	}
 
-	let created = session.created;
-	let last_modified = next_last_modified(now, session.last_modified);
-	let expires_at = expires_at(now, ttl);
-
-	*session = Session {
-		etag: etag(id, &data, last_modified),
-		data,
-		created,
-		last_modified,
-		expires_at,
-	};
-
-	Put::Accepted(session.meta())
+	self.transactions
+		.push_back((txn_id.to_owned(), self.etag));
 }
+
+#[implement(Session)]
+#[inline]
+fn is_live(&self, now: SystemTime) -> bool { self.expires_at > now }
 
 /// Deletes a rendezvous session regardless of expiration.
 ///
@@ -454,7 +505,7 @@ fn delete_if_active_at(&self, id: &str, now: SystemTime) -> bool {
 		.write()
 		.expect("locked for writing")
 		.remove(id)
-		.is_some_and(|session| session.expires_at > now)
+		.is_some_and(|session| session.is_live(now))
 }
 
 /// Returns the unquoted sequence token for this representation.
@@ -491,22 +542,13 @@ fn expires_in_at(&self, now: SystemTime) -> Duration {
 		.unwrap_or_default()
 }
 
-impl Session {
-	fn meta(&self) -> Meta {
-		Meta {
-			etag: self.etag,
-			expires_at: self.expires_at,
-			last_modified: self.last_modified,
-		}
-	}
-}
-
-impl Validator<'_> {
-	fn matches(self, stored: &Etag) -> bool {
-		match self {
-			| Self::Etag(candidate) => etag_matches(candidate, stored),
-			| Self::SequenceToken(candidate) => candidate == etag_value(stored),
-		}
+#[implement(Session)]
+#[inline]
+fn meta(&self) -> Meta {
+	Meta {
+		etag: self.etag,
+		expires_at: self.expires_at,
+		last_modified: self.last_modified,
 	}
 }
 

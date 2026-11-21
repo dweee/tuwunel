@@ -4,7 +4,7 @@
 //! assigned a normal stream count and committed to the timeline. Subsequent
 //! cache, indexing, notification, and membership effects are coordinated here.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::btree_map::Entry, sync::Arc};
 
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, EventId, UserId,
@@ -19,24 +19,70 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Result, err, error, implement,
-	matrix::{
-		event::Event,
-		pdu::{PduCount, PduEvent, PduId, RawPduId},
-		room_version,
-	},
+	Result, debug_warn, err, error, implement,
 	smallvec::SmallVec,
-	utils::{self, result::LogErr},
+	utils::{
+		OptionExt,
+		result::{LogErr, NotFound},
+	},
 };
 use tuwunel_database::Json;
-
-use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard, bias_count};
-use crate::rooms::{
-	read_receipt::PrivateRead, short::ShortRoomId, state_accessor::plain_text_topic,
-	state_cache::MembershipUpdate, state_compressor::CompressedState,
+use tuwunel_matrix::{
+	event::Event,
+	pdu::{PduCount, PduEvent, PduId, RawPduId},
+	room_version,
 };
 
+use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard, bias_count};
+use crate::{
+	admin::CommandInput,
+	rooms::{
+		read_receipt::PrivateRead,
+		short::{ShortRoomId, ShortStateHash},
+		state_accessor::plain_text_topic,
+		state_cache::MembershipUpdate,
+		state_compressor::CompressedState,
+	},
+};
+
+/// Inputs for admitting a federated event to the timeline.
+///
+/// Event state precedes the event, while current state is installed after its
+/// accepted row exists and before its stream position becomes visible.
+pub(crate) struct Incoming<'a, Leafs> {
+	/// Event being admitted.
+	pub(crate) pdu: &'a PduEvent,
+
+	/// Canonical event representation.
+	pub(crate) pdu_json: CanonicalJsonObject,
+
+	/// Replacement forward extremities.
+	pub(crate) new_room_leafs: Leafs,
+
+	/// State immediately preceding the event.
+	pub(crate) state_ids_compressed: Arc<CompressedState>,
+
+	/// Whether current-state authorization withheld acceptance.
+	pub(crate) soft_fail: bool,
+
+	/// Prepared current state for an accepted state event.
+	pub(crate) shortstatehash: Option<ShortStateHash>,
+
+	/// Guard serializing the room's state transition.
+	pub(crate) state_lock: &'a RoomMutexGuard,
+}
+
 type Band<'a> = SmallVec<[&'a EventId; 1]>;
+
+struct Appended<'a> {
+	pdu_id: RawPduId,
+	pdu: &'a PduEvent,
+	shortroomid: ShortRoomId,
+	count: PduCount,
+
+	/// Stream position of the same user's join a member event replaced, if any.
+	replaced_join: Option<PduCount>,
+}
 
 /// Appends an incoming event with its locally resolved state snapshot.
 ///
@@ -53,19 +99,21 @@ type Band<'a> = SmallVec<[&'a EventId; 1]>;
 )]
 pub(crate) async fn append_incoming_pdu<'a, Leafs>(
 	&'a self,
-	pdu: &'a PduEvent,
-	pdu_json: CanonicalJsonObject,
-	new_room_leafs: Leafs,
-	state_ids_compressed: Arc<CompressedState>,
-	soft_fail: bool,
-	state_lock: &'a RoomMutexGuard,
+	Incoming {
+		pdu,
+		pdu_json,
+		new_room_leafs,
+		state_ids_compressed,
+		soft_fail,
+		shortstatehash,
+		state_lock,
+	}: Incoming<'a, Leafs>,
 ) -> Result<Option<RawPduId>>
 where
 	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
 {
-	// We append to state before appending the pdu, so we don't have a moment in
-	// time with the pdu without it's state. This is okay because append_pdu can't
-	// fail.
+	// The event's preceding snapshot is distinct from resolved current state.
+	// Store it before the timeline row; install current state before retirement.
 	self.services
 		.state
 		.set_event_state(&pdu.event_id, &pdu.room_id, state_ids_compressed)
@@ -89,7 +137,7 @@ where
 	}
 
 	let pdu_id = self
-		.append_pdu(pdu, pdu_json, new_room_leafs, state_lock)
+		.append_pdu(pdu, pdu_json, new_room_leafs, shortstatehash, state_lock)
 		.await?;
 
 	Ok(Some(pdu_id))
@@ -110,13 +158,16 @@ where
 /// outlier removal, and timestamp index are committed together, but later
 /// cache, indexing, notification, and membership work is not part of that
 /// transaction, so an error can be returned after the event is stored.
+/// Any prepared current state is installed before the event's stream count
+/// retires, including when a later timeline effect returns an error.
 #[implement(super::Service)]
 #[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
 pub async fn append_pdu<'a, Leafs>(
 	&'a self,
 	pdu: &'a PduEvent,
-	mut pdu_json: CanonicalJsonObject,
+	pdu_json: CanonicalJsonObject,
 	leafs: Leafs,
+	shortstatehash: Option<ShortStateHash>,
 	state_lock: &'a RoomMutexGuard,
 ) -> Result<RawPduId>
 where
@@ -132,49 +183,7 @@ where
 		.await
 		.map_err(|_| err!(Database("Room does not exist")))?;
 
-	// Make unsigned fields correct. This is not properly documented in the spec,
-	// but state events need to have previous content in the unsigned field, so
-	// clients can easily interpret things like membership changes
-	if let Some(state_key) = pdu.state_key() {
-		if let CanonicalJsonValue::Object(unsigned) = pdu_json
-			.entry("unsigned".into())
-			.or_insert_with(|| CanonicalJsonValue::Object(BTreeMap::default()))
-		{
-			if let Ok(shortstatehash) = self
-				.services
-				.state
-				.pdu_shortstatehash(pdu.event_id())
-				.await && let Ok(prev_state) = self
-				.services
-				.state_accessor
-				.state_get(shortstatehash, &pdu.kind().to_string().into(), state_key)
-				.await
-			{
-				unsigned.insert(
-					"prev_content".into(),
-					CanonicalJsonValue::Object(
-						utils::to_canonical_object(prev_state.get_content_as_value()).map_err(
-							|e| {
-								err!(Database(error!(
-									"Failed to convert prev_state to canonical JSON: {e}",
-								)))
-							},
-						)?,
-					),
-				);
-				unsigned.insert(
-					"prev_sender".into(),
-					CanonicalJsonValue::String(prev_state.sender().to_string()),
-				);
-				unsigned.insert(
-					"replaces_state".into(),
-					CanonicalJsonValue::String(prev_state.event_id().to_string()),
-				);
-			}
-		} else {
-			error!("Invalid unsigned type in pdu.");
-		}
-	}
+	let (pdu_json, replaced_join) = self.read_replaced(pdu, pdu_json).await?;
 
 	// We must keep track of all events that have been referenced.
 	self.services
@@ -239,10 +248,31 @@ where
 		.log_err()
 		.ok();
 
-	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
-		.await?;
+	let appended = Appended {
+		pdu_id,
+		pdu,
+		shortroomid,
+		count,
+		replaced_join,
+	};
+
+	let effects = self
+		.append_pdu_effects(appended, state_lock)
+		.await;
+
+	if let Some(shortstatehash) = shortstatehash {
+		self.services
+			.state
+			.set_room_state(pdu.room_id(), shortstatehash, state_lock);
+	}
+
+	// The cached hierarchy summary projects the installed room state.
+	if pdu.state_key().is_some() {
+		self.services.spaces.cache_evict(pdu.room_id());
+	}
 
 	drop(next_count);
+	effects?;
 
 	self.services
 		.appservice
@@ -254,16 +284,160 @@ where
 	Ok(pdu_id)
 }
 
+/// Fill a state event's `unsigned` from the event it replaced, and find the
+/// position of the same user's join that a profile change replaces.
+///
+/// The replaced event is read once from the event's own state snapshot and is
+/// dropped on return, so it holds no place across the append's later awaits.
+#[implement(super::Service)]
+async fn read_replaced(
+	&self,
+	pdu: &PduEvent,
+	pdu_json: CanonicalJsonObject,
+) -> Result<(CanonicalJsonObject, Option<PduCount>)> {
+	let state_key = pdu.state_key();
+	let prev_state = state_key
+		.map_async(|state_key| self.prev_state(pdu, state_key))
+		.await
+		.flatten();
+
+	let pdu_json = if state_key.is_some() {
+		with_prev_unsigned(pdu_json, prev_state.as_ref())?
+	} else {
+		pdu_json
+	};
+
+	let replaced_join = self.replaced_join(pdu, prev_state.as_ref()).await;
+
+	Ok((pdu_json, replaced_join))
+}
+
+#[implement(super::Service)]
+async fn prev_state(&self, pdu: &PduEvent, state_key: &str) -> Option<PduEvent> {
+	let event_id = pdu.event_id();
+	let shortstatehash = self
+		.services
+		.state
+		.pdu_shortstatehash(event_id)
+		.await
+		.optional()
+		.inspect_err(|error| debug_warn!(%event_id, %error, "State snapshot read failed."))
+		.ok()
+		.flatten()?;
+
+	let event_type = pdu.kind().to_cow_str().into();
+
+	self.services
+		.state_accessor
+		.state_get(shortstatehash, &event_type, state_key)
+		.await
+		.optional()
+		.inspect_err(|error| debug_warn!(%event_id, %error, "Replaced state read failed."))
+		.ok()
+		.flatten()
+}
+
+/// Fill a state event's `unsigned` from the event it replaced.
+///
+/// Adds the replaced event's `prev_content`, `prev_sender` and
+/// `replaces_state`, from which clients read a membership or other state
+/// change. A non-object `unsigned` is logged and left as it is.
+fn with_prev_unsigned(
+	mut pdu_json: CanonicalJsonObject,
+	prev_state: Option<&PduEvent>,
+) -> Result<CanonicalJsonObject> {
+	let replaced = || {
+		prev_state
+			.map(prev_state_unsigned)
+			.transpose()
+			.map(Option::unwrap_or_default)
+	};
+
+	match pdu_json.entry("unsigned".into()) {
+		| Entry::Vacant(entry) => {
+			entry.insert(CanonicalJsonValue::Object(replaced()?));
+		},
+		| Entry::Occupied(entry) => match entry.into_mut() {
+			| CanonicalJsonValue::Object(unsigned) => unsigned.extend(replaced()?),
+			| _ => error!("Invalid unsigned type in pdu."),
+		},
+	}
+
+	Ok(pdu_json)
+}
+
+fn prev_state_unsigned(prev_state: &PduEvent) -> Result<CanonicalJsonObject> {
+	let prev_content = prev_state
+		.get_content::<CanonicalJsonObject>()
+		.map_err(|e| {
+			err!(Database(error!("Failed to convert prev_state to canonical JSON: {e}")))
+		})?;
+
+	let unsigned = [
+		("prev_content".into(), CanonicalJsonValue::Object(prev_content)),
+		(
+			"prev_sender".into(),
+			CanonicalJsonValue::String(prev_state.sender().to_string()),
+		),
+		(
+			"replaces_state".into(),
+			CanonicalJsonValue::String(prev_state.event_id().to_string()),
+		),
+	]
+	.into();
+
+	Ok(unsigned)
+}
+
+/// Stream position of the same user's join that a member event replaces, when
+/// the event is itself a join, as a profile change is.
+///
+/// `prev_state` must come from the event's own state snapshot, never the state
+/// cache, which a forced replay may have moved ahead of this append. Any other
+/// event yields `None`, as does a replaced join without a readable position,
+/// which a failed read logs.
+#[implement(super::Service)]
+async fn replaced_join(&self, pdu: &PduEvent, prev_state: Option<&PduEvent>) -> Option<PduCount> {
+	let user_id: &UserId = pdu.state_key()?.try_into().ok()?;
+	let is_join = |event: &PduEvent| event.membership_for(user_id) == Some(MembershipState::Join);
+	let replaced = prev_state.filter(|prev| is_join(prev) && is_join(pdu))?;
+	let event_id = replaced.event_id();
+
+	self.get_pdu_count(event_id)
+		.await
+		.optional()
+		.inspect_err(
+			|error| debug_warn!(%event_id, %error, "Replaced join position read failed."),
+		)
+		.ok()
+		.flatten()
+}
+
 #[implement(super::Service)]
 async fn append_pdu_effects(
 	&self,
-	pdu_id: RawPduId,
-	pdu: &PduEvent,
-	shortroomid: ShortRoomId,
-	count: PduCount,
+	Appended {
+		pdu_id,
+		pdu,
+		shortroomid,
+		count,
+		replaced_join,
+	}: Appended<'_>,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
 	match *pdu.kind() {
+		| TimelineEventType::RoomMember =>
+			self.append_member_effects(pdu, replaced_join, count)
+				.await?,
+		| TimelineEventType::RoomMessage =>
+			self.append_message_effects(&pdu_id, pdu, shortroomid)
+				.await?,
+		| TimelineEventType::RoomTopic =>
+			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
+				self.services
+					.search
+					.index_pdu(shortroomid, &pdu_id, &topic);
+			},
 		| TimelineEventType::RoomRedaction => {
 			let room_version = self
 				.services
@@ -286,39 +460,7 @@ async fn append_pdu_effects(
 					.await?;
 			}
 		},
-		| TimelineEventType::RoomMember => self.append_member_effects(pdu, count).await?,
-		| TimelineEventType::RoomMessage => {
-			let content: ExtractBody = pdu.get_content()?;
-			if let Some(body) = content.body {
-				self.services
-					.search
-					.index_pdu(shortroomid, &pdu_id, &body);
-
-				if self
-					.services
-					.admin
-					.is_admin_command(pdu, &body)
-					.await
-				{
-					self.services
-						.admin
-						.command(body, Some((pdu.event_id()).into()))
-						.await?;
-				}
-			}
-		},
-		| TimelineEventType::RoomTopic =>
-			if let Some(topic) = pdu.get_content().ok().and_then(plain_text_topic) {
-				self.services
-					.search
-					.index_pdu(shortroomid, &pdu_id, &topic);
-			},
 		| _ => {},
-	}
-
-	// The cached hierarchy summary projects room state; evict on any state change.
-	if pdu.state_key().is_some() {
-		self.services.spaces.cache_evict(pdu.room_id());
 	}
 
 	if let Ok(content) = pdu.get_content::<ExtractRelatesToEventId>()
@@ -383,9 +525,15 @@ async fn append_pdu_effects(
 ///
 /// The cache is written here rather than off the resolved state so that a
 /// user who is invited or knocked and leaves immediately still leaves the
-/// earlier event on record for auth.
+/// earlier event on record for auth. A join that replaced the same user's join
+/// is a profile change, which keeps the user's recorded join position.
 #[implement(super::Service)]
-async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result {
+async fn append_member_effects(
+	&self,
+	pdu: &PduEvent,
+	replaced_join: Option<PduCount>,
+	count: PduCount,
+) -> Result {
 	let Some(state_key) = pdu.state_key() else {
 		return Ok(());
 	};
@@ -414,7 +562,9 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 			sender: pdu.sender(),
 			last_state: stripped_state,
 			invite_via: None,
+			invite_event: is_invite.then_some(pdu.event_id()),
 			update_joined_count: true,
+			replaced_join,
 			count,
 		})
 		.await?;
@@ -423,6 +573,46 @@ async fn append_member_effects(&self, pdu: &PduEvent, count: PduCount) -> Result
 		self.services
 			.membership
 			.auto_accept(pdu.room_id(), &user_id, pdu.sender(), is_direct);
+	}
+
+	Ok(())
+}
+
+/// Index an `m.room.message` event's body, and queue it when it is an admin
+/// command.
+///
+/// The queued command carries the event's sender, so a handler can tell who
+/// issued it, and the event's id, which its response replies to.
+#[implement(super::Service)]
+async fn append_message_effects(
+	&self,
+	pdu_id: &RawPduId,
+	pdu: &PduEvent,
+	shortroomid: ShortRoomId,
+) -> Result {
+	let content: ExtractBody = pdu.get_content()?;
+	let Some(body) = content.body else {
+		return Ok(());
+	};
+
+	self.services
+		.search
+		.index_pdu(shortroomid, pdu_id, &body);
+
+	if self
+		.services
+		.admin
+		.is_admin_command(pdu, &body)
+		.await
+	{
+		self.services
+			.admin
+			.command(CommandInput {
+				command: body,
+				reply_id: Some(pdu.event_id().into()),
+				sender: Some(pdu.sender().into()),
+			})
+			.await?;
 	}
 
 	Ok(())
