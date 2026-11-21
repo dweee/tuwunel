@@ -28,12 +28,28 @@
   disable_release_max_log_level ? false,
   features ? [ ],
   profile ? "release",
-  # rocksdb compiled with -march=haswell and target-cpu=haswell rustflag
-  # haswell is pretty much any x86 cpu made in the last 12 years, and
-  # supports modern CPU extensions that rocksdb can make use of.
-  # disable if trying to make a portable x86_64 build for very old hardware
-  x86_64_haswell_target_optimised ? false,
+  # Minimum CPU the build may require, given to rustc as -Ctarget-cpu and to
+  # rocksdb as -march; null targets the baseline. x86_64 takes any name both
+  # compilers accept (e.g. "x86-64-v3"); the levels x86-64-v2 to v4 also
+  # require PCLMUL, as the release packages of those levels do. aarch64 takes
+  # only "native": a name there replaces the crc and crypto extensions
+  # rocksdb's build adds itself.
+  target_cpu ? null,
+  # Allow any target_cpu off x86_64. The value must then be a -march string
+  # gcc and rustc both accept, and must keep crc and crypto on aarch64.
+  target_cpu_unchecked ? false,
 }:
+
+assert lib.assertMsg (
+  target_cpu == null
+  || target_cpu == "native"
+  || stdenv.hostPlatform.isx86_64
+  || target_cpu_unchecked
+) ''
+  target_cpu = "${toString target_cpu}": off x86_64 only "native" is checked.
+  Here -march replaces the crc/crypto flags rocksdb adds, so a narrower value
+  silently drops its hardware crc32c. Set target_cpu_unchecked = true to
+  override.'';
 
 let
   # We perform default-feature unification in nix, because some of the dependencies
@@ -44,7 +60,12 @@ let
       manifest = lib.importTOML "${path}/Cargo.toml";
     in
     lib.remove "default" (lib.attrNames manifest.features);
-  crateDefaultFeatures = path: (lib.importTOML "${path}/Cargo.toml").features.default;
+  # Only the crate's own feature names; `dep/feature` forwards (such as each
+  # workspace crate's default) would re-enable what disable_features removes.
+  crateDefaultFeatures =
+    path:
+    lib.filter (feature: !lib.hasInfix "/" feature)
+      (lib.importTOML "${path}/Cargo.toml").features.default;
   allDefaultFeatures = crateDefaultFeatures "${inputs.self}/src/main";
   allFeatures = crateFeatures "${inputs.self}/src/main";
   features' = lib.unique (
@@ -75,20 +96,23 @@ let
     }).overrideAttrs
       (old: {
         enableLiburing = enableLiburing;
-        cmakeFlags =
-          (
-            if x86_64_haswell_target_optimised then
-              (
-                lib.subtractLists [
-                  # dont make a portable build if x86_64_haswell_target_optimised is enabled
-                  "-DPORTABLE=1"
-                ] old.cmakeFlags
-                ++ [ "-DPORTABLE=haswell" ]
-              )
-            else
-              ([ "-DPORTABLE=1" ])
-          )
-          ++ old.cmakeFlags;
+        cmakeFlags = [ "-DPORTABLE=1" ] ++ old.cmakeFlags;
+
+        # Not PORTABLE=<cpu>: cmake reads any value containing 0, 1, N or Y
+        # as a boolean, so names like skylake-avx512 would silently stay
+        # baseline. NIX_CFLAGS_COMPILE follows cmake's flags, so this wins.
+        # The psABI levels omit pclmul. Rocksdb's crc32c assumes it from AVX,
+        # so v3 and v4 fail to compile without it, and it gives v2 the three
+        # way crc32c. The v2 to v4 release packages add it too (docker/bake.hcl,
+        # rocksdb_cxx_flags), so these levels mean the level plus PCLMUL.
+        env =
+          (old.env or { })
+          // lib.optionalAttrs (target_cpu != null) {
+            NIX_CFLAGS_COMPILE =
+              toString (old.env.NIX_CFLAGS_COMPILE or "")
+              + " -march=${target_cpu}"
+              + lib.optionalString (builtins.match "x86-64-v[2-4]" target_cpu != null) " -mpclmul";
+          };
 
         # outputs has "tools" which we dont need or use
         outputs = [ "out" ];
@@ -96,6 +120,16 @@ let
         # preInstall hooks has stuff for messing with ldb/sst_dump which we dont need or use
         preInstall = "";
       });
+
+  crossEnv = import ./cross-compilation-env.nix {
+    # Keep sorted
+    inherit
+      lib
+      pkgsBuildHost
+      rust
+      stdenv
+      ;
+  };
 
   buildDepsOnlyEnv = {
     # https://crane.dev/faq/rebuilds-bindgen.html
@@ -105,15 +139,13 @@ let
     ROCKSDB_INCLUDE_DIR = "${rocksdb'}/include";
     ROCKSDB_LIB_DIR = "${rocksdb'}/lib";
   }
-  // (import ./cross-compilation-env.nix {
-    # Keep sorted
-    inherit
-      lib
-      pkgsBuildHost
-      rust
-      stdenv
-      ;
-  });
+  // crossEnv
+  // {
+    # Set on the deps-only build too, so the final build reuses its artifacts.
+    CARGO_BUILD_RUSTFLAGS =
+      crossEnv.CARGO_BUILD_RUSTFLAGS
+      + lib.optionalString (target_cpu != null) " -Ctarget-cpu=${target_cpu}";
+  };
 
   buildPackageEnv = {
     TUWUNEL_VERSION_EXTRA = inputs.self.shortRev or inputs.self.dirtyShortRev or "";
@@ -126,8 +158,7 @@ let
       buildDepsOnlyEnv.CARGO_BUILD_RUSTFLAGS
       + lib.optionalString (
         enableLiburing && stdenv.hostPlatform.isStatic
-      ) " -L${lib.getLib liburing}/lib -luring"
-      + lib.optionalString x86_64_haswell_target_optimised " -Ctarget-cpu=haswell";
+      ) " -L${lib.getLib liburing}/lib -luring";
   };
 
   commonAttrs = {

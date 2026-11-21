@@ -74,29 +74,58 @@ on:
         required: false
         description: Write token for the self-hosted binary cache.
 
+permissions:
+  contents: read
+
 jobs:
+  base:
+    if: >
+      !failure() && !cancelled()
+      && (fromJSON(inputs.enable_distro) || fromJSON(inputs.enable_checks))
+      && contains(fromJSON(inputs.feat_sets), fromJSON('["default"]')[0])
+      && contains(fromJSON(inputs.cargo_profiles), fromJSON('["release"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["msrv"]')[0])
+      && inputs.machines
+      && fromJSON(inputs.machines)[0] != null
+
+    name: Base
+    runs-on: ["${{fromJSON(inputs.machines)[0]}}", "self-hosted"]
+    outputs:
+      sys_versions: ${{steps.base.outputs.sys_versions}}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{inputs.checkout}}
+    - id: base
+      shell: bash
+      run: |
+        source docker/package.env
+        echo "sys_versions=$package_sys_versions" >> "$GITHUB_OUTPUT"
+
   docs:
     if: >
       !failure() && !cancelled()
       && fromJSON(inputs.enable_docs)
       && contains(fromJSON(inputs.cargo_profiles), fromJSON('["release"]')[0])
-      && contains(fromJSON(inputs.feat_sets), fromJSON('["all"]')[0])
+      && contains(fromJSON(inputs.feat_sets), fromJSON('["default"]')[0])
       && contains(fromJSON(inputs.rust_toolchains), fromJSON('["nightly"]')[0])
       && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v1-linux-gnu"]')[0])
 
     name: Docs
+    permissions:
+      contents: write # release asset upload in bake.yml
     uses: ./.github/workflows/bake.yml
     with:
       bake_targets: '["docs"]'
       cargo_profiles: '["release"]'
-      feat_sets: '["all"]'
+      feat_sets: '["default"]'
       rust_toolchains: '["nightly"]'
       rust_targets: '["x86_64-unknown-linux-gnu"]'
       sys_names: '["debian"]'
       sys_versions: ${{inputs.sys_versions}}
       sys_targets: '["x86_64-v1-linux-gnu"]'
       machines: '["X64"]'
-      runner: 'het'
+      runner: 'docs-builder'
       #excludes: ${{inputs.excludes}}
       includes: ${{inputs.includes}}
       release_url: ${{inputs.release_url}}
@@ -115,23 +144,25 @@ jobs:
       !failure() && !cancelled()
       && fromJSON(inputs.enable_book)
       && contains(fromJSON(inputs.cargo_profiles), fromJSON('["release"]')[0])
-      && contains(fromJSON(inputs.feat_sets), fromJSON('["all"]')[0])
-      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["stable"]')[0])
+      && contains(fromJSON(inputs.feat_sets), fromJSON('["default"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["msrv"]')[0])
       && contains(fromJSON(inputs.sys_targets), fromJSON('["x86_64-v1-linux-gnu"]')[0])
 
     name: Book
+    permissions:
+      contents: write # release asset upload in bake.yml
     uses: ./.github/workflows/bake.yml
     with:
       bake_targets: '["book"]'
       cargo_profiles: '["release"]'
-      feat_sets: '["all"]'
-      rust_toolchains: '["stable"]'
+      feat_sets: '["default"]'
+      rust_toolchains: '["msrv"]'
       rust_targets: ${{inputs.rust_targets}}
       sys_names: ${{inputs.sys_names}}
       sys_versions: ${{inputs.sys_versions}}
       sys_targets: '["x86_64-v1-linux-gnu"]'
       machines: ${{inputs.machines}}
-      runner: 'het'
+      runner: 'book-builder'
       excludes: ${{inputs.excludes}}
       includes: ${{inputs.includes}}
       release_url: ${{inputs.release_url}}
@@ -150,6 +181,8 @@ jobs:
       && fromJSON(inputs.enable_binary)
 
     name: Binaries
+    permissions:
+      contents: write # release asset upload in bake.yml
     uses: ./.github/workflows/bake.yml
     with:
       bake_targets: '["static"]'
@@ -161,6 +194,8 @@ jobs:
       rust_targets: ${{inputs.rust_targets}}
       sys_targets: ${{inputs.sys_targets}}
       machines: ${{inputs.machines}}
+      # Publish pushes these stages from the builder that made them.
+      runner: 'publisher'
       excludes: ${{inputs.excludes}}
       includes: ${{inputs.includes}}
       release_url: ${{inputs.release_url}}
@@ -182,6 +217,8 @@ jobs:
       && fromJSON(inputs.enable_container)
 
     name: Containers
+    permissions:
+      contents: write # release asset upload in bake.yml
     uses: ./.github/workflows/bake.yml
     with:
       bake_targets: ${{inputs.containers}}
@@ -193,6 +230,8 @@ jobs:
       rust_targets: ${{inputs.rust_targets}}
       sys_targets: ${{inputs.sys_targets}}
       machines: ${{inputs.machines}}
+      # Publish pushes these stages from the builder that made them.
+      runner: 'publisher'
       excludes: ${{inputs.excludes}}
       includes: ${{inputs.includes}}
       release_url: ${{inputs.release_url}}
@@ -217,19 +256,22 @@ jobs:
     if: >
       !failure() && !cancelled()
       && fromJSON(inputs.enable_distro)
-      && contains(fromJSON(inputs.feat_sets), fromJSON('["all"]')[0])
+      && contains(fromJSON(inputs.feat_sets), fromJSON('["default"]')[0])
       && contains(fromJSON(inputs.cargo_profiles), fromJSON('["release"]')[0])
-      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["stable"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["msrv"]')[0])
 
     name: Distro Packages
+    needs: [base]
+    permissions:
+      contents: write # release asset upload in bake.yml
     uses: ./.github/workflows/bake.yml
     with:
       bake_targets: ${{inputs.distros}}
       cargo_profiles: '["release"]'
-      feat_sets: '["all"]'
-      rust_toolchains: '["stable"]'
-      sys_names: ${{inputs.sys_names}}
-      sys_versions: ${{inputs.sys_versions}}
+      feat_sets: '["default"]'
+      rust_toolchains: '["msrv"]'
+      sys_names: '["debian"]'
+      sys_versions: ${{needs.base.outputs.sys_versions}}
       rust_targets: ${{inputs.rust_targets}}
       sys_targets: ${{inputs.sys_targets}}
       machines: ${{inputs.machines}}
@@ -262,20 +304,20 @@ jobs:
     if: >
       !failure() && !cancelled()
       && fromJSON(inputs.enable_checks)
-      && contains(fromJSON(inputs.feat_sets), fromJSON('["all"]')[0])
+      && contains(fromJSON(inputs.feat_sets), fromJSON('["default"]')[0])
       && contains(fromJSON(inputs.cargo_profiles), fromJSON('["release"]')[0])
-      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["stable"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["msrv"]')[0])
 
     name: Check Packages
-    needs: [distro]
+    needs: [base, distro]
     uses: ./.github/workflows/bake.yml
     with:
       bake_targets: '["deb-install", "rpm-install"]'
       cargo_profiles: '["release"]'
-      feat_sets: '["all"]'
-      rust_toolchains: '["stable"]'
-      sys_names: ${{inputs.sys_names}}
-      sys_versions: ${{inputs.sys_versions}}
+      feat_sets: '["default"]'
+      rust_toolchains: '["msrv"]'
+      sys_names: '["debian"]'
+      sys_versions: ${{needs.base.outputs.sys_versions}}
       rust_targets: ${{inputs.rust_targets}}
       sys_targets: ${{inputs.sys_targets}}
       machines: ${{inputs.machines}}
@@ -287,17 +329,17 @@ jobs:
     if: >
       !failure() && !cancelled()
       && fromJSON(inputs.enable_checks)
-      && contains(fromJSON(inputs.feat_sets), fromJSON('["all"]')[0])
+      && contains(fromJSON(inputs.feat_sets), fromJSON('["default"]')[0])
       && contains(fromJSON(inputs.cargo_profiles), fromJSON('["release"]')[0])
-      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["stable"]')[0])
+      && contains(fromJSON(inputs.rust_toolchains), fromJSON('["msrv"]')[0])
 
     name: Check Apt Repository
     uses: ./.github/workflows/bake.yml
     with:
       bake_targets: '["apt-repo-install"]'
       cargo_profiles: '["release"]'
-      feat_sets: '["all"]'
-      rust_toolchains: '["stable"]'
+      feat_sets: '["default"]'
+      rust_toolchains: '["msrv"]'
       sys_names: '["debian", "ubuntu"]'
       sys_versions: '["stable-slim", "noble"]'
       rust_targets: ${{inputs.rust_targets}}

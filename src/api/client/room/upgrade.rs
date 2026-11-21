@@ -22,13 +22,13 @@ use serde_json::{Value as JsonValue, json, value::to_raw_value};
 use tuwunel_core::{
 	Err, Result, debug_info, err, error, implement, info, is_equal_to, is_less_than,
 	itertools::Itertools,
-	matrix::{Event, StateKey, pdu::PduBuilder, room_version},
 	utils::{
 		ReadyExt,
 		future::TryExtExt,
 		stream::{IterStream, TryIgnore, WidebandExt},
 	},
 };
+use tuwunel_matrix::{Event, StateKey, pdu::PduBuilder, room_version};
 use tuwunel_service::{Services, rooms::timeline::RoomMutexGuard};
 
 use crate::Ruma;
@@ -45,6 +45,8 @@ const RECOMMENDED_TRANSFERABLE_STATE_EVENT_TYPES: &[StateEventType; 9] = &[
 	StateEventType::RoomJoinRules,
 	StateEventType::RoomPowerLevels,
 ];
+
+const RTC_SLOT_TYPES: [&str; 2] = ["m.rtc.slot", "org.matrix.msc4143.rtc.slot"];
 
 #[derive(Debug)]
 struct RoomUpgradeContext<'a> {
@@ -243,25 +245,11 @@ async fn upgrade_room_create(
 		return Err!(Request(BadJson("Error forming creation event: {e}")));
 	}
 
-	let room_id = ruma::room_id!("!thiswillbereplaced").to_owned();
-	let state_lock = services.state.mutex.lock(&room_id).await;
 	let create_event_id = services
 		.timeline
-		.build_and_append_pdu(
-			PduBuilder {
-				event_type: TimelineEventType::RoomCreate,
-				content: to_raw_value(&content)?.into(),
-				state_key: Some(StateKey::new()),
-				..Default::default()
-			},
-			sender_user,
-			&room_id,
-			&state_lock,
-		)
-		.boxed()
+		.build_and_append_create_pdu(content, sender_user, None, None)
+		.boxed() // size firewall
 		.await?;
-
-	drop(state_lock);
 
 	// The real room_id is now the event_id.
 	let room_id = OwnedRoomId::from_parts('!', create_event_id.localpart(), None)?;
@@ -337,6 +325,8 @@ async fn transfer_room(&self) -> Result {
 	self.move_state_events().await?;
 
 	self.move_space_state().await?;
+
+	self.move_rtc_slots().await?;
 
 	self.move_sender_user().await?;
 
@@ -459,9 +449,6 @@ async fn move_state_events(&self) -> Result {
 // MSC4168: copy m.space.parent for any room, plus m.space.child when the
 // old room is itself a space, into the upgraded room.
 #[implement(RoomUpgradeContext, params = "<'_>")]
-// try_for_each requires FnMut returning a nameable future; an async closure
-// capturing self does not satisfy it.
-#[expect(closure_returning_async_block)]
 #[tracing::instrument(level = "debug")]
 async fn move_space_state(&self) -> Result {
 	let old_room_is_space = self
@@ -482,6 +469,23 @@ async fn move_space_state(&self) -> Result {
 		| false => &[StateEventType::SpaceParent],
 	};
 
+	self.move_keyed_state(event_types).await
+}
+
+#[implement(RoomUpgradeContext, params = "<'_>")]
+#[tracing::instrument(level = "debug")]
+async fn move_rtc_slots(&self) -> Result {
+	// MSC4143: copy RTC slots into the upgraded room.
+	self.move_keyed_state(&RTC_SLOT_TYPES.map(StateEventType::from))
+		.await
+}
+
+#[implement(RoomUpgradeContext, params = "<'_>")]
+// try_for_each requires FnMut returning a nameable future; an async closure
+// capturing self does not satisfy it.
+#[expect(closure_returning_async_block)]
+#[tracing::instrument(level = "debug")]
+async fn move_keyed_state(&self, event_types: &[StateEventType]) -> Result {
 	event_types
 		.iter()
 		.stream()
@@ -511,7 +515,7 @@ async fn move_space_state(&self) -> Result {
 							self.new_state_lock,
 						)
 						.inspect_err(|e| {
-							error!(?event, ?self, "Failed to copy space state: {e}");
+							error!(?event, ?self, %e, "Failed to copy keyed state");
 						})
 						.await
 						.ok();

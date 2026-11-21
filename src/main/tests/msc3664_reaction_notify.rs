@@ -26,6 +26,20 @@ use self::{
 mod client;
 mod msc3664;
 
+#[expect(dead_code)] // Only the event PUT is used from the event add-on.
+#[path = "client/event.rs"]
+mod event;
+
+#[path = "client/get.rs"]
+mod get;
+
+#[expect(dead_code)] // Only the self-membership action is used from the add-on.
+#[path = "client/membership.rs"]
+mod membership;
+
+#[path = "client/put.rs"]
+mod put;
+
 const AUTHOR_TOKEN: &str = "msc3664-related-event-match-author-token";
 const READER_TOKEN: &str = "msc3664-related-event-match-reader-token";
 
@@ -46,15 +60,11 @@ fn reaction_to_my_message_notifies_me() -> Result {
 
 	let db_path = Args::test_database_path("msc3664-reaction");
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
-
-	args.option.extend([
-		format!("database_path={db_path:?}"),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
-		"listening=true".to_owned(),
-		"msc3664_related_event_match=true".to_owned(),
-	]);
+	let args = Args::default_test(&["fresh", "cleanup"])
+		.with_database_path(&db_path)
+		.with_loopback_listener(port)
+		.with_option("listening=true")
+		.with_option("push.msc3664_related_event_match=true");
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -100,7 +110,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	let room = writer.create_room(&public_room()).await?;
 
-	reader.join(&room).await?;
+	reader.act(&room, "join").await?;
 
 	if writer.condition_capability().await?.is_none() {
 		return Err!("the condition is evaluated but its capability is not advertised");

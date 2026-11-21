@@ -19,8 +19,9 @@ use super::{
 	Reset, RestartState, Substitution,
 	http::{
 		AuthenticatedPasswordChange, PasswordTokenRequest, authenticated_password_change,
-		confirm_email, jwt_password_change, password_uiaa_session, request_password_token,
-		request_token_failure, reset_password, view_confirmation, wait_until_ready,
+		confirm_email, jwt_password_change, password_login, password_uiaa_session,
+		request_password_token, request_token_failure, reset_password, view_confirmation,
+		wait_until_ready,
 	},
 };
 
@@ -33,6 +34,13 @@ const A_WRONG_SECRET_PASSWORD: &str = "email-reset-a-wrong-secret-password";
 const A_UNBOUND_PASSWORD: &str = "email-reset-a-unbound-password";
 const A_KEEP_DEVICES_PASSWORD: &str = "email-reset-a-keep-devices-password";
 const A_REPLAY_PASSWORD: &str = "email-reset-a-replay-password";
+const A_DEACTIVATED_PASSWORD: &str = "email-reset-a-deactivated-password";
+const A_DEACTIVATED_REPLAY_PASSWORD: &str = "email-reset-a-deactivated-replay-password";
+const A_DEACTIVATED_SECRET: &str = "email-reset-deactivated-secret";
+const A_NON_EMAIL_SECRET: &str = "email-reset-non-email-secret";
+const A_NON_EMAIL_PASSWORD: &str = "email-reset-non-email-password";
+const B_FINAL_PASSWORD: &str = "email-reset-b-final-password";
+const B_FINAL_SECRET: &str = "email-reset-b-final-secret";
 const A_EMAIL: &str = "strass-reset@example.org";
 const A_EMAIL_VARIANT: &str = "Straß-Reset@Example.Org";
 const A_INITIAL_TOKENS: [&str; 2] = [
@@ -240,6 +248,7 @@ pub(super) async fn first_phase(
 		a_password_hash,
 		b_password_hash,
 		masked,
+		deactivated_sid: String::new(),
 	})
 }
 
@@ -247,8 +256,8 @@ pub(super) async fn second_phase(
 	services: Arc<Services>,
 	client: Client,
 	base: String,
-	state: RestartState,
-) -> Result {
+	mut state: RestartState,
+) -> Result<RestartState> {
 	wait_until_ready(&client, &base).await?;
 
 	let user_a = UserId::parse_with_server_name("email-reset-a", services.globals.server_name())?;
@@ -280,7 +289,110 @@ pub(super) async fn second_phase(
 
 	verify_device_modes(phase).await?;
 
-	verify_authenticated_changes(phase).await
+	verify_authenticated_changes(phase).await?;
+
+	state.deactivated_sid = reject_deactivated_reset(phase).await?;
+
+	Ok(state)
+}
+
+pub(super) async fn verify_spent_after_restart(
+	services: Arc<Services>,
+	client: Client,
+	base: String,
+	state: RestartState,
+) -> Result {
+	wait_until_ready(&client, &base).await?;
+
+	let user = UserId::parse_with_server_name("email-reset-a", services.globals.server_name())?;
+
+	assert!(services.users.is_deactivated(&user).await?);
+	assert!(
+		!services
+			.threepid
+			.session_validated(&state.deactivated_sid, A_DEACTIVATED_SECRET)
+			.await,
+		"deactivated reset proof became valid after restart"
+	);
+
+	let substitution = Substitution {
+		session: &state.b_session,
+		user: user.as_str(),
+		email: A_EMAIL,
+		device: &state.b_device,
+	};
+
+	let replay = Reset {
+		sid: &state.deactivated_sid,
+		client_secret: A_DEACTIVATED_SECRET,
+		new_password: A_DEACTIVATED_REPLAY_PASSWORD,
+		logout_devices: Some(true),
+		substitution,
+	};
+
+	let response = reset_password(&client, &base, replay).await?;
+
+	assert_eq!(response, state.masked, "spent proof changed after restart");
+	assert!(services.users.is_deactivated(&user).await?);
+	assert_password(&services, &user, A_DEACTIVATED_REPLAY_PASSWORD, false).await?;
+
+	let login = password_login(&client, &base, &user, A_DEACTIVATED_PASSWORD).await?;
+
+	assert_ne!(login.0, 200, "deactivated account password login succeeded: {}", login.1);
+
+	let user_b = UserId::parse_with_server_name("email-reset-b", services.globals.server_name())?;
+	let now = MilliSecondsSinceUnixEpoch::now();
+
+	services
+		.threepid
+		.put_binding(&user_b, B_EMAIL, Medium::Email, now, now)
+		.await;
+
+	let pending = services
+		.threepid
+		.create_or_reuse_pending(
+			B_FINAL_SECRET,
+			Medium::Email,
+			B_EMAIL,
+			1,
+			Duration::from_mins(5),
+		)
+		.await?;
+
+	let token = pending
+		.freshly_minted_token
+		.as_deref()
+		.ok_or_else(|| err!("active control did not mint a token"))?;
+
+	services
+		.threepid
+		.validate_pending_token(&pending.sid, B_FINAL_SECRET, token)
+		.await?;
+
+	let substitution = Substitution {
+		session: &state.b_session,
+		user: user_b.as_str(),
+		email: B_EMAIL,
+		device: &state.b_device,
+	};
+
+	let reset = Reset {
+		sid: &pending.sid,
+		client_secret: B_FINAL_SECRET,
+		new_password: B_FINAL_PASSWORD,
+		logout_devices: Some(false),
+		substitution,
+	};
+
+	let response = reset_password(&client, &base, reset).await?;
+
+	assert_eq!(response.0, 200, "active control password reset: {}", response.1);
+
+	let login = password_login(&client, &base, &user_b, B_FINAL_PASSWORD).await?;
+
+	assert_eq!(login.0, 200, "active control password login: {}", login.1);
+
+	Ok(())
 }
 
 async fn verify_restart_state(phase: Phase<'_>) -> Result {
@@ -717,6 +829,154 @@ async fn verify_authenticated_changes(phase: Phase<'_>) -> Result {
 	assert_eq!(token_device.as_str(), phase.state.b_device);
 
 	Ok(())
+}
+
+async fn reject_deactivated_reset(phase: Phase<'_>) -> Result<String> {
+	let pending = phase
+		.services
+		.threepid
+		.create_or_reuse_pending(
+			A_DEACTIVATED_SECRET,
+			Medium::Email,
+			A_EMAIL,
+			1,
+			Duration::from_mins(5),
+		)
+		.await?;
+
+	let token = pending
+		.freshly_minted_token
+		.as_deref()
+		.ok_or_else(|| err!("deactivated password-reset proof did not mint a token"))?;
+
+	phase
+		.services
+		.threepid
+		.validate_pending_token(&pending.sid, A_DEACTIVATED_SECRET, token)
+		.await?;
+
+	phase
+		.services
+		.users
+		.deactivate_account(phase.user_a)
+		.await?;
+
+	let non_email = phase
+		.services
+		.threepid
+		.create_or_reuse_pending(
+			A_NON_EMAIL_SECRET,
+			Medium::Msisdn,
+			A_EMAIL,
+			1,
+			Duration::from_mins(5),
+		)
+		.await?;
+
+	let token = non_email
+		.freshly_minted_token
+		.as_deref()
+		.ok_or_else(|| err!("non-email proof did not mint a token"))?;
+
+	phase
+		.services
+		.threepid
+		.validate_pending_token(&non_email.sid, A_NON_EMAIL_SECRET, token)
+		.await?;
+
+	let reset = Reset {
+		sid: &non_email.sid,
+		client_secret: A_NON_EMAIL_SECRET,
+		new_password: A_NON_EMAIL_PASSWORD,
+		logout_devices: Some(true),
+		substitution: phase.substitution,
+	};
+
+	let response = reset_password(phase.client, phase.base, reset).await?;
+
+	assert_eq!(response, phase.state.masked, "non-email proof exposed its medium");
+	assert!(
+		!phase
+			.services
+			.threepid
+			.session_validated(&non_email.sid, A_NON_EMAIL_SECRET)
+			.await,
+		"non-email proof remained redeemable"
+	);
+
+	let replay = Reset {
+		sid: &non_email.sid,
+		client_secret: A_NON_EMAIL_SECRET,
+		new_password: A_NON_EMAIL_PASSWORD,
+		logout_devices: Some(true),
+		substitution: phase.substitution,
+	};
+
+	let response = reset_password(phase.client, phase.base, replay).await?;
+
+	assert_eq!(response, phase.state.masked, "non-email proof replay changed failure");
+	assert!(
+		phase
+			.services
+			.users
+			.is_deactivated(phase.user_a)
+			.await?
+	);
+
+	assert_password(phase.services, phase.user_a, A_NON_EMAIL_PASSWORD, false).await?;
+
+	let reset = Reset {
+		sid: &pending.sid,
+		client_secret: A_DEACTIVATED_SECRET,
+		new_password: A_DEACTIVATED_PASSWORD,
+		logout_devices: Some(true),
+		substitution: phase.substitution,
+	};
+
+	let response = reset_password(phase.client, phase.base, reset).await?;
+	let body = serde_json::from_str::<Value>(&response.1)?;
+
+	assert_eq!(response.0, 403, "deactivated account password reset: {}", response.1);
+	assert_eq!(body.get("errcode").and_then(Value::as_str), Some("M_USER_DEACTIVATED"));
+
+	let login =
+		password_login(phase.client, phase.base, phase.user_a, A_DEACTIVATED_PASSWORD).await?;
+
+	assert_ne!(login.0, 200, "deactivated account password login succeeded: {}", login.1);
+	assert!(
+		phase
+			.services
+			.users
+			.is_deactivated(phase.user_a)
+			.await?,
+		"password reset reactivated a deactivated account"
+	);
+	assert!(
+		!phase
+			.services
+			.threepid
+			.session_validated(&pending.sid, A_DEACTIVATED_SECRET)
+			.await,
+		"rejected deactivated reset left the proof redeemable"
+	);
+
+	let replay = Reset {
+		sid: &pending.sid,
+		client_secret: A_DEACTIVATED_SECRET,
+		new_password: A_DEACTIVATED_REPLAY_PASSWORD,
+		logout_devices: Some(true),
+		substitution: phase.substitution,
+	};
+
+	let response = reset_password(phase.client, phase.base, replay).await?;
+
+	assert_eq!(
+		response, phase.state.masked,
+		"deactivated proof replay exposed a different failure"
+	);
+	assert_password(phase.services, phase.user_a, A_DEACTIVATED_REPLAY_PASSWORD, false).await?;
+
+	Ok(pending.sid)
 }
 
 fn jwt_token(user_id: &UserId) -> Result<String> {

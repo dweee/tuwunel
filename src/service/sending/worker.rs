@@ -1,18 +1,22 @@
+#[cfg(test)]
+mod tests;
+
 use std::{
-	hash::{BuildHasher, BuildHasherDefault, DefaultHasher},
+	hash::{BuildHasher, BuildHasherDefault, DefaultHasher, Hash},
+	iter::from_fn,
 	mem::take,
 	sync::Arc,
 };
 
-use futures::FutureExt;
-use tokio::task::{JoinError, JoinSet, unconstrained};
+use ruma::ServerName;
+use tokio::task::{JoinError, JoinSet};
 use tuwunel_core::{
 	Result, debug, err, error, implement,
 	utils::{available_parallelism, math::usize_from_u64_truncated},
 };
 
-use super::{Destination, Msg, Service};
-use crate::{Args, Service as _};
+use super::{Destination, Msg, Service, dest::DestinationRef};
+use crate::Args;
 
 /// Run the sender workers to completion.
 ///
@@ -27,11 +31,6 @@ pub(super) async fn run(self: Arc<Self>) -> Result {
 			.enumerate()
 			.fold(JoinSet::new(), |mut senders, (id, _)| {
 				let worker = self.clone().sender(id);
-				let worker = if self.unconstrained() {
-					unconstrained(worker).left_future()
-				} else {
-					worker.right_future()
-				};
 
 				senders.spawn_on(worker, self.server.runtime());
 				senders
@@ -72,6 +71,11 @@ async fn join_senders(mut senders: JoinSet<Result>) -> Result {
 pub(super) fn close(&self) {
 	self.flushes.lock().expect("locked").abort_all();
 
+	for (sender, receiver) in &self.controls {
+		sender.close();
+		from_fn(|| receiver.try_recv().ok()).for_each(drop);
+	}
+
 	for (sender, _) in &self.channels {
 		sender.close();
 	}
@@ -93,14 +97,24 @@ pub(super) fn dispatch(&self, msg: Msg) -> Result {
 
 #[implement(Service)]
 pub(super) fn shard_id(&self, dest: &Destination) -> usize {
-	if self.channels.len() <= 1 {
+	shard(&dest.borrowed(), self.channels.len())
+}
+
+#[implement(Service)]
+#[inline]
+pub(super) fn federation_shard_id(&self, server: &ServerName) -> usize {
+	shard(&DestinationRef::Federation(server), self.channels.len())
+}
+
+fn shard(dest: &impl Hash, count: usize) -> usize {
+	if count <= 1 {
 		return 0;
 	}
 
 	let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(dest);
 
 	usize_from_u64_truncated(hash)
-		.overflowing_rem(self.channels.len())
+		.overflowing_rem(count)
 		.0
 }
 
@@ -115,7 +129,8 @@ pub(super) fn num_senders(args: &Args<'_>) -> usize {
 	// The config default 0 clamps to one sender; multiple senders are experimental.
 	args.server
 		.config
-		.sender_workers
+		.sending
+		.workers
 		.clamp(MIN_SENDERS, max_senders)
 }
 

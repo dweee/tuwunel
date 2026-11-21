@@ -11,17 +11,15 @@ use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{EventId, OwnedEventId, RoomId, RoomVersionId};
 use serde::Deserialize;
 use tuwunel_core::{
-	Err, Result, err, error, implement,
-	matrix::room_version,
-	trace,
+	Err, Result, err, error, implement, trace,
 	utils::stream::{IterStream, ReadyExt, TryWidebandExt, WidebandExt},
 };
-
-use crate::rooms::{
-	state_compressor::CompressedState,
-	state_res::{self, AuthSet, FetchEvent, StateMap},
-	timeline,
+use tuwunel_matrix::{
+	room::state::resolution::{AuthSet, FetchEvent, StateMap, resolve},
+	room_version::rules,
 };
+
+use crate::rooms::{state_compressor::CompressedState, timeline};
 
 #[derive(Clone, Copy)]
 struct Strict<'a> {
@@ -65,8 +63,8 @@ pub async fn resolve_state(
 		.iter()
 		.try_stream()
 		.wide_and_then(|state| {
-			// The chain walk dedups short ids and maps them injectively, so
-			// the collected ids are distinct as `from_distinct` requires.
+			// The chain walk dedups short ids, so these are distinct unless a damaged
+			// short-id mapping repeats one, which the auth difference counts once.
 			self.services
 				.auth_chain
 				.event_ids_iter(room_id, room_version, state.values().map(Borrow::borrow))
@@ -141,21 +139,23 @@ where
 		complete,
 	};
 
-	state_res::resolve(
-		&room_version::rules(room_version)?,
-		state_sets,
-		auth_chains,
-		fetch,
-		self.services.server.config.hydra_backports,
-	)
-	.inspect_err(|error| {
-		if let Some(complete) = complete {
-			complete.store(false, Ordering::Relaxed);
-		}
+	let rules = rules(room_version)?;
+	let hydra_backports = self
+		.services
+		.server
+		.config
+		.compatibility
+		.hydra_backports;
 
-		error!(?error, "State resolution failed.");
-	})
-	.await
+	resolve(&rules, state_sets, auth_chains, fetch, hydra_backports)
+		.inspect_err(|error| {
+			if let Some(complete) = complete {
+				complete.store(false, Ordering::Relaxed);
+			}
+
+			error!(?error, "State resolution failed.");
+		})
+		.await
 }
 
 impl FetchEvent for Strict<'_> {

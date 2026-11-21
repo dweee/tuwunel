@@ -30,7 +30,7 @@ pub(super) async fn handle_command(
 	services: Arc<Services>,
 	input: &CommandInput,
 ) -> ProcessorResult {
-	AssertUnwindSafe(Box::pin(process_command(&*command, services, input)))
+	AssertUnwindSafe(Box::pin(process_command(&*command, services, input))) // size firewall
 		.catch_unwind()
 		.await
 		.map_err(Error::from_panic)
@@ -91,6 +91,7 @@ async fn process_command(
 	let context = Context {
 		services: &services,
 		body: &body,
+		sender: input.sender.as_deref(),
 		timer: SystemTime::now(),
 		output: String::new().into(),
 	};
@@ -137,7 +138,7 @@ async fn process(
 	let (capture, logs) = capture_create(context);
 
 	let capture_scope = capture.start();
-	let result = Box::pin(command.dispatch(matches, context)).await;
+	let result = command.dispatch(matches, context).await;
 	drop(capture_scope);
 
 	debug!(
@@ -159,9 +160,9 @@ async fn process(
 }
 
 fn capture_create(context: &Context<'_>) -> (Arc<Capture>, Arc<Mutex<String>>) {
-	let env_config = &context.services.server.config.admin_log_capture;
+	let env_config = &context.services.server.config.admin.log_capture;
 	let env_filter = EnvFilter::try_new(env_config).unwrap_or_else(|e| {
-		warn!("admin_log_capture filter invalid: {e:?}");
+		warn!(?e, "admin.log_capture filter invalid");
 		cfg!(debug_assertions)
 			.then_some("debug")
 			.or(Some("info"))

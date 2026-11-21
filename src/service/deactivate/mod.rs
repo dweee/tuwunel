@@ -9,11 +9,11 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Event, Result, async_noinline, implement, info,
-	pdu::PduBuilder,
+	Result, async_noinline, implement, info,
 	utils::{IterStream, future::TryExtExt, stream::BroadbandExt},
 	warn,
 };
+use tuwunel_matrix::{Event, pdu::PduBuilder};
 
 const CURRENT_MEMBERSHIPS: &[MembershipState] =
 	&[MembershipState::Join, MembershipState::Invite, MembershipState::Knock];
@@ -252,6 +252,10 @@ async fn leave_room(&self, user_id: &UserId, room_id: &RoomId) {
 		.ok()
 		.await;
 
-	drop(state_lock);
-	self.services.state_cache.forget(room_id, user_id);
+	self.services
+		.state_cache
+		.forget(room_id, user_id)
+		.await
+		.inspect_err(|error| warn!(%user_id, %room_id, %error, "Failed to forget room"))
+		.ok();
 }

@@ -3,9 +3,46 @@
 //! These helpers provide reusable matching rules that the URL parser does not
 //! expose directly.
 
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Write};
 
 use http::Uri;
+use url::{Host, Url};
+
+use super::string::is_unreserved_byte;
+
+/// Percent-encodes a string for use in a URL component.
+///
+/// ASCII letters, digits and unreserved punctuation remain unchanged.
+/// Other UTF-8 bytes are encoded with uppercase hexadecimal digits.
+#[must_use]
+pub fn url_encode(s: &str) -> String {
+	s.bytes()
+		.fold(String::with_capacity(s.len()), |mut out, b| {
+			if is_unreserved_byte(b) {
+				out.push(b.into());
+			} else {
+				write!(&mut out, "%{b:02X}").ok();
+			}
+
+			out
+		})
+}
+
+/// Whether a URI's host, or its scheme when it has no host, appears in `allowed`.
+///
+/// A URI with no host is the RFC 8252 §7.1 private-use form, as in
+/// `io.element.android:/callback`. The comparison ignores case, and an
+/// unparsable URI never matches.
+#[must_use]
+pub fn redirect_allowlisted(allowed: &[String], uri: &str) -> bool {
+	Url::parse(uri).is_ok_and(|url| {
+		let name = url.host_str().unwrap_or_else(|| url.scheme());
+
+		allowed
+			.iter()
+			.any(|entry| entry.eq_ignore_ascii_case(name))
+	})
+}
 
 /// Reports whether a hostname is equal to or beneath a domain name.
 ///
@@ -44,6 +81,20 @@ pub fn hostname_matches_domain(hostname: &str, domain: &str) -> bool {
 		&& hostname
 			.get(suffix_start..)
 			.is_some_and(|suffix| suffix.eq_ignore_ascii_case(domain))
+}
+
+/// Whether a URL's host names the loopback interface.
+///
+/// That is any IPv4 or IPv6 loopback address (RFC 8252 §7.3) or the domain
+/// `localhost` (§8.3), compared without regard to case.
+#[must_use]
+pub fn is_loopback(url: &Url) -> bool {
+	match url.host() {
+		| Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+		| Some(Host::Ipv4(ip)) => ip.is_loopback(),
+		| Some(Host::Ipv6(ip)) => ip.is_loopback(),
+		| None => false,
+	}
 }
 
 /// Formats a request URI without exposing sensitive components.

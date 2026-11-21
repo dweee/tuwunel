@@ -18,10 +18,23 @@ crate-type = [
 ]
 
 [features]
+default = [
+	"brotli_compression",
+	"cpu_affinity",
+	"gzip_compression",
+	"jemalloc",
+	"jemalloc_conf",
+	"jwt_login",
+	"release_max_log_level",
+	"zstd_compression",
+]
+
 brotli_compression = [
 	"reqwest/brotli",
 ]
-console = []
+cpu_affinity = [
+	"dep:core_affinity",
+]
 gzip_compression = [
 	"reqwest/gzip",
 ]
@@ -30,19 +43,20 @@ jemalloc = [
 ]
 jemalloc_conf = []
 jemalloc_prof = [
-	#"jevmalloc/profiling",
+	"jevmalloc?/profiling",
 ]
 jemalloc_stats = [
-	#"jevmalloc/stats",
+	"jevmalloc?/stats",
 ]
-perf_measurements = []
+jwt_login = [
+	"jsonwebtoken/use_pem",
+]
 release_max_log_level = [
 	"log/max_level_trace",
 	"log/release_max_level_info",
 	"tracing/max_level_trace",
 	"tracing/release_max_level_info",
 ]
-sentry_telemetry = []
 tuwunel_mods = [
     "dep:libloading"
 ]
@@ -59,13 +73,13 @@ axum-extra.workspace = true
 base64.workspace = true
 bytes.workspace = true
 bytesize.workspace = true
-cargo_toml.workspace = true
 checked_ops.workspace = true
 chrono.workspace = true
 clap.workspace = true
 tuwunel-macros.workspace = true
 const-str.workspace = true
 core_affinity.workspace = true
+core_affinity.optional = true
 ctor.workspace = true
 dtor.workspace = true
 cyborgtime.workspace = true
@@ -92,6 +106,7 @@ regex.workspace = true
 reqwest.workspace = true
 ruma.workspace = true
 sanitize-filename.workspace = true
+semver.workspace = true
 serde_core.workspace = true
 serde_html_form.workspace = true
 serde_json.workspace = true
@@ -120,6 +135,9 @@ workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [target.'cfg(target_os = "openbsd")'.dependencies]
 num_cpus.workspace = true

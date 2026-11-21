@@ -5,10 +5,11 @@ mod tests;
 
 use std::{
 	collections::{BTreeMap, btree_map::Entry},
+	mem::replace,
 	sync::Arc,
 };
 
-use futures::{FutureExt, Stream};
+use futures::Stream;
 use ruma::{
 	DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 	api::client::sync::sync_events::v5::{
@@ -20,9 +21,13 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 use tuwunel_core::{
-	Result, at, debug, err, implement, is_equal_to, smallvec::SmallVec, utils::stream::TryIgnore,
+	Result, at, debug, err, implement, is_equal_to,
+	smallvec::SmallVec,
+	utils::{OptionExt, stream::TryIgnore},
 };
-use tuwunel_database::{Cbor, Deserialized, Map};
+use tuwunel_database::{Cbor, Deserialized, Map, serialize_val};
+
+use crate::rooms::short::ShortStateHash;
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -85,12 +90,55 @@ pub struct Connection {
 /// The cursor advances with complete ranges; configuration tracks room payloads.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Room {
+	/// Position the room's content was last delivered up to.
 	pub roomsince: u64,
+
+	/// Hash of the room configuration last delivered.
 	#[serde(default)]
 	pub config_hash: u64,
+
 	/// Fingerprints of the required-state selectors last delivered for this room.
 	#[serde(default)]
 	pub required_state: RequiredState,
+
+	/// Snapshot the delivered required state was read against.
+	///
+	/// Zero when unknown, as for a room recorded by an older build or delivered
+	/// without resolving every key its required state named: its deltas compare
+	/// against the cursor and resend outliers until a delivery records one.
+	#[serde(default)]
+	pub shortstatehash: ShortStateHash,
+
+	/// Fingerprints of the requested state keys whose events the last delivery
+	/// found due but could not read.
+	///
+	/// The snapshot does not vouch for these keys, so the next delivery that
+	/// compares state sends their events whatever the snapshot holds.
+	#[serde(default, skip_serializing_if = "UnreadState::is_empty")]
+	pub unread_state: UnreadState,
+
+	/// The room's delivery progress before the last request advanced it, kept in
+	/// memory for a retry of that request's position.
+	#[serde(skip)]
+	pub checkpoint: Option<Checkpoint>,
+}
+
+/// A room's delivery progress as a request resuming from `pos` found it.
+///
+/// A retry of that position restores it, so the retry repeats the delta a lost
+/// response carried instead of resending the room's whole state. A restart
+/// forgets it, and a retry then rewinds the room to that position and forgets
+/// its delivered configuration.
+#[derive(Clone, Debug)]
+pub struct Checkpoint {
+	/// The position the request resumed from.
+	pos: u64,
+
+	/// The room's cursor before the request advanced it.
+	roomsince: u64,
+
+	/// The delivered configuration the request replaced, boxed since most hold none.
+	config: Option<Box<DeliveredConfig>>,
 }
 
 /// Fingerprints of delivered required-state selectors.
@@ -98,10 +146,23 @@ pub struct Room {
 /// The inline capacity covers common room-list and open-room selections.
 pub type RequiredState = SmallVec<[u64; 18]>;
 
-/// A delivered room configuration and its required-state coverage.
+/// A room configuration's hash and its required-state coverage.
 ///
-/// Both values advance together only after a room payload is assembled.
+/// The merged request configuration yields one per room. A delivered payload
+/// records it with the snapshot its coverage was read against.
 pub type RoomConfig = (u64, RequiredState);
+
+/// Fingerprints of requested state keys whose due events a delivery could not read.
+///
+/// Only a read fault leaves any; two fit inline at the size of an empty `Vec`.
+pub type UnreadState = SmallVec<[u64; 2]>;
+
+/// A delivered room configuration's hash, its required-state coverage, the
+/// snapshot that coverage was read against, and the keys whose events the
+/// delivery could not read.
+///
+/// All four advance together only after a room payload is assembled.
+pub type DeliveredConfig = (u64, RequiredState, ShortStateHash, UnreadState);
 
 type Connections = TokioMutex<BTreeMap<ConnectionKey, ConnectionVal>>;
 pub type ConnectionVal = Arc<TokioMutex<Connection>>;
@@ -110,7 +171,11 @@ pub type ConnectionKey = (OwnedUserId, Option<OwnedDeviceId>, Option<ConnectionI
 pub type Subscriptions = BTreeMap<OwnedRoomId, request::ListConfig>;
 pub type Lists = BTreeMap<ListId, request::List>;
 pub type Rooms = BTreeMap<OwnedRoomId, Room>;
-type RoomUpdate<'a> = (&'a RoomId, Option<RoomConfig>);
+
+/// A completed room range, with the configuration its payload delivered, if any.
+///
+/// Without a configuration, completing the range advances only the room's cursor.
+pub type RoomUpdate<'a> = (&'a RoomId, Option<DeliveredConfig>);
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
@@ -142,6 +207,12 @@ impl crate::Service for Service {
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
+/// Drops the loaded connections that match every filter given, returning how
+/// many were dropped.
+///
+/// A filter left out matches any value, so giving none drops every loaded
+/// connection. A dropped connection is deleted from the cache and from
+/// storage; one only in storage is kept.
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
 pub async fn clear_connections(
@@ -149,23 +220,24 @@ pub async fn clear_connections(
 	user_id: Option<&UserId>,
 	device_id: Option<&DeviceId>,
 	conn_id: Option<&ConnectionId>,
-) {
+) -> usize {
 	self.connections
 		.lock()
 		.await
-		.retain(|(conn_user_id, conn_device_id, conn_conn_id), _| {
-			let retain = user_id.is_none_or(is_equal_to!(conn_user_id))
-				&& (device_id.is_none() || device_id == conn_device_id.as_deref())
-				&& (conn_id.is_none() || conn_id == conn_conn_id.as_ref());
+		.extract_if(.., |key, _| connection_matches(key, user_id, device_id, conn_id))
+		.inspect(|(key, _)| self.db.userdeviceconnid_conn.del(key))
+		.count()
+}
 
-			if !retain {
-				self.db
-					.userdeviceconnid_conn
-					.del((conn_user_id, conn_device_id, conn_conn_id));
-			}
-
-			retain
-		});
+fn connection_matches(
+	(conn_user_id, conn_device_id, conn_conn_id): &ConnectionKey,
+	user_id: Option<&UserId>,
+	device_id: Option<&DeviceId>,
+	conn_id: Option<&ConnectionId>,
+) -> bool {
+	user_id.is_none_or(is_equal_to!(conn_user_id))
+		&& device_id.is_none_or(|device_id| conn_device_id.as_deref() == Some(device_id))
+		&& conn_id.is_none_or(|conn_id| conn_conn_id.as_ref() == Some(conn_id))
 }
 
 #[implement(Service)]
@@ -177,29 +249,60 @@ pub async fn drop_connection(&self, key: &ConnectionKey) {
 	cache.remove(key);
 }
 
+/// Returns the connection for a key, from the cache or else from storage.
+///
+/// An uncached connection for a removed device is returned fresh and left
+/// uncached, and a device that cannot be read fails the load. Otherwise the
+/// stored state, or a default when none is stored, is cached.
 #[implement(Service)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub async fn load_or_init_connection(&self, key: &ConnectionKey) -> ConnectionVal {
+pub async fn load_or_init_connection(&self, key: &ConnectionKey) -> Result<ConnectionVal> {
 	let mut cache = self.connections.lock().await;
 
-	match cache.entry(key.clone()) {
-		| Entry::Occupied(val) => val.get().clone(),
-		| Entry::Vacant(val) => {
-			let conn = self
-				.db
-				.userdeviceconnid_conn
-				.qry(key)
-				.boxed()
-				.await
-				.deserialized::<Cbor<_>>()
-				.map(at!(0))
-				.map(TokioMutex::new)
-				.map(Arc::new)
-				.unwrap_or_default();
-
-			val.insert(conn).clone()
-		},
+	if let Some(conn) = cache.get(key) {
+		return Ok(conn.clone());
 	}
+
+	// Left uncached, a removed device's connection can never be stored.
+	if self.device_removed(key).await? {
+		return Ok(ConnectionVal::default());
+	}
+
+	let conn: ConnectionVal = self
+		.db
+		.userdeviceconnid_conn
+		.qry(key)
+		.await
+		.deserialized()
+		.map(|Cbor(conn)| conn)
+		.map(TokioMutex::new)
+		.map(Arc::new)
+		.unwrap_or_default();
+
+	cache.insert(key.clone(), conn.clone());
+
+	Ok(conn)
+}
+
+#[implement(Service)]
+async fn device_removed(&self, (user_id, device_id, _): &ConnectionKey) -> Result<bool> {
+	let exists = device_id
+		.as_deref()
+		.map_async(|device_id| {
+			self.services
+				.users
+				.try_device_exists(user_id, device_id)
+		})
+		.await;
+
+	confirmed_removed(exists)
+}
+
+/// Reads a device lookup as a removal only when it found no device.
+///
+/// No device to look up removes nothing, and a failed lookup stays an error.
+fn confirmed_removed(exists: Option<Result<bool>>) -> Result<bool> {
+	exists.transpose().map(is_equal_to!(Some(false)))
 }
 
 #[implement(Service)]
@@ -220,6 +323,42 @@ pub async fn load_connection(&self, key: &ConnectionKey) -> Result<ConnectionVal
 			.map(Arc::new)
 			.map(|conn| val.insert(conn).clone()),
 	}
+}
+
+/// Stores a connection's state while the cache still holds that connection.
+///
+/// A connection dropped, or replaced by a newer load, while a request held it
+/// is not stored again. The check and the write hold the one server-wide cache
+/// lock, so no drop falls between them and every store briefly waits on it.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip(self, loaded, conn))]
+pub async fn store_connection(
+	&self,
+	key: &ConnectionKey,
+	loaded: &ConnectionVal,
+	conn: &Connection,
+) -> Result {
+	// Encoded before the lock, so the wait on it stays short.
+	let state = serialize_val(Cbor(conn))?;
+	let cache = self.connections.lock().await;
+	let cached = cache
+		.get(key)
+		.is_some_and(|current| Arc::ptr_eq(current, loaded));
+
+	if !cached {
+		debug!(?key, "Not persisting a dropped connection");
+		return Ok(());
+	}
+
+	self.db.userdeviceconnid_conn.put_raw(key, state);
+
+	debug!(
+		since = %conn.globalsince,
+		next_batch = %conn.next_batch,
+		"Persisted connection state"
+	);
+
+	Ok(())
 }
 
 #[implement(Service)]
@@ -276,56 +415,112 @@ where
 	(user_id.into(), device_id.map(Into::into), conn_id.map(Into::into))
 }
 
-#[implement(Connection)]
-#[tracing::instrument(level = "debug", skip(self, service))]
-pub fn store(&self, service: &Service, key: &ConnectionKey) {
-	service
-		.db
-		.userdeviceconnid_conn
-		.put(key, Cbor(self));
-
-	debug!(
-		since = %self.globalsince,
-		next_batch = %self.next_batch,
-		"Persisted connection state"
-	);
-}
-
+/// Rewind each room past a retried position to where that position left it.
+///
+/// A room checkpointed at the retried position is restored as the client last
+/// saw it. Any other room past the position rewinds to it and forgets its
+/// delivered configuration.
 #[implement(Connection)]
 #[tracing::instrument(level = "debug", skip(self))]
-pub fn update_rooms_prologue(&mut self, retard_since: Option<u64>) {
-	self.rooms.values_mut().for_each(|room| {
-		if let Some(retard_since) = retard_since
-			&& room.roomsince > retard_since
-		{
-			room.roomsince = retard_since;
-			room.config_hash = 0;
-			room.required_state.clear();
-		}
-	});
+pub fn update_rooms_prologue(&mut self, retry_since: Option<u64>) {
+	let Some(retry_since) = retry_since else {
+		return;
+	};
+
+	self.rooms
+		.values_mut()
+		.filter(|room| room.roomsince > retry_since)
+		.for_each(|room| room.rewind(retry_since));
+}
+
+#[implement(Room)]
+fn rewind(&mut self, since: u64) {
+	let (roomsince, config) = self.take_checkpoint(since).map_or_else(
+		|| (since, Some(DeliveredConfig::default())),
+		|Checkpoint { roomsince, config, .. }| (roomsince, config.map(|config| *config)),
+	);
+
+	self.roomsince = roomsince;
+	if let Some(config) = config {
+		self.replace_config(config);
+	}
+}
+
+#[implement(Room)]
+fn take_checkpoint(&mut self, pos: u64) -> Option<Checkpoint> {
+	self.checkpoint
+		.take()
+		.filter(|checkpoint| checkpoint.pos == pos)
+}
+
+#[implement(Room)]
+fn replace_config(
+	&mut self,
+	(config_hash, required_state, shortstatehash, unread_state): DeliveredConfig,
+) -> DeliveredConfig {
+	(
+		replace(&mut self.config_hash, config_hash),
+		replace(&mut self.required_state, required_state),
+		replace(&mut self.shortstatehash, shortstatehash),
+		replace(&mut self.unread_state, unread_state),
+	)
 }
 
 /// Advance the per-room cursor for each complete bounded room range.
 ///
-/// `roomsince` is the lower bound of every content query for its room. Only
-/// rooms whose complete range was safely assembled may advance. A failed room
-/// keeps its cursor and retries the same range after a later wake.
+/// `roomsince` is the lower bound of every content query for its room. A failed
+/// room keeps its cursor and retries the same range after a later wake. An
+/// advanced room is checkpointed at `since`, the position the request resumed from.
 #[implement(Connection)]
 #[tracing::instrument(level = "debug", skip_all)]
-pub fn update_rooms_epilogue<'a, Complete>(&mut self, complete: Complete)
+pub fn update_rooms_epilogue<'a, Complete>(&mut self, since: u64, complete: Complete)
 where
 	Complete: Iterator<Item = RoomUpdate<'a>> + Send + 'a,
 {
 	let next_batch = self.next_batch;
-	complete.for_each(|(room_id, config)| {
-		let room = self.rooms.entry(room_id.into()).or_default();
 
-		room.roomsince = next_batch;
-		if let Some((config_hash, required_state)) = config {
-			room.config_hash = config_hash;
-			room.required_state = required_state;
-		}
+	complete.for_each(|(room_id, config)| {
+		self.rooms
+			.entry(room_id.into())
+			.or_default()
+			.advance(since, next_batch, config);
 	});
+}
+
+/// Advance the room for a request that resumed from `since`.
+///
+/// A checkpoint taken at `since` is kept; one from another position gives way to
+/// the room as this request found it. The checkpoint keeps the first configuration
+/// replaced at `since` that the delivery changed, so a retry restores what the
+/// client last saw.
+#[implement(Room)]
+fn advance(&mut self, since: u64, next_batch: u64, config: Option<DeliveredConfig>) {
+	let found = self.take_checkpoint(since).unwrap_or(Checkpoint {
+		pos: since,
+		roomsince: self.roomsince,
+		config: None,
+	});
+
+	// An unchanged configuration needs no copy; the room still holds it.
+	let replaced = config
+		.map(|config| self.replace_config(config))
+		.filter(|(config_hash, required_state, shortstatehash, unread_state)| {
+			(*config_hash, required_state, *shortstatehash, unread_state) != self.delivered()
+		});
+
+	let checkpoint = Checkpoint {
+		config: found.config.or_else(|| replaced.map(Box::new)),
+		..found
+	};
+
+	self.roomsince = next_batch;
+	self.checkpoint = Some(checkpoint);
+}
+
+#[implement(Room)]
+#[inline]
+fn delivered(&self) -> (u64, &RequiredState, ShortStateHash, &UnreadState) {
+	(self.config_hash, &self.required_state, self.shortstatehash, &self.unread_state)
 }
 
 /// Records that this pass carried the syncing user's whole profile.
@@ -366,9 +561,16 @@ pub fn own_profile_owed(&self) -> bool {
 		&& (self.own_profile_since == 0 || self.own_profile_since > self.globalsince)
 }
 
+/// Merges the request's lists, subscriptions and extension settings into the
+/// connection.
+///
+/// Returns whether a caught-up connection needs a pass because a list or
+/// subscription changed or the request enabled the e2ee extension.
+/// MSC4543 requires the e2ee section in the response to the enabling request.
 #[implement(Connection)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn update_cache(&mut self, request: &Request) -> bool {
+	let e2ee_enabled = self.extensions.e2ee.enabled == Some(true);
 	let lists_changed = Self::update_cache_lists(request, self);
 	let subscriptions_changed = Self::update_cache_subscriptions(request, self);
 
@@ -376,7 +578,9 @@ pub fn update_cache(&mut self, request: &Request) -> bool {
 
 	self.update_cache_profiles_owed(fields_widened);
 
-	lists_changed || subscriptions_changed
+	lists_changed
+		|| subscriptions_changed
+		|| (!e2ee_enabled && self.extensions.e2ee.enabled == Some(true))
 }
 
 #[implement(Connection)]
@@ -521,6 +725,7 @@ fn update_cache_typing(request: &Typing, cached: &mut Typing) {
 fn update_cache_to_device(request: &ToDevice, cached: &mut ToDevice) {
 	some_or_sticky(request.enabled.as_ref(), &mut cached.enabled);
 	cached.since.clone_from(&request.since);
+	cached.limit = request.limit;
 }
 
 /// Merges the profiles extension settings into the connection.
@@ -533,12 +738,34 @@ fn update_cache_profiles(request: &Profiles, cached: &mut Profiles) -> bool {
 	some_or_sticky(request.rooms.as_ref(), &mut cached.rooms);
 	some_or_sticky(request.lists.as_ref(), &mut cached.lists);
 
-	// Compare against the cached filter before the merge below overwrites it.
-	let widened = fields_widened(request.fields.as_deref(), cached.fields.as_deref());
+	let Some(fields) = request.fields.as_ref() else {
+		return false;
+	};
 
-	some_or_sticky(request.fields.as_ref(), &mut cached.fields);
+	if let Some(cached) = cached.fields.as_mut() {
+		normalize_profile_fields(cached);
+	}
+
+	let widened = fields_widened(Some(fields), cached.fields.as_deref());
+
+	retain_profile_fields(&mut cached.fields, fields);
 
 	widened
+}
+
+fn retain_profile_fields(
+	cached: &mut Option<Vec<ProfileFieldName>>,
+	fields: &[ProfileFieldName],
+) {
+	let retained = cached.get_or_insert_default();
+
+	fields.clone_into(retained);
+	normalize_profile_fields(retained);
+}
+
+fn normalize_profile_fields(fields: &mut Vec<ProfileFieldName>) {
+	fields.sort_unstable();
+	fields.dedup();
 }
 
 /// Whether the request names a profile field the connection did not ask for.
@@ -551,7 +778,11 @@ fn fields_widened(
 ) -> bool {
 	request
 		.zip(cached)
-		.is_some_and(|(request, cached)| request.iter().any(|name| !cached.contains(name)))
+		.is_some_and(|(request, cached)| {
+			request
+				.iter()
+				.any(|name| cached.binary_search(name).is_err())
+		})
 }
 
 #[implement(Connection)]

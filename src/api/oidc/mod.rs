@@ -1,45 +1,54 @@
-pub(super) mod account;
-pub(super) mod auth_issuer;
-pub(super) mod auth_metadata;
-pub(super) mod authorize;
-pub(super) mod complete;
-pub(super) mod device;
-pub(super) mod jwks;
-pub(super) mod native;
-pub(super) mod registration;
-pub(super) mod revoke;
-pub(super) mod token;
-pub(super) mod userinfo;
+pub(crate) mod account;
+pub(crate) mod auth_issuer;
+pub(crate) mod auth_metadata;
+pub(crate) mod authorize;
+pub(crate) mod complete;
+pub(crate) mod device;
+pub(crate) mod jwks;
+pub(crate) mod native;
+pub(crate) mod registration;
+pub(crate) mod revoke;
+pub(crate) mod token;
+pub(crate) mod userinfo;
 
-use std::fmt::Write;
+/// Provides the OpenID Connect route builder.
+///
+/// It groups discovery, authorization and callback endpoints.
+pub mod routes;
 
 use axum::{Json, body::Body, response::IntoResponse};
 use http::{Response, StatusCode};
-use ruma::OwnedUserId;
+use log as _;
+use ruma::{OwnedUserId, UserId};
 use serde_json::json;
-use tuwunel_core::{Result, err};
-use tuwunel_service::Services;
+use tuwunel_api::router::{ClientIp, RateLimitIp, State};
+pub(crate) use tuwunel_core::utils::url::{redirect_allowlisted, url_encode};
+use tuwunel_core::{Result, err, mod_ctor, mod_dtor};
+use tuwunel_service::{Services, users::LoginToken};
 use url::Url;
 
-pub(super) use self::{
-	account::*, auth_issuer::*, auth_metadata::*, authorize::*, complete::*, device::*, jwks::*,
-	native::*, registration::*, revoke::*, token::*, userinfo::*,
+pub(crate) use self::{
+	account::{
+		ACCOUNT_MANAGEMENT_ACTIONS_SUPPORTED, account_css_route, account_js_route,
+		get_account_callback_route, get_account_route, post_account_callback_route,
+	},
+	auth_issuer::auth_issuer_route,
+	auth_metadata::openid_configuration_route,
+	authorize::authorize_route,
+	complete::{complete_route, post_complete_route},
+	device::{
+		device_authorization_route, get_device_callback_route, get_device_route,
+		post_device_callback_route,
+	},
+	jwks::jwks_route,
+	native::{native_get_route, native_submit_route},
+	registration::registration_route,
+	revoke::revoke_route,
+	token::token_route,
+	userinfo::userinfo_route,
 };
 
 const OIDC_REQ_ID_LENGTH: usize = 32;
-
-pub(crate) fn url_encode(s: &str) -> String {
-	s.bytes()
-		.fold(String::with_capacity(s.len()), |mut out, b| {
-			if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-				out.push(b.into());
-			} else {
-				write!(&mut out, "%{b:02X}").ok();
-			}
-
-			out
-		})
-}
 
 fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response<Body> {
 	let body = json!({
@@ -50,12 +59,31 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response<B
 	(status, Json(body)).into_response()
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
+async fn require_account_usable(services: &Services, user_id: &UserId) -> Result {
+	services.users.deactivated_check(user_id).await?;
+	services.users.locked_check(user_id).await
+}
+
 async fn consume_login_token(services: &Services, token: Option<&str>) -> Result<OwnedUserId> {
 	let token = token.ok_or_else(|| err!(Request(Forbidden("Missing login token"))))?;
 
 	services
 		.users
 		.find_from_login_token(token)
+		.await
+		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
+}
+
+async fn consume_login_token_with_provider(
+	services: &Services,
+	token: Option<&str>,
+) -> Result<LoginToken> {
+	let token = token.ok_or_else(|| err!(Request(Forbidden("Missing login token"))))?;
+
+	services
+		.users
+		.find_login_token_with_provider(token)
 		.await
 		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
 }
@@ -72,21 +100,31 @@ async fn peek_login_token(services: &Services, token: Option<&str>) -> Result<Ow
 		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
 }
 
-/// Whether a redirect URI is covered by the operator's redirect allowlist.
-///
-/// A URI carrying a host matches an allowlist entry naming that host. A
-/// private-use scheme carries no host at all (RFC 8252 §7.1, as in
-/// `io.element.android:/callback`), so it matches an entry naming the scheme
-/// instead, which is what lets one list cover both a web and a mobile client.
-/// Either way the comparison ignores case.
-fn redirect_allowlisted(allowed: &[String], uri: &str) -> bool {
-	Url::parse(uri).is_ok_and(|url| {
-		let name = url.host_str().unwrap_or_else(|| url.scheme());
+async fn peek_login_token_with_provider(
+	services: &Services,
+	token: Option<&str>,
+) -> Result<LoginToken> {
+	let token = token.ok_or_else(|| err!(Request(Forbidden("Missing login token"))))?;
 
-		allowed
-			.iter()
-			.any(|entry| entry.eq_ignore_ascii_case(name))
-	})
+	services
+		.users
+		.peek_login_token_with_provider(token)
+		.await
+		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
+}
+
+/// Build the upstream SSO redirect URL for a pending authorization request.
+///
+/// The provider hands the browser back to the completion route carrying the
+/// request id, where the authorization code is minted. A trailing slash on the
+/// issuer is ignored.
+fn authorization_sso_url(issuer: &str, idp_id: &str, req_id: &str) -> Result<Url> {
+	let base = issuer.trim_end_matches('/');
+	let complete = format!("{base}/_tuwunel/oidc/_complete");
+	let callback = Url::parse_with_params(&complete, [("oidc_req_id", req_id)])
+		.map_err(|_| err!(error!("Failed to build complete URL")))?;
+
+	sso_redirect_url(base, idp_id, &callback)
 }
 
 fn sso_redirect_url(base: &str, idp_id: &str, callback: &Url) -> Result<Url> {
@@ -101,3 +139,6 @@ fn sso_redirect_url(base: &str, idp_id: &str, callback: &Url) -> Result<Url> {
 
 	Ok(sso_url)
 }
+
+mod_ctor! {}
+mod_dtor! {}

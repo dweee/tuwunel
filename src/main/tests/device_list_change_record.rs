@@ -28,12 +28,12 @@ fn records_follow_the_device_lifecycle() -> Result {
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
 	let port = listener.local_addr()?.port();
 	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_loopback_listener(port)
 		.with_option("listening=true")
-		.with_option("allow_registration=true")
+		.with_option("registration.enable=true")
 		.with_option(
-			"yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse=true",
+			"registration.\
+			 yes_i_am_very_very_sure_i_want_an_open_registration_server_prone_to_abuse=true",
 		);
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -82,6 +82,14 @@ async fn exercise(services: &Services, base: &str) -> Result {
 
 	client.post("keys/upload", &upload).await?;
 	request(&client, Method::PUT, &json!({"display_name": "renamed"})).await?;
+	request(&client, Method::PUT, &json!({})).await?;
+
+	let renamed = services
+		.users
+		.get_device_metadata(&user, device_id!("RECORD"))
+		.await?;
+
+	assert_eq!(renamed.display_name.as_deref(), Some("renamed"), "an omitted name is kept");
 
 	let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 	let signing = json!({"master_key": {"user_id": user, "usage": ["master"],
@@ -147,14 +155,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 #[tracing::instrument(level = "debug", skip_all)]
 async fn request(client: &Client<'_>, method: Method, body: &Value) -> Result {
 	client
-		.services
-		.client
-		.clients
-		.default
-		.request(method, client.url("devices/RECORD"))
-		.bearer_auth(client.token)
-		.json(body)
-		.send()
+		.request(method, &client.url("devices/RECORD"), body)
 		.await?
 		.error_for_status()?;
 

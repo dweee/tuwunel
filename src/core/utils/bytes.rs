@@ -3,10 +3,17 @@
 //! The module handles human-readable sizes alongside fixed-width big-endian
 //! counters. Its size deserializers integrate human-readable values with Serde.
 
+#[cfg(test)]
+mod tests;
+
+use std::fmt::{self, Display, Formatter, Write};
+
 use bytesize::ByteSize;
 use serde::{Deserialize, Deserializer, de};
 
 use crate::{Result, at, err};
+
+struct EscapedBytes<'a>(&'a [u8]);
 
 /// Accepts an integer byte count or a string with SI/IEC suffix (e.g. "24 MiB")
 /// and returns a `usize`.
@@ -55,6 +62,22 @@ pub fn pretty(bytes: usize) -> String {
 	ByteSize::b(bytes).display().iec().to_string()
 }
 
+/// Renders bytes as text, writing each non-printable byte as `\xHH`.
+///
+/// Printable ASCII passes through, so a database key reads as itself around its
+/// binary separators. The raw database admin commands read and write this form.
+#[must_use]
+pub fn escape_bytes(data: &[u8]) -> impl Display + '_ { EscapedBytes(data) }
+
+impl Display for EscapedBytes<'_> {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		self.0.iter().try_for_each(|byte| match byte {
+			| 0x20..=0x7E => f.write_char(char::from(*byte)),
+			| _ => write!(f, "\\x{byte:02x}"),
+		})
+	}
+}
+
 /// Increments an optional big-endian counter with wrapping arithmetic.
 ///
 /// Missing or malformed input is treated as zero. The returned array contains
@@ -77,3 +100,16 @@ pub fn u64_from_u8(bytes: &[u8]) -> u64 {
 /// Parses the big-endian bytes into an u64.
 #[inline]
 pub fn u64_from_bytes(bytes: &[u8]) -> Result<u64> { Ok(u64::from_be_bytes(bytes.try_into()?)) }
+
+/// Returns the least byte prefix strictly after every key with this prefix.
+///
+/// Trailing maximum bytes are removed before the remaining last byte advances.
+/// An empty or all-maximum prefix has no successor. The owned buffer is reused.
+#[must_use]
+pub fn prefix_successor(mut prefix: Vec<u8>) -> Option<Vec<u8>> {
+	let index = prefix.iter().rposition(|byte| *byte != u8::MAX)?;
+
+	prefix.truncate(index.saturating_add(1));
+	prefix[index] = prefix[index].saturating_add(1);
+	Some(prefix)
+}

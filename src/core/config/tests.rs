@@ -1,26 +1,38 @@
 #![cfg(test)]
 
+mod baseline;
+mod hierarchy;
+
 use std::{
 	cell::RefCell,
+	fmt::Debug,
 	io::{Result as IoResult, Write},
+	net::IpAddr,
 	sync::{Arc, Mutex, Once},
 };
 
+use ::http::StatusCode;
+use ::tracing::{level_filters::LevelFilter, subscriber::set_global_default};
 use argon2::Params;
 use figment::providers::Data;
-use tracing::{level_filters::LevelFilter, subscriber::set_global_default};
+use ipaddress::IPAddress;
+use ruma::{
+	RoomVersionId,
+	api::error::{ErrorKind, IncompatibleRoomVersionErrorData},
+};
 use tracing_subscriber::fmt::{MakeWriter, fmt};
 
 use super::*;
 use crate::{
 	config::{
+		authentication::Argon2,
 		check::reload,
+		media::UrlPreview,
 		proxy::{ProxySnapshot, parse_environment_proxy_url},
+		regenerate::schema,
 	},
-	utils::{
-		BoolExt,
-		hash::{password, verify_password},
-	},
+	matrix::MAX_PREV_EVENTS,
+	utils::hash::{password, verify_password},
 };
 
 thread_local! {
@@ -51,8 +63,54 @@ impl<'a> MakeWriter<'a> for ThreadLocalWriter {
 	fn make_writer(&'a self) -> Self::Writer { Self }
 }
 
+#[test]
+fn smtp_display_redacts_userinfo() {
+	for (value, expected) in [
+		(
+			Some("smtps://user:secret@mail.example.com:465"),
+			"Some(\"smtps://***********@mail.example.com:465\")",
+		),
+		(
+			Some("smtp://bot%40example.com:p%40ss@mail.example.com:587"),
+			"Some(\"smtp://***********@mail.example.com:587\")",
+		),
+		(Some("smtp://mail.example.com:25"), "Some(\"smtp://mail.example.com:25\")"),
+		(Some("smtps://user:secret@[::1]:465"), "Some(\"smtps://***********@[::1]:465\")"),
+		(Some("smtps://user:secret@[invalid"), "***********"),
+		(Some("smtp:user:secret"), "***********"),
+		(None, "None"),
+	] {
+		let smtp = SmtpConfig {
+			connection_uri: value.map(str::to_owned),
+			..SmtpConfig::default()
+		};
+
+		let rendered = smtp.to_string();
+		let row = rendered
+			.lines()
+			.find(|line| line.contains("connection_uri"))
+			.expect("SMTP URI row present");
+
+		assert_eq!(row, format!("| connection_uri | {expected} |"));
+		assert_eq!(smtp.connection_uri.as_deref(), value);
+	}
+}
+
 fn config_from_toml(toml: &str) -> Result<Config> {
-	Config::new(&Figment::new().merge(Data::nested(Toml::string(toml))))
+	Config::new(&Figment::new().merge(Config::normalize(Data::nested(Toml::string(toml)))?))
+}
+
+fn assert_group_coverage<'a, Sections>(sections: Sections)
+where
+	Sections: Iterator<Item = &'a str>,
+{
+	let registered = schema()
+		.iter()
+		.filter(|section| section.group)
+		.map(|section| section.section)
+		.sorted_unstable();
+
+	assert!(registered.eq(sections.sorted_unstable()));
 }
 
 fn check_with_captured_logs(config: &Config) -> (Result, String) {
@@ -88,15 +146,144 @@ fn check_with_captured_logs(config: &Config) -> (Result, String) {
 }
 
 #[test]
-fn url_preview_accept_language_defaults_to_none() {
-	let config = config_from_toml("[global]\n").expect("default config should parse");
+fn admin_escape_commands_default_to_off() {
+	let config = default_config();
 
-	assert!(config.url_preview_accept_language.is_none());
+	assert!(!config.admin.escape_commands);
+}
+
+fn default_config() -> Config {
+	config_from_toml("[global]\n").expect("default config should parse")
+}
+
+#[test]
+fn unix_socket_permissions_preserve_octal_digits_and_reject_invalid_digits() {
+	for (digits, expected) in [
+		(0, Some(0)),
+		(660, Some(0o660)),
+		(4_000_000_000, Some(0o4_000_000_000)),
+		(888, None),
+		(u32::MAX, None),
+	] {
+		let document = format!("[global.http.listen]\nunix_socket_perms = {digits}\n");
+		let config =
+			config_from_toml(&document).expect("permission digits parse as configuration");
+
+		let result = config.get_unix_socket_perms();
+
+		match expected {
+			| Some(expected) =>
+				assert_eq!(result.expect("valid octal digits convert"), expected, "{digits}"),
+			| None => {
+				let error = result.expect_err("invalid octal digits must fail");
+
+				assert!(
+					error
+						.to_string()
+						.contains("http.listen.unix_socket_perms"),
+					"{error}"
+				);
+			},
+		}
+	}
+}
+
+#[test]
+fn media_upload_min_free_space_defaults_to_one_gib_and_takes_either_form() {
+	let default = default_config();
+	let integer = config_from_toml("[global]\nmedia_upload_min_free_space = 10737418240\n")
+		.expect("an integer byte count should parse");
+
+	let suffixed = config_from_toml("[global]\nmedia_upload_min_free_space = \"10 GiB\"\n")
+		.expect("a size with a suffix should parse");
+
+	assert_eq!(default.media.upload_min_free_space, 1_073_741_824);
+	assert_eq!(integer.media.upload_min_free_space, 10_737_418_240);
+	assert_eq!(suffixed.media.upload_min_free_space, 10_737_418_240);
+}
+
+#[test]
+fn url_preview_accept_language_defaults_to_none() {
+	let config = default_config();
+
+	assert!(config.media.url_preview.accept_language.is_none());
+}
+
+#[test]
+fn shared_room_profile_requests_require_profile_authentication() {
+	let unauthenticated = "[global]
+limit_profile_requests_to_users_who_share_rooms = true
+";
+
+	let authenticated = "[global]
+require_auth_for_profile_requests = true
+limit_profile_requests_to_users_who_share_rooms = true
+";
+
+	for (toml, valid) in [(unauthenticated, false), (authenticated, true)] {
+		let config = config_from_toml(toml).expect("the config should parse");
+		let result = check(&config);
+
+		assert_eq!(result.is_ok(), valid, "{toml}: {result:?}");
+	}
+}
+
+#[test]
+fn login_rate_limits_default_every_option_left_unset() {
+	let rates = "[global.rate_limiting.login.failed]
+per_second = 1.5
+
+[global.rate_limiting.login.account]
+per_second = 2.5
+
+[global.rate_limiting.login.address]
+per_second = 3.5
+";
+
+	let bursts = "[global.rate_limiting.login.failed]
+burst_count = 7
+
+[global.rate_limiting.login.account]
+burst_count = 9
+
+[global.rate_limiting.login.address]
+burst_count = 11
+";
+
+	let account = "[global.rate_limiting.login.account]
+burst_count = 9
+";
+
+	let address = "[global.rate_limiting.login.address]
+per_second = 4.5
+";
+
+	for (toml, expected) in [
+		("[global]\n", [(0.17, 3), (0.003, 5), (1.0, 20)]),
+		(rates, [(1.5, 3), (2.5, 5), (3.5, 20)]),
+		(bursts, [(0.17, 7), (0.003, 9), (1.0, 11)]),
+		(account, [(0.17, 3), (0.003, 9), (1.0, 20)]),
+		(address, [(0.17, 3), (0.003, 5), (4.5, 20)]),
+	] {
+		let config = config_from_toml(toml).expect("the config should parse");
+
+		assert_eq!(login_limits(&config), expected, "{toml}");
+	}
+}
+
+fn login_limits(config: &Config) -> [(f64, u32); 3] {
+	let LoginRateLimits { failed, account, address } = &config.rate_limiting.login;
+
+	[
+		(failed.per_second, failed.burst_count),
+		(account.per_second, account.burst_count),
+		(address.per_second, address.burst_count),
+	]
 }
 
 #[test]
 fn url_preview_accept_language_can_be_reloaded_and_removed() {
-	let original = config_from_toml("[global]\n").expect("default config should parse");
+	let original = default_config();
 	let english = config_from_toml(
 		r#"[global]
 url_preview_accept_language = "en-US,en;q=0.9"
@@ -104,33 +291,44 @@ url_preview_accept_language = "en-US,en;q=0.9"
 	)
 	.expect("language preference should parse");
 
-	let german = Config {
-		url_preview_accept_language: Some("de-DE,de;q=0.9,en;q=0.5".to_owned()),
-		..english.clone()
-	};
+	let german = with_preview_language(&english, "de-DE,de;q=0.9,en;q=0.5");
+	let language = english
+		.media
+		.url_preview
+		.accept_language
+		.as_deref();
 
-	assert_eq!(english.url_preview_accept_language.as_deref(), Some("en-US,en;q=0.9"));
+	assert_eq!(language, Some("en-US,en;q=0.9"));
+
 	reload(&original, &english).expect("setting a language should reload");
 	reload(&english, &german).expect("changing the language should reload");
 	reload(&german, &original).expect("removing the language should reload");
 }
 
+fn with_preview_language(base: &Config, language: &str) -> Config {
+	let url_preview = UrlPreview {
+		accept_language: Some(language.to_owned()),
+		..base.media.url_preview.clone()
+	};
+
+	let media = Media { url_preview, ..base.media.clone() };
+
+	Config { media, ..base.clone() }
+}
+
 #[test]
 fn url_preview_accept_language_rejects_invalid_headers() {
-	let original = config_from_toml("[global]\n").expect("default config should parse");
+	let original = default_config();
 
 	for value in ["en\r\nX-Injected: true", "en\n", "en\0"] {
-		let config = Config {
-			url_preview_accept_language: Some(value.to_owned()),
-			..original.clone()
-		};
+		let config = with_preview_language(&original, value);
 
 		let error = check(&config).expect_err("invalid header must fail at startup");
 
 		assert!(
 			error
 				.to_string()
-				.contains("url_preview_accept_language"),
+				.contains("media.url_preview.accept_language"),
 			"{error}"
 		);
 
@@ -140,14 +338,14 @@ fn url_preview_accept_language_rejects_invalid_headers() {
 
 #[test]
 fn ip_source_absent_parses_as_none() {
-	let config = config_from_toml("[global]\n").unwrap();
+	let config = default_config();
 
-	assert_eq!(config.ip_source, None);
+	assert_eq!(config.http.ip_source, None);
 }
 
 #[test]
 fn legacy_state_local_switch_is_recognized_and_warned() {
-	let default = config_from_toml("[global]\n").unwrap();
+	let default = default_config();
 	let disabled = config_from_toml(
 		"[global]
 resolve_state_locally = true
@@ -156,13 +354,13 @@ resolve_state_locally_shadow = true
 	)
 	.unwrap();
 
-	assert!(!default.resolve_state_locally_shadow);
-	assert!(disabled.resolve_state_locally_shadow);
+	assert!(!default.federation.resolve_state_locally_shadow);
+	assert!(disabled.federation.resolve_state_locally_shadow);
 
 	let (result, logs) = check_with_captured_logs(&disabled);
 
 	result.expect("legacy state-local switch should pass config check");
-	assert!(logs.contains("use resolve_state_locally=false"));
+	assert!(logs.contains("use federation.resolve_state_locally=false"));
 }
 
 #[test]
@@ -177,7 +375,7 @@ dns_passthru_domains = [\"example.com\"]
 	let (result, logs) = check_with_captured_logs(&config);
 
 	result.expect("a literal pattern should warn rather than refuse the config");
-	assert!(logs.contains("dns_passthru_domains"));
+	assert!(logs.contains("network.dns.passthru_domains"));
 	// A raw string: the rendered suggestion carries the doubled backslash a TOML
 	// basic string needs, so this is the text an operator can paste.
 	assert!(
@@ -200,8 +398,60 @@ forbidden_usernames = [\"bad_user.name\"]
 	let (result, logs) = check_with_captured_logs(&config);
 
 	result.expect("a literal pattern should warn rather than refuse the config");
-	assert!(logs.contains("forbidden_usernames"));
+	assert!(logs.contains("registration.forbidden_usernames"));
 	assert!(!logs.contains("host name"), "localparts are not host names: {logs}");
+}
+
+#[test]
+fn turn_provider_conflicts_refuse_the_config() {
+	let both = concat!(
+		"[global.turn.endpoint]\n",
+		"url = \"http://127.0.0.1:8088/\"\n",
+		"[global.turn.cloudflare]\n",
+		"key_id = \"0123456789abcdef\"\n",
+		"token = \"secret\"\n",
+	);
+
+	let no_lifetime = concat!(
+		"[global.turn]\n",
+		"ttl = 0\n",
+		"[global.turn.endpoint]\n",
+		"url = \"http://127.0.0.1:8088/\"\n",
+	);
+
+	assert_refused(both, "turn.cloudflare.key_id");
+	assert_refused(no_lifetime, "turn.ttl");
+}
+
+fn assert_refused(toml: &str, field: &str) {
+	let (result, _) = check_toml(toml);
+	let error = result
+		.expect_err("the config is refused")
+		.to_string();
+
+	assert!(error.contains(field), "{error}");
+}
+
+#[test]
+fn turn_provider_warnings_name_what_is_wrong() {
+	let tokenless = concat!("[global.turn.cloudflare]\n", "key_id = \"0123456789abcdef\"\n");
+	let overridden = concat!(
+		"[global.turn]\n",
+		"uris = [\"turn:turn.example.com\"]\n",
+		"secret = \"secret\"\n",
+		"[global.turn.endpoint]\n",
+		"url = \"http://127.0.0.1:8088/\"\n",
+	);
+
+	assert_warns(tokenless, "turn.cloudflare.token");
+	assert_warns(overridden, "are ignored");
+}
+
+fn assert_warns(toml: &str, needle: &str) {
+	let (result, logs) = check_toml(toml);
+
+	result.expect("a warning rather than a refusal");
+	assert!(logs.contains(needle), "{logs}");
 }
 
 // A pattern of bare dots is the any-character idiom, not a name typed by mistake.
@@ -274,15 +524,43 @@ fn legacy_state_local_switch_is_reloadable() {
 
 #[test]
 fn prev_events_concurrency_is_nonzero_and_reloadable() {
-	let default = config_from_toml("[global]\n").unwrap();
+	let default = default_config();
 	let zero = config_from_toml("[global]\nprev_events_concurrency = 0\n").unwrap();
 	let one = config_from_toml("[global]\nprev_events_concurrency = 1\n").unwrap();
 
-	assert_eq!(default.prev_events_concurrency, u16::try_from(MAX_PREV_EVENTS).unwrap());
+	assert_eq!(
+		default.federation.history.prev_events_concurrency,
+		u16::try_from(MAX_PREV_EVENTS).unwrap()
+	);
+
 	assert!(check(&default).is_ok(), "default concurrency should pass validation");
 	assert!(check(&zero).is_err(), "zero concurrency should fail validation");
 	assert!(check(&one).is_ok(), "one recovery slot should pass validation");
 	reload(&default, &one).expect("previous-event concurrency should reload");
+}
+
+#[cfg(feature = "jwt_login")]
+#[test]
+fn jwt_expiry_needs_a_nonzero_access_token_ttl() {
+	let config = |enable: bool, expire: bool, ttl: u64| {
+		let toml = format!(
+			"[global.jwt]\nenable = {enable}\nkey = \"secret\"\nexpire_access_token = \
+			 {expire}\n[global.authentication]\naccess_token_ttl = {ttl}\n"
+		);
+
+		config_from_toml(&toml).unwrap()
+	};
+
+	assert!(check(&config(true, true, 1)).is_ok(), "a lasting token should pass validation");
+
+	let dead = check(&config(true, true, 0))
+		.expect_err("a dead token should fail validation")
+		.to_string();
+
+	assert!(dead.contains("'jwt.expire_access_token' directive"), "{dead}");
+	assert!(check(&config(true, false, 0)).is_ok(), "no expiry should pass validation");
+	assert!(check(&config(false, true, 0)).is_ok(), "no JWT login should pass validation");
+	reload(&default_config(), &config(true, true, 1)).expect("JWT expiry should reload");
 }
 
 #[test]
@@ -313,7 +591,7 @@ ip_source = "connect_info"
 	)
 	.unwrap();
 
-	assert_eq!(config.ip_source, Some(IpSource::ConnectInfo));
+	assert_eq!(config.http.ip_source, Some(IpSource::ConnectInfo));
 }
 
 #[test]
@@ -325,7 +603,7 @@ ip_source = "rightmost_x_forwarded_for"
 	)
 	.unwrap();
 
-	assert_eq!(config.ip_source, Some(IpSource::RightmostXForwardedFor));
+	assert_eq!(config.http.ip_source, Some(IpSource::RightmostXForwardedFor));
 }
 
 #[test]
@@ -337,7 +615,7 @@ ip_source = "cf_connecting_ip"
 	)
 	.unwrap();
 
-	assert_eq!(config.ip_source, Some(IpSource::CfConnectingIp));
+	assert_eq!(config.http.ip_source, Some(IpSource::CfConnectingIp));
 }
 
 #[test]
@@ -359,7 +637,7 @@ ip_source = "{value}"
 		))
 		.unwrap();
 
-		assert_eq!(config.ip_source, Some(expected), "{value}");
+		assert_eq!(config.http.ip_source, Some(expected), "{value}");
 	}
 }
 
@@ -378,13 +656,14 @@ ip_source = "{value}"
 
 		let err = err.to_string();
 		assert!(err.contains("ip_source"), "{err}");
+		assert!(err.contains("global.ip_source"), "{err}");
 		assert!(err.contains(value), "{err}");
 	}
 }
 
 #[test]
 fn check_accepts_absent_connect_info_and_cf_connecting_ip() {
-	let absent = config_from_toml("[global]\n").unwrap();
+	let absent = default_config();
 	let connect_info = config_from_toml(
 		r#"[global]
 ip_source = "connect_info"
@@ -400,15 +679,77 @@ ip_source = "cf_connecting_ip"
 
 	let (result, logs) = check_with_captured_logs(&absent);
 	result.expect("absent ip_source should pass config check");
-	assert!(!logs.contains("ip_source is set to"));
+	assert!(!logs.contains("http.ip_source selects a header-based source"));
 
 	let (result, logs) = check_with_captured_logs(&connect_info);
 	result.expect("connect_info should pass config check");
-	assert!(!logs.contains("ip_source is set to"));
+	assert!(!logs.contains("http.ip_source selects a header-based source"));
 
 	let (result, logs) = check_with_captured_logs(&cf_connecting_ip);
 	result.expect("cf_connecting_ip should pass config check");
-	assert!(logs.contains("ip_source is set to CfConnectingIp"));
+	assert!(logs.contains("http.ip_source selects a header-based source"));
+	assert!(logs.contains("source=CfConnectingIp"));
+}
+
+#[test]
+fn only_a_loopback_socket_peer_identifies_no_client() {
+	let parse = |address: &str| -> IpAddr { address.parse().expect("test address parses") };
+	let cases = [
+		(IpSource::ConnectInfo, "127.0.0.1", false),
+		(IpSource::ConnectInfo, "127.0.0.2", false),
+		(IpSource::ConnectInfo, "::1", false),
+		(IpSource::ConnectInfo, "::ffff:127.0.0.1", false),
+		(IpSource::ConnectInfo, "192.0.2.1", true),
+		(IpSource::ConnectInfo, "2001:db8::1", true),
+		(IpSource::RightmostXForwardedFor, "127.0.0.1", true),
+		(IpSource::XRealIp, "192.0.2.1", true),
+	];
+
+	for (source, address, expected) in cases {
+		let identified = source.identifies_client(parse(address));
+
+		assert_eq!(identified, expected, "{source:?} {address}");
+	}
+
+	assert!(
+		!IpSource::ConnectInfo.identifies_client(UNIX_SOCKET_PEER.ip()),
+		"the Unix listener's peer must identify no single client"
+	);
+}
+
+#[test]
+fn check_warns_when_local_listeners_have_no_forwarding_header() {
+	const WARNING: &str = "listener have no per-address limit";
+
+	let unix = "[global]\nunix_socket_path = \"/run/tuwunel.sock\"\n";
+	let cases = [
+		("default loopback listeners", "[global]\n".to_owned(), true),
+		("unix socket", unix.to_owned(), true),
+		(
+			"unix socket with connect_info",
+			format!("{unix}ip_source = \"connect_info\"\n"),
+			true,
+		),
+		(
+			"unix socket with a header source",
+			format!("{unix}ip_source = \"rightmost_x_forwarded_for\"\n"),
+			false,
+		),
+		("public listener", "[global]\naddress = \"0.0.0.0\"\n".to_owned(), false),
+	];
+
+	for (name, toml, warns) in cases {
+		let (result, logs) = check_toml(&toml);
+
+		result.expect("listener config should pass config check");
+		assert_eq!(logs.contains(WARNING), warns, "{name}");
+	}
+}
+
+fn check_toml(toml: &str) -> (Result, String) {
+	let config = config_from_toml(toml).expect("test config should parse");
+
+	check_with_captured_logs(&config)
 }
 
 #[test]
@@ -447,8 +788,7 @@ client_secret = "oauth-secret"
 	];
 
 	for (name, toml, warns) in cases {
-		let config = config_from_toml(toml).expect("MAS provider config should parse");
-		let (result, logs) = check_with_captured_logs(&config);
+		let (result, logs) = check_toml(toml);
 
 		result.expect("MAS provider config should pass config check");
 		assert_eq!(logs.contains("configured without `trusted = true`"), warns, "{name}");
@@ -476,11 +816,59 @@ oidc_registration_access_token = "initial-access-token"
 	for (name, toml, warns) in cases {
 		let config = config_from_toml(toml).expect("OIDC registration config should parse");
 		let (result, logs) = check_with_captured_logs(&config);
-		let secret = config.oidc_registration_access_token.as_str();
+		let secret = config
+			.authentication
+			.oidc
+			.registration_access_token
+			.as_str();
 
 		result.expect("OIDC registration config should pass config check");
-		assert_eq!(logs.contains("oidc_registration_access_token is set"), warns, "{name}");
+		assert_eq!(
+			logs.contains("authentication.oidc.registration_access_token is set"),
+			warns,
+			"{name}"
+		);
+
 		assert!(secret.is_empty() || !logs.contains(secret), "{name} leaked the token value");
+	}
+}
+
+#[test]
+fn check_warns_about_url_preview_allowlist_entries() {
+	let cases = [
+		("a host entry", r#"domain_contains_allowlist = ["youtube.com"]"#, None),
+		(
+			"a URL entry",
+			r#"domain_contains_allowlist = ["https://youtube.com"]"#,
+			Some("host alone"),
+		),
+		(
+			"an empty domain entry",
+			r#"domain_contains_allowlist = [""]"#,
+			Some("matches nothing"),
+		),
+		("an empty URL entry", r#"url_contains_allowlist = [""]"#, None),
+		(
+			"a wildcard entry",
+			r#"domain_contains_allowlist = ["*"]"#,
+			Some("All URLs are allowed"),
+		),
+	];
+
+	for (name, setting, warning) in cases {
+		let config =
+			config_from_toml(&format!("[global.media.url_preview]\n{setting}\n")).unwrap();
+
+		let (result, logs) = check_with_captured_logs(&config);
+
+		result.expect("a preview allowlist should pass config check");
+		let warned = ["never matches", "matches nothing", "All URLs are allowed"]
+			.iter()
+			.any(|marker| logs.contains(marker));
+
+		assert_eq!(warned, warning.is_some(), "{name}");
+
+		assert!(warning.is_none_or(|warning| logs.contains(warning)), "{name}");
 	}
 }
 
@@ -501,8 +889,148 @@ fn check_bounds_the_animated_thumbnail_concurrency() {
 }
 
 #[test]
+fn profile_count_limits_are_positive_and_reloadable() {
+	let default = default_config();
+
+	assert_eq!(default.profile.max_remote_fields, 100);
+	assert_eq!(default.profile.max_fields_per_request, 64);
+
+	let changed = config_from_toml(
+		"[global]
+max_remote_profile_fields = 2
+max_profile_fields_per_request = 3
+",
+	)
+	.unwrap();
+
+	check(&changed).expect("positive overrides should load");
+	reload(&default, &changed).expect("positive overrides should reload");
+
+	for (name, path) in [
+		("max_remote_profile_fields", "profile.max_remote_fields"),
+		("max_profile_fields_per_request", "profile.max_fields_per_request"),
+	] {
+		let config = config_from_toml(&format!("[global]\n{name} = 0\n")).unwrap();
+		let error = check(&config).expect_err("zero must not disable a count limit");
+
+		assert!(error.to_string().contains(path));
+		assert!(reload(&default, &config).is_err());
+	}
+}
+
+#[test]
+fn thread_latest_reply_search_limit_is_positive_and_reloadable() {
+	let default = default_config();
+
+	let limit = default
+		.rooms
+		.redaction
+		.thread_latest_reply_search_limit;
+
+	assert_eq!(limit, 1024);
+
+	let changed = config_from_toml("[global]\nthread_latest_reply_search_limit = 3\n").unwrap();
+
+	check(&changed).expect("a positive search limit should load");
+	reload(&default, &changed).expect("a positive search limit should reload");
+
+	let zero = config_from_toml("[global]\nthread_latest_reply_search_limit = 0\n").unwrap();
+	let error = check(&zero).expect_err("zero must not disable the search limit");
+
+	assert!(
+		error
+			.to_string()
+			.contains("rooms.redaction.thread_latest_reply_search_limit")
+	);
+
+	assert!(reload(&default, &zero).is_err());
+}
+
+#[test]
+fn inverted_bounds_are_refused_at_startup_and_reload() {
+	let default = default_config();
+	let hierarchy = |min: u64, max: u64| {
+		format!("[global.cache.space_hierarchy]\nttl_min = {min}\nttl_max = {max}\n")
+	};
+
+	let typing = |min: u64, max: u64| {
+		format!("[global.typing]\nclient_timeout_min_s = {min}\nclient_timeout_max_s = {max}\n")
+	};
+
+	let ttl_min = "cache.space_hierarchy.ttl_min";
+
+	for (document, key) in [
+		(hierarchy(600, 600), ttl_min),
+		(hierarchy(601, 600), ttl_min),
+		(typing(46, 45), "typing.client_timeout_min_s"),
+	] {
+		let config = config_from_toml(&document).unwrap();
+		let error = check(&config).expect_err("an inverted pair must not load");
+
+		assert!(error.to_string().contains(key), "{document}");
+		assert!(reload(&default, &config).is_err(), "{document}");
+	}
+
+	for document in [hierarchy(599, 600), typing(45, 45)] {
+		let config = config_from_toml(&document).unwrap();
+
+		check(&config).expect("an ordered pair should load");
+		reload(&default, &config).expect("an ordered pair should reload");
+	}
+}
+
+#[test]
+fn a_reload_that_changes_storage_providers_is_refused() {
+	let default = default_config();
+	let section =
+		|bucket: &str| format!("[global.storage_provider.archive.s3]\nbucket = {bucket}\n");
+
+	let added = config_from_toml(&section("\"archive\"")).unwrap();
+	let changed = config_from_toml(&section("\"elsewhere\"")).unwrap();
+
+	check(&added).expect("an unused provider section should load");
+	reload(&added, &added).expect("an unchanged provider section should reload");
+
+	for (old, new) in [(&default, &added), (&added, &changed), (&added, &default)] {
+		let error = reload(old, new).expect_err("a provider change must not reload");
+
+		assert!(error.to_string().contains("storage_provider"));
+	}
+}
+
+#[test]
+fn a_config_with_no_enabled_upload_provider_is_refused() {
+	let disabled = "[global.storage_provider.archive.s3]\nregion = \"us-west-2\"\n";
+	let media = |lists: &str| format!("[global.media]\n{lists}\n{disabled}");
+	let both = r#"storage_providers = ["media", "archive"]"#;
+	let fallback = config_from_toml(&media(both)).unwrap();
+
+	check(&fallback).expect("the built-in provider should still receive uploads");
+
+	for document in [
+		media(r#"storage_providers = ["archive"]"#),
+		media(&format!("{both}\nstore_on_providers = [\"archive\"]")),
+	] {
+		let config = config_from_toml(&document).unwrap();
+
+		for result in [check(&config), reload(&fallback, &config)] {
+			let error = result.expect_err("uploads must have a provider");
+
+			assert!(error.to_string().contains("No enabled"), "{document}");
+		}
+	}
+
+	let replaced =
+		config_from_toml("[global.storage_provider.media.local]\nbase_path = \"\"\n").unwrap();
+
+	let error = check(&replaced).expect_err("an empty built-in replacement leaves none");
+
+	assert!(error.to_string().contains("No enabled"));
+}
+
+#[test]
 fn reload_rejects_none_to_some_and_some_to_none() {
-	let none = config_from_toml("[global]\n").unwrap();
+	let none = default_config();
 	let some = config_from_toml(
 		r#"[global]
 ip_source = "connect_info"
@@ -516,31 +1044,18 @@ ip_source = "rightmost_x_forwarded_for"
 	)
 	.unwrap();
 
-	let err = reload(&none, &some).unwrap_err();
-	assert!(
-		err.to_string().contains("'ip_source'")
-			&& err
-				.to_string()
-				.contains("cannot be changed at runtime"),
-		"{err}"
-	);
+	assert_ip_source_reload_rejected(&none, &some);
+	assert_ip_source_reload_rejected(&some, &none);
+	assert_ip_source_reload_rejected(&some, &other_some);
+}
 
-	let err = reload(&some, &none).unwrap_err();
-	assert!(
-		err.to_string().contains("'ip_source'")
-			&& err
-				.to_string()
-				.contains("cannot be changed at runtime"),
-		"{err}"
-	);
+fn assert_ip_source_reload_rejected(old: &Config, new: &Config) {
+	let error = reload(old, new).expect_err("changing the IP source must fail");
+	let message = error.to_string();
 
-	let err = reload(&some, &other_some).unwrap_err();
 	assert!(
-		err.to_string().contains("'ip_source'")
-			&& err
-				.to_string()
-				.contains("cannot be changed at runtime"),
-		"{err}"
+		message.contains("'http.ip_source'") && message.contains("cannot be changed at runtime"),
+		"{error}"
 	);
 }
 
@@ -556,22 +1071,75 @@ fn s3_storage_provider_debug_masks_credentials() {
 
 	let dump = format!("{config:?}");
 
-	assert!(!dump.contains("AKIAIOSFODNN7EXAMPLE"), "key leaked in Debug: {dump}");
-	assert!(!dump.contains("wJalrXUtnFEMI"), "secret leaked in Debug: {dump}");
-	assert!(!dump.contains("session-token"), "token leaked in Debug: {dump}");
-	assert!(!dump.contains("kms-material"), "kms leaked in Debug: {dump}");
-
-	for field in ["key", "secret", "token", "kms"] {
-		assert!(
-			dump.contains(&format!("{field}: Some(<redacted>)")),
-			"{field} should appear as Some(<redacted>): {dump}"
-		);
+	for (field, secret) in [
+		("key", "AKIAIOSFODNN7EXAMPLE"),
+		("secret", "wJalrXUtnFEMI"),
+		("token", "session-token"),
+		("kms", "kms-material"),
+	] {
+		assert_masked(&dump, field, secret, "Some(<redacted>)");
 	}
+}
+
+fn assert_masked(dump: &str, field: &str, secret: &str, mask: &str) {
+	assert!(!dump.contains(secret), "{field} leaked in Debug: {dump}");
+	assert!(
+		dump.contains(&format!("{field}: {mask}")),
+		"{field} should appear as {mask}: {dump}"
+	);
+}
+
+#[test]
+fn identity_provider_debug_masks_client_secret() {
+	let config = config_from_toml(
+		r#"[[global.identity_provider]]
+brand = "test"
+client_id = "test"
+client_secret = "client-secret-sentinel"
+"#,
+	)
+	.expect("identity provider config should parse");
+
+	let provider = config
+		.identity_provider
+		.values()
+		.next()
+		.expect("one identity provider configured");
+
+	let dump = format!("{provider:#?}");
+
+	assert_masked(&dump, "client_secret", "client-secret-sentinel", "Some(<redacted>)");
+}
+
+#[test]
+fn jwt_config_debug_masks_key() {
+	let config = JwtConfig {
+		key: "jwt-key-sentinel".to_owned(),
+		..Default::default()
+	};
+
+	let dump = format!("{config:#?}");
+
+	assert_masked(&dump, "key", "jwt-key-sentinel", "<redacted>");
+}
+
+#[test]
+fn appservice_debug_masks_tokens() {
+	let config = AppService {
+		as_token: "as-token-sentinel".to_owned(),
+		hs_token: "hs-token-sentinel".to_owned(),
+		..Default::default()
+	};
+
+	let dump = format!("{config:#?}");
+
+	assert_masked(&dump, "as_token", "as-token-sentinel", "<redacted>");
+	assert_masked(&dump, "hs_token", "hs-token-sentinel", "<redacted>");
 }
 
 #[test]
 fn reload_accepts_unchanged_none_and_unchanged_some() {
-	let none = config_from_toml("[global]\n").unwrap();
+	let none = default_config();
 	let some = config_from_toml(
 		r#"[global]
 ip_source = "rightmost_x_forwarded_for"
@@ -588,8 +1156,8 @@ fn check_support_pgp_key(value: &str) -> Result {
 		"[global.well_known.support_contact.admin]\nrole = \"m.role.admin\"\nemail_address = \
 		 \"admin@example.com\"\npgp_key = \"{value}\"\n"
 	);
-	let config = config_from_toml(&toml).expect("support_contact config should parse");
-	check_with_captured_logs(&config).0
+
+	check_toml(&toml).0
 }
 
 #[test]
@@ -642,7 +1210,26 @@ default_power_level_content_override = false
 	let err = check(&config)
 		.expect_err("a non-table default_power_level_content_override must be rejected")
 		.to_string();
-	assert!(err.contains("default_power_level_content_override"), "{err}");
+
+	assert!(err.contains("rooms.default_power_level_content_override"), "{err}");
+}
+
+#[test]
+fn an_unsupported_room_version_is_refused_as_incompatible() {
+	let config = default_config();
+
+	config
+		.require_supported_room_version(&RoomVersionId::V12)
+		.expect("room version 12 is supported");
+
+	let error = config
+		.require_supported_room_version(&RoomVersionId::V1)
+		.expect_err("room version 1 is not supported");
+
+	let refused = IncompatibleRoomVersionErrorData::new(RoomVersionId::V1);
+
+	assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+	assert_eq!(error.kind(), ErrorKind::IncompatibleRoomVersion(refused));
 }
 
 #[test]
@@ -1022,6 +1609,22 @@ fn proxy_snapshots_own_their_configured_and_environment_generations() {
 	assert!(environment_snapshot.resolver_alias(&environment_url));
 }
 
+#[test]
+fn default_ip_range_denylist_covers_the_unspecified_addresses() {
+	let denylist: Vec<IPAddress> = Network::default()
+		.http
+		.ip_range_denylist
+		.iter()
+		.map(|cidr| IPAddress::parse(cidr).expect("default denylist range parses"))
+		.collect();
+
+	for address in ["0.0.0.0", "::"] {
+		let ip = IPAddress::parse(address).expect("test address parses");
+
+		assert!(denylist.iter().any(|cidr| cidr.includes(&ip)), "{address} is not denied");
+	}
+}
+
 /// The shipped Argon2id cost is the OWASP recommendation the argon2 crate
 /// also carries as its own default.
 ///
@@ -1030,9 +1633,11 @@ fn proxy_snapshots_own_their_configured_and_environment_generations() {
 /// stored.
 #[test]
 fn argon2_defaults_are_the_owasp_recommendation() {
-	assert_eq!(default_argon2_m_cost(), Params::DEFAULT_M_COST);
-	assert_eq!(default_argon2_t_cost(), Params::DEFAULT_T_COST);
-	assert_eq!(default_argon2_p_cost(), Params::DEFAULT_P_COST);
+	let costs = Argon2::default();
+
+	assert_eq!(costs.m_cost, Params::DEFAULT_M_COST);
+	assert_eq!(costs.t_cost, Params::DEFAULT_T_COST);
+	assert_eq!(costs.p_cost, Params::DEFAULT_P_COST);
 }
 
 /// A configured cost reaches the parameters a stored hash records.
@@ -1060,9 +1665,12 @@ fn a_configured_cost_reaches_the_stored_hash() {
 #[test]
 fn an_impossible_cost_fails_the_config_check() {
 	for (toml, key) in [
-		("[global]\nargon2_m_cost = 8\nargon2_p_cost = 4\n", "argon2_m_cost"),
-		("[global]\nargon2_t_cost = 0\n", "argon2_t_cost"),
-		("[global]\nargon2_p_cost = 0\n", "argon2_p_cost"),
+		(
+			"[global]\nargon2_m_cost = 8\nargon2_p_cost = 4\n",
+			"authentication.argon2.m_cost",
+		),
+		("[global]\nargon2_t_cost = 0\n", "authentication.argon2.t_cost"),
+		("[global]\nargon2_p_cost = 0\n", "authentication.argon2.p_cost"),
 	] {
 		let config = config_from_toml(toml).expect("the config should parse");
 		let error = check(&config).expect_err("the cost should be rejected");
@@ -1083,8 +1691,7 @@ fn a_weak_cost_passes_the_config_check_with_a_warning() {
 		("[global]\n", false),
 		("[global]\nargon2_m_cost = 64\nargon2_t_cost = 1\n", true),
 	] {
-		let config = config_from_toml(toml).expect("the config should parse");
-		let (result, logs) = check_with_captured_logs(&config);
+		let (result, logs) = check_toml(toml);
 
 		result.expect("a valid cost should pass the config check");
 		assert_eq!(logs.contains("below the weakest OWASP"), warns, "{toml}");
@@ -1110,18 +1717,128 @@ fn an_out_of_range_sentry_sample_rate_fails_the_config_check() {
 		("[global]\nsentry_traces_sample_rate = 1.5\n".to_owned(), true),
 	] {
 		let config = config_from_toml(&toml).expect("the config should parse");
-		let result = check(&config);
 
-		assert_eq!(result.is_ok(), valid, "{toml}: {result:?}");
+		assert_verdict(&toml, check(&config), valid, "telemetry.sentry.traces_sample_rate");
+	}
+}
 
-		if let Err(error) = result {
-			assert!(
-				error
-					.to_string()
-					.contains("'sentry_traces_sample_rate' directive"),
-				"{error}"
-			);
-		}
+/// An enabled JWT login fails the check in a build without JWT login support.
+///
+/// The refusal names the `jwt_login` feature and covers startup and reload
+/// alike. A disabled JWT table passes with its other keys set, since no key
+/// conversion runs.
+#[cfg(not(feature = "jwt_login"))]
+#[test]
+fn jwt_login_needs_the_build_feature() {
+	const ENABLED: &str = "[global.jwt]\nenable = true\nkey = \"k\"\n";
+
+	for (toml, valid) in [
+		("[global]\n", true),
+		("[global.jwt]\nformat = \"bogus\"\nkey = \"k\"\n", true),
+		(ENABLED, false),
+	] {
+		let config = config_from_toml(toml).expect("the config should parse");
+
+		assert_verdict(toml, check(&config), valid, "jwt.enable");
+		assert_verdict(toml, reload(&default_config(), &config), valid, "jwt.enable");
+	}
+
+	let enabled = config_from_toml(ENABLED).expect("the config should parse");
+	let error = check(&enabled)
+		.expect_err("JWT login should fail the check")
+		.to_string();
+
+	assert!(error.contains("\"jwt_login\""), "{error}");
+}
+
+fn assert_verdict<T: Debug>(row: &str, result: Result<T>, valid: bool, field: &str) {
+	assert_eq!(result.is_ok(), valid, "{row}: {result:?}");
+
+	if let Err(error) = result {
+		let directive = format!("'{field}' directive");
+		let error = error.to_string();
+
+		assert!(error.contains(&directive), "{row}: {error}");
+	}
+}
+
+/// An enabled JWT login fails the check with an unknown key format.
+///
+/// Every documented spelling passes regardless of letter case, the older
+/// HMACB64 included. A disabled or absent JWT table is left alone, since its
+/// format may be empty.
+#[cfg(feature = "jwt_login")]
+#[test]
+fn an_unknown_jwt_key_format_fails_the_config_check() {
+	const ENABLED: &str = "[global.jwt]\nenable = true\nkey = \"secret\"\n";
+
+	for (toml, valid) in [
+		("[global]\n".to_owned(), true),
+		("[global.jwt]\nformat = \"bogus\"\n".to_owned(), true),
+		(ENABLED.to_owned(), true),
+		(format!("{ENABLED}format = \"hmac\"\n"), true),
+		(format!("{ENABLED}format = \"B64HMAC\"\n"), true),
+		(format!("{ENABLED}format = \"HMACB64\"\n"), true),
+		(format!("{ENABLED}format = \"ECDSA\"\n"), true),
+		(format!("{ENABLED}format = \"EdDSA\"\n"), true),
+		(format!("{ENABLED}format = \"bogus\"\n"), false),
+		(format!("{ENABLED}format = \"\"\n"), false),
+	] {
+		let config = config_from_toml(&toml).expect("the config should parse");
+
+		assert_verdict(&toml, check(&config), valid, "jwt.format");
+	}
+}
+
+/// An enabled JWT login with an empty key fails the check at startup and reload.
+///
+/// No key format can use an empty key, so each one is refused. A disabled JWT
+/// table keeps the default empty key.
+#[cfg(feature = "jwt_login")]
+#[test]
+fn an_empty_jwt_key_fails_the_config_check() {
+	const ENABLED: &str = "[global.jwt]\nenable = true\n";
+
+	for (toml, valid) in [
+		("[global.jwt]\nkey = \"\"\n".to_owned(), true),
+		(format!("{ENABLED}key = \"k\"\n"), true),
+		(ENABLED.to_owned(), false),
+		(format!("{ENABLED}key = \"\"\n"), false),
+		(format!("{ENABLED}format = \"B64HMAC\"\n"), false),
+		(format!("{ENABLED}format = \"ECDSA\"\n"), false),
+		(format!("{ENABLED}format = \"EDDSA\"\n"), false),
+	] {
+		let config = config_from_toml(&toml).expect("the config should parse");
+
+		assert_verdict(&toml, check(&config), valid, "jwt.key");
+		assert_verdict(&toml, reload(&default_config(), &config), valid, "jwt.key");
+	}
+}
+
+/// The key conversions refuse an empty key in either shared-secret format.
+///
+/// An empty base64 key decodes to an empty secret, so neither format refuses
+/// one on its own. The rows leave JWT login disabled, since the conversions
+/// must not rely on the config check.
+#[cfg(feature = "jwt_login")]
+#[test]
+fn jwt_key_conversions_refuse_an_empty_key() {
+	for (format, key, valid) in [
+		("HMAC", "", false),
+		("B64HMAC", "", false),
+		("HMAC", "c2VjcmV0", true),
+		("B64HMAC", "c2VjcmV0", true),
+	] {
+		let config = JwtConfig {
+			key: key.to_owned(),
+			format: format.to_owned(),
+			..Default::default()
+		};
+
+		let row = format!("{format} {key:?}");
+
+		assert_verdict(&row, config.decoding_key(), valid, "jwt.key");
+		assert_verdict(&row, config.encoding_key(), valid, "jwt.key");
 	}
 }
 
@@ -1131,30 +1848,66 @@ fn an_out_of_range_sentry_sample_rate_fails_the_config_check() {
 /// "varies by system" and non-literal bodies are out of reach here.
 #[test]
 fn documented_defaults_match_the_code() {
-	const SRC: &str = include_str!("mod.rs");
+	const SOURCES: [&str; 30] = [
+		include_str!("mod.rs"),
+		include_str!("rocksdb.rs"),
+		include_str!("cache.rs"),
+		include_str!("database.rs"),
+		include_str!("runtime.rs"),
+		include_str!("http.rs"),
+		include_str!("network.rs"),
+		include_str!("media.rs"),
+		include_str!("federation.rs"),
+		include_str!("rooms.rs"),
+		include_str!("sending.rs"),
+		include_str!("authentication.rs"),
+		include_str!("directory.rs"),
+		include_str!("encryption.rs"),
+		include_str!("profile.rs"),
+		include_str!("registration.rs"),
+		include_str!("admin.rs"),
+		include_str!("appservice_client.rs"),
+		include_str!("client.rs"),
+		include_str!("compatibility.rs"),
+		include_str!("configuration.rs"),
+		include_str!("logging.rs"),
+		include_str!("presence.rs"),
+		include_str!("push.rs"),
+		include_str!("read_receipts.rs"),
+		include_str!("rendezvous.rs"),
+		include_str!("telemetry.rs"),
+		include_str!("tracing.rs"),
+		include_str!("turn.rs"),
+		include_str!("typing.rs"),
+	];
+
 	const SERDE_DEFAULT: &str = "#[serde(default = \"";
 
-	let lines: Vec<&str> = SRC.lines().collect();
-	let bodies: BTreeMap<&str, &str> = lines
-		.iter()
-		.copied()
-		.filter_map(default_fn_body)
-		.collect();
+	let compared: Vec<(&str, u64, u64)> = SOURCES
+		.into_iter()
+		.flat_map(|source| {
+			let lines: Vec<&str> = source.lines().collect();
+			let bodies: BTreeMap<&str, &str> = SOURCES[0]
+				.lines()
+				.chain(lines.iter().copied())
+				.filter_map(default_fn_body)
+				.collect();
 
-	let compared: Vec<(&str, u64, u64)> = lines
-		.iter()
-		.enumerate()
-		.filter_map(|(at, line)| {
-			let name = line
-				.trim()
-				.strip_prefix(SERDE_DEFAULT)?
-				.split('"')
-				.next()?;
+			source
+				.lines()
+				.enumerate()
+				.filter_map(move |(at, line)| {
+					let name = line
+						.trim()
+						.strip_prefix(SERDE_DEFAULT)?
+						.split('"')
+						.next()?;
 
-			let documented = documented_default(&lines, at)?;
-			let actual = bodies.get(name).copied().and_then(eval_int)?;
+					let documented = documented_default(&lines, at)?;
+					let actual = bodies.get(name).copied().and_then(eval_int)?;
 
-			Some((name, documented, actual))
+					Some((name, documented, actual))
+				})
 		})
 		.collect();
 

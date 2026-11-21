@@ -1,35 +1,44 @@
 //! Reads events and short IDs from a historical room-state snapshot.
 //!
-//! Strict streams preserve snapshot and reverse-mapping errors. The remaining
-//! collection streams are intentionally best effort and omit unresolved entries.
+//! Strict streams preserve snapshot and reverse-mapping errors, and the listings
+//! of one type's state keys with their IDs yield each failure beside the entries
+//! that resolved. The remaining collection streams are intentionally best effort
+//! and omit unresolved entries.
 
 use std::{ops::Deref, sync::Arc};
 
 use futures::{
 	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future::try_join, pin_mut,
+	stream::empty,
 };
 use ruma::{
 	OwnedEventId, UserId,
 	events::{
-		StateEventType, TimelineEventType,
-		room::member::{MembershipState, RoomMemberEventContent},
+		StateEventType,
+		room::{
+			history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
+			member::{MembershipState, RoomMemberEventContent},
+		},
 	},
 };
 use serde::Deserialize;
 use tuwunel_core::{
-	Result, at, err, implement,
-	matrix::{Event, Pdu, StateKey},
-	pair_of,
+	Error, Result, at, err, implement, pair_of,
 	utils::{
 		result::FlatOk,
-		stream::{BroadbandExt, IterStream, ReadyExt, TryBroadbandExt, TryIgnore, TryTools},
+		stream::{
+			BroadbandExt, IterStream, ReadyExt, TryBroadbandExt, TryIgnore, TryReadyExt, TryTools,
+		},
 	},
 };
+use tuwunel_matrix::{Event, Pdu, StateKey};
 
 use crate::rooms::{
 	short::{ShortEventId, ShortStateHash, ShortStateKey},
 	state_compressor::{CompressedState, compress_state_event, parse_compressed_state_event},
 };
+
+type Listing = ((Vec<StateKey>, Vec<ShortEventId>), Vec<Error>);
 
 /// Reports whether a user was joined in a selected state snapshot.
 ///
@@ -38,8 +47,11 @@ use crate::rooms::{
 #[implement(super::Service)]
 #[inline]
 pub async fn user_was_joined(&self, shortstatehash: ShortStateHash, user_id: &UserId) -> bool {
-	self.user_membership(shortstatehash, user_id)
-		.await == MembershipState::Join
+	matches!(
+		self.user_membership(shortstatehash, user_id)
+			.await,
+		MembershipState::Join
+	)
 }
 
 /// Reports whether a user was invited or joined in a selected state snapshot.
@@ -49,10 +61,11 @@ pub async fn user_was_joined(&self, shortstatehash: ShortStateHash, user_id: &Us
 #[implement(super::Service)]
 #[inline]
 pub async fn user_was_invited(&self, shortstatehash: ShortStateHash, user_id: &UserId) -> bool {
-	let s = self
+	let membership = self
 		.user_membership(shortstatehash, user_id)
 		.await;
-	s == MembershipState::Join || s == MembershipState::Invite
+
+	matches!(membership, MembershipState::Join | MembershipState::Invite)
 }
 
 /// Returns a user's membership in a selected state snapshot.
@@ -77,11 +90,8 @@ pub async fn user_membership(
 /// invalid state falls back to [`MembershipState::Leave`].
 #[implement(super::Service)]
 pub async fn user_membership_at_pdu(&self, user_id: &UserId, pdu: &Pdu) -> MembershipState {
-	if pdu.kind() == &TimelineEventType::RoomMember
-		&& pdu.state_key() == Some(user_id.as_str())
-		&& let Ok(content) = pdu.get_content::<RoomMemberEventContent>()
-	{
-		return content.membership;
+	if let Some(membership) = pdu.membership_for(user_id) {
+		return membership;
 	}
 
 	let Ok(shortstatehash) = self
@@ -95,6 +105,19 @@ pub async fn user_membership_at_pdu(&self, user_id: &UserId, pdu: &Pdu) -> Membe
 
 	self.user_membership(shortstatehash, user_id)
 		.await
+}
+
+/// Returns the room's history visibility in a selected state snapshot.
+///
+/// Missing, unreadable, or invalid history-visibility state falls back to
+/// [`HistoryVisibility::Shared`], as the spec directs.
+#[implement(super::Service)]
+pub async fn history_visibility(&self, shortstatehash: ShortStateHash) -> HistoryVisibility {
+	self.state_get_content(shortstatehash, &StateEventType::RoomHistoryVisibility, "")
+		.await
+		.map_or(HistoryVisibility::Shared, |c: RoomHistoryVisibilityEventContent| {
+			c.history_visibility
+		})
 }
 
 /// Deserializes one event's content from a selected state snapshot.
@@ -257,6 +280,7 @@ pub fn state_type_pdus<'a>(
 	event_type: &'a StateEventType,
 ) -> impl Stream<Item = impl Event> + Send + 'a {
 	self.state_keys_with_ids(shortstatehash, event_type)
+		.ready_filter_map(Result::ok)
 		.map(at!(1))
 		.broad_filter_map(async |event_id: OwnedEventId| {
 			self.services
@@ -269,52 +293,61 @@ pub fn state_type_pdus<'a>(
 
 /// Streams state keys and event IDs for one type in a snapshot.
 ///
-/// Snapshot and reverse-mapping failures are skipped. The stream buffers the
-/// selected short IDs before resolving event IDs in a batch.
+/// A failure to load the snapshot or to resolve an entry's short IDs is yielded
+/// as an error beside the entries that resolved. The stream buffers the selected
+/// short IDs before resolving event IDs in a batch, and yields the failures
+/// known before that batch first.
 #[implement(super::Service)]
 pub fn state_keys_with_ids<'a>(
 	&'a self,
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
-) -> impl Stream<Item = (StateKey, OwnedEventId)> + Send + 'a {
+) -> impl Stream<Item = Result<(StateKey, OwnedEventId)>> + Send + 'a {
 	self.state_keys_with_shortids(shortstatehash, event_type)
-		.unzip()
-		.map(|(state_keys, shorteventids): (Vec<_>, Vec<_>)| {
-			self.services
+		.try_unzip_partial()
+		.map(|((state_keys, shorteventids), errors): Listing| {
+			let entries = self
+				.services
 				.short
 				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
 				.zip(state_keys.into_iter().stream())
-				.ready_filter_map(|(eid, sk)| eid.map(move |eid| (sk, eid)).ok())
+				.map(|(event_id, state_key)| event_id.map(|event_id| (state_key, event_id)));
+
+			errors
+				.into_iter()
+				.map(Err)
+				.stream()
+				.chain(entries)
 		})
 		.flatten_stream()
 }
 
 /// Streams state keys and short event IDs for one type in a snapshot.
 ///
-/// Snapshot and short-state-key mapping failures are skipped. The full
+/// A failure to load the snapshot is yielded as an error, as is each entry
+/// whose state key cannot be resolved, since its type is then unknown. The full
 /// compressed snapshot is buffered before filtering by event type.
 #[implement(super::Service)]
 pub fn state_keys_with_shortids<'a>(
 	&'a self,
 	shortstatehash: ShortStateHash,
 	event_type: &'a StateEventType,
-) -> impl Stream<Item = (StateKey, ShortEventId)> + Send + 'a {
+) -> impl Stream<Item = Result<(StateKey, ShortEventId)>> + Send + 'a {
 	self.state_full_shortids(shortstatehash)
-		.ignore_err()
-		.unzip()
-		.map(move |(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
+		.try_unzip()
+		.map_ok(move |(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
 			self.services
 				.short
 				.multi_get_statekey_from_short(shortstatekeys.into_iter().stream())
 				.zip(shorteventids.into_iter().stream())
-				.ready_filter_map(|(res, id)| res.map(|res| (res, id)).ok())
-				.ready_filter_map(move |((event_type_, state_key), event_id)| {
-					event_type_
+				.map(|(key, shorteventid)| key.map(|key| (key, shorteventid)))
+				.ready_try_filter_map(move |((entry_type, state_key), shorteventid)| {
+					Ok(entry_type
 						.eq(event_type)
-						.then_some((state_key, event_id))
+						.then_some((state_key, shorteventid)))
 				})
 		})
-		.flatten_stream()
+		.try_flatten_stream()
 }
 
 /// Streams state keys for one event type in a snapshot.
@@ -363,6 +396,10 @@ pub fn state_added(
 	&self,
 	shortstatehash: pair_of!(ShortStateHash),
 ) -> impl Stream<Item = (ShortStateKey, ShortEventId)> + Send + '_ {
+	if shortstatehash.0 == shortstatehash.1 {
+		return empty().left_stream();
+	}
+
 	let a = self.load_full_state(shortstatehash.0);
 	let b = self.load_full_state(shortstatehash.1);
 	try_join(a, b)
@@ -371,6 +408,7 @@ pub fn state_added(
 		.try_flatten_stream()
 		.ignore_err()
 		.map(parse_compressed_state_event)
+		.right_stream()
 }
 
 /// Streams resolvable keyed events from a state snapshot.
@@ -459,9 +497,25 @@ pub fn state_full_ids_strict(
 	&self,
 	shortstatehash: ShortStateHash,
 ) -> impl Stream<Item = Result<(ShortStateKey, OwnedEventId)>> + Send + '_ {
+	self.state_full_ids_complete(shortstatehash)
+		.map_ok(Vec::into_iter)
+		.map_ok(IterStream::try_stream)
+		.try_flatten_stream()
+}
+
+/// Loads a complete short-state-key to event-ID map for a snapshot.
+///
+/// Snapshot and reverse-mapping failures are returned instead of a partial
+/// map. Pairs keep the snapshot's order; [`Self::state_full_ids_strict`]
+/// streams the same pairs.
+#[implement(super::Service)]
+pub async fn state_full_ids_complete(
+	&self,
+	shortstatehash: ShortStateHash,
+) -> Result<Vec<(ShortStateKey, OwnedEventId)>> {
 	self.state_full_shortids(shortstatehash)
-		.try_unzip::<Vec<_>, Vec<_>>()
-		.and_then(async move |(shortstatekeys, shorteventids)| {
+		.try_unzip()
+		.and_then(async move |(shortstatekeys, shorteventids): (Vec<_>, Vec<_>)| {
 			self.services
 				.short
 				.multi_get_eventid_from_short(shorteventids.into_iter().stream())
@@ -469,12 +523,10 @@ pub fn state_full_ids_strict(
 				.map(|(event_id, shortstatekey)| {
 					event_id.map(|event_id| (shortstatekey, event_id))
 				})
-				.try_collect::<Vec<_>>()
+				.try_collect()
 				.await
 		})
-		.map_ok(Vec::into_iter)
-		.map_ok(IterStream::try_stream)
-		.try_flatten_stream()
+		.await
 }
 
 /// Streams every compressed `(short state key, short event ID)` pair.

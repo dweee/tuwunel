@@ -1,13 +1,14 @@
 use rocksdb::{
 	BlockBasedIndexType, BlockBasedOptions, BlockBasedPinningTier, Cache,
 	DBCompressionType as CompressionType, DataBlockIndexType, FifoCompactOptions,
-	LruCacheOptions, Options, UniversalCompactOptions, UniversalCompactionStopStyle,
+	LruCacheOptions, Options, SliceTransform, UniversalCompactOptions,
+	UniversalCompactionStopStyle,
 };
 use tuwunel_core::{Config, Result, err, utils::math::Expected};
 
 use super::{
 	context::{ColCache, ColCaches, SHARED_POOL},
-	descriptor::{CacheDisp, Descriptor},
+	descriptor::{AccessPattern, CacheDisp, Descriptor},
 };
 use crate::{Context, util::map_err};
 
@@ -29,7 +30,7 @@ fn descriptor_cf_options(
 	cache: Option<&Cache>,
 ) -> Result<Options> {
 	set_compression(&mut desc, config);
-	set_preview_retention(&mut desc, config.url_preview_cache_ttl);
+	set_preview_retention(&mut desc, config.media.url_preview.cache_ttl);
 	set_table_options(&mut opts, &desc, cache)?;
 
 	opts.set_min_write_buffer_number(1);
@@ -76,6 +77,10 @@ fn descriptor_cf_options(
 		);
 	}
 
+	if desc.prefix_size > 0 {
+		opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(desc.prefix_size));
+	}
+
 	opts.set_options_from_string("{{arena_block_size=2097152;}}")
 		.map_err(map_err)?;
 
@@ -111,10 +116,11 @@ fn set_table_options(opts: &mut Options, desc: &Descriptor, cache: Option<&Cache
 		prepopulate,
 	);
 
+	// The options string amends the installed table factory, so install it first.
+	opts.set_block_based_table_factory(&table);
+
 	opts.set_options_from_string(&string)
 		.map_err(map_err)?;
-
-	opts.set_block_based_table_factory(&table);
 
 	Ok(())
 }
@@ -125,7 +131,7 @@ fn set_compression(desc: &mut Descriptor, config: &Config) {
 		return;
 	}
 
-	desc.compression = match config.rocksdb_compression_algo.as_ref() {
+	desc.compression = match config.rocksdb.compression_algo.as_ref() {
 		| "snappy" => CompressionType::Snappy,
 		| "zlib" => CompressionType::Zlib,
 		| "bz2" => CompressionType::Bz2,
@@ -135,22 +141,22 @@ fn set_compression(desc: &mut Descriptor, config: &Config) {
 		| _ => CompressionType::Zstd,
 	};
 
-	let can_override_level = config.rocksdb_compression_level == SENTINEL_COMPRESSION_LEVEL
+	let can_override_level = config.rocksdb.compression_level == SENTINEL_COMPRESSION_LEVEL
 		&& desc.compression == CompressionType::Zstd;
 
 	if !can_override_level {
-		desc.compression_level = config.rocksdb_compression_level;
+		desc.compression_level = config.rocksdb.compression_level;
 	}
 
-	let can_override_bottom = config.rocksdb_bottommost_compression_level
+	let can_override_bottom = config.rocksdb.bottommost_compression_level
 		== SENTINEL_COMPRESSION_LEVEL
 		&& desc.compression == CompressionType::Zstd;
 
 	if !can_override_bottom {
-		desc.bottommost_level = Some(config.rocksdb_bottommost_compression_level);
+		desc.bottommost_level = Some(config.rocksdb.bottommost_compression_level);
 	}
 
-	if !config.rocksdb_bottommost_compression {
+	if !config.rocksdb.bottommost_compression {
 		desc.bottommost_level = None;
 	}
 }
@@ -204,12 +210,21 @@ fn table_options(desc: &Descriptor, has_cache: bool) -> BlockBasedOptions {
 
 	opts.set_partition_filters(true);
 	opts.set_use_delta_encoding(false);
-	opts.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
 
-	opts.set_data_block_index_type(match desc.block_index_hashing {
-		| None if desc.index_size > 512 => DataBlockIndexType::BinaryAndHash,
-		| Some(enable) if enable => DataBlockIndexType::BinaryAndHash,
-		| Some(_) | None => DataBlockIndexType::BinarySearch,
+	opts.set_index_type(match desc.access_pattern {
+		| AccessPattern::ShortScan | AccessPattern::FromScan =>
+			BlockBasedIndexType::TwoLevelIndexSearch,
+		| AccessPattern::RandomScan | AccessPattern::FastScan =>
+			BlockBasedIndexType::BinarySearch,
+		| AccessPattern::PointQuery | AccessPattern::PrefixScan =>
+			BlockBasedIndexType::HashSearch,
+	});
+
+	opts.set_data_block_index_type(match desc.access_pattern {
+		| AccessPattern::PrefixScan | AccessPattern::FromScan | AccessPattern::FastScan =>
+			DataBlockIndexType::BinarySearch,
+		| AccessPattern::PointQuery | AccessPattern::ShortScan | AccessPattern::RandomScan =>
+			DataBlockIndexType::BinaryAndHash,
 	});
 
 	opts
@@ -224,19 +239,19 @@ fn get_cache(ctx: &Context, desc: &Descriptor) -> Option<Cache> {
 	// descriptor's size hints; the lookup by column name is legacy-compat.
 	let config = &ctx.server.config;
 	let cap = match desc.name {
-		| "eventid_pduid" => Some(config.eventid_pdu_cache_capacity),
-		| "eventid_shorteventid" => Some(config.eventidshort_cache_capacity),
-		| "eventid_backoff" => Some(config.eventid_backoff_cache_capacity),
-		| "shorteventid_eventid" => Some(config.shorteventid_cache_capacity),
-		| "shortstatekey_statekey" => Some(config.shortstatekey_cache_capacity),
-		| "statekey_shortstatekey" => Some(config.statekeyshort_cache_capacity),
-		| "servernameevent_data" => Some(config.servernameevent_data_cache_capacity),
+		| "eventid_pduid" => Some(config.cache.eventid_pdu_capacity),
+		| "eventid_shorteventid" => Some(config.cache.eventidshort_capacity),
+		| "eventid_backoff" => Some(config.cache.eventid_backoff_capacity),
+		| "shorteventid_eventid" => Some(config.cache.shorteventid_capacity),
+		| "shortstatekey_statekey" => Some(config.cache.shortstatekey_capacity),
+		| "statekey_shortstatekey" => Some(config.cache.statekeyshort_capacity),
+		| "servernameevent_data" => Some(config.cache.servernameevent_data_capacity),
 		| "servername_destination" | "servername_override" =>
-			Some(config.resolver_cache_capacity),
-		| "servername_status" => Some(config.servername_status_cache_capacity),
-		| "mediaid_lazycontent" => Some(config.mediaid_lazycontent_cache_capacity),
-		| "pduid_pdu" | "eventid_outlierpdu" => Some(config.pdu_cache_capacity),
-		| "authchainkey_authchain" => Some(config.auth_chain_cache_capacity),
+			Some(config.cache.resolver_capacity),
+		| "servername_status" => Some(config.cache.servername_status_capacity),
+		| "mediaid_lazycontent" => Some(config.cache.mediaid_lazycontent_capacity),
+		| "pduid_pdu" | "eventid_outlierpdu" => Some(config.cache.pdu_capacity),
+		| "authchainkey_authchain" => Some(config.cache.auth_chain_capacity),
 		| _ => None,
 	}
 	.map(TryInto::try_into)
@@ -249,7 +264,8 @@ fn get_cache(ctx: &Context, desc: &Descriptor) -> Option<Cache> {
 		.expected_add(desc.val_size_hint.unwrap_or_default());
 
 	let size = match cap {
-		| Some(cap) => cache_size(config, cap, ent_size),
+		// Whole MiB, so reported capacities stay round and divide evenly across the shards.
+		| Some(cap) => cache_size(config, cap, ent_size).next_multiple_of(1 << 20),
 		| _ => desc.cache_size,
 	};
 
@@ -324,10 +340,10 @@ pub(crate) fn cache_size(config: &Config, base_size: u32, entity_size: usize) ->
 	clippy::cast_possible_truncation
 )]
 pub(crate) fn cache_size_f64(config: &Config, base_size: f64, entity_size: usize) -> usize {
-	let ents = base_size * config.cache_capacity_modifier;
+	let ents = base_size * config.cache.capacity_modifier;
 
 	(ents as usize)
 		.checked_mul(entity_size)
-		.ok_or_else(|| err!(Config("cache_capacity_modifier", "Cache size is too large.")))
+		.ok_or_else(|| err!(Config("cache.capacity_modifier", "Cache size is too large.")))
 		.expect("invalid cache size")
 }

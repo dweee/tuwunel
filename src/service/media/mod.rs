@@ -2,6 +2,7 @@ mod data;
 pub(super) mod migrations;
 mod preview;
 mod remote;
+mod space;
 mod tests;
 mod thumbnail;
 #[cfg(feature = "media_thumbnail")]
@@ -27,7 +28,9 @@ use ruma::{
 use tokio::sync::Semaphore;
 use tokio::{fs, sync::Notify};
 use tuwunel_core::{
-	Err, Error, Result, debug, debug_error, debug_info, debug_warn, err, trace,
+	Err, Error, Result,
+	config::Media as MediaConfig,
+	debug, debug_error, debug_info, debug_warn, err, implement, trace,
 	utils::{
 		self, BoolExt, MutexMap,
 		result::LogDebugErr,
@@ -131,12 +134,11 @@ const REDIRECT_TTL: Duration = Duration::from_mins(5);
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		#[cfg(feature = "media_thumbnail")]
-		let animated_thumbnail_slots = Arc::new(Semaphore::new(
-			args.server
-				.config
-				.media_thumbnail_animated_concurrency
-				.max(1),
-		));
+		let media = &args.server.config.media;
+
+		#[cfg(feature = "media_thumbnail")]
+		let animated_thumbnail_slots =
+			Arc::new(Semaphore::new(media.thumbnail.animated_concurrency.max(1)));
 
 		let service = Arc::new(Self {
 			db: Data::new(args.db),
@@ -152,12 +154,7 @@ impl crate::Service for Service {
 			#[cfg(feature = "media_thumbnail")]
 			animated_thumbnail_slots,
 			#[cfg(feature = "media_thumbnail")]
-			video_thumbnail_slots: Semaphore::new(
-				args.server
-					.config
-					.media_video_thumbnail_concurrency
-					.max(1),
-			),
+			video_thumbnail_slots: Semaphore::new(media.video_thumbnail.concurrency.max(1)),
 		});
 
 		#[cfg(feature = "media_thumbnail")]
@@ -171,6 +168,11 @@ impl crate::Service for Service {
 
 impl Service {
 	/// Create a pending media upload ID.
+	///
+	/// The ID is refused past the user's create rate or pending-upload cap, or
+	/// while storage is short of space, and expires unused at
+	/// `unused_expires_at`. The space check runs after the create rate is
+	/// charged, so a client retrying a refusal is still rate limited.
 	#[tracing::instrument(level = "debug", skip(self))]
 	pub async fn create_pending(
 		&self,
@@ -181,8 +183,8 @@ impl Service {
 		let config = &self.services.server.config;
 
 		// Rate limiting (rc_media_create)
-		let rate = f64::from(config.media_rc_create_per_second);
-		let burst = f64::from(config.media_rc_create_burst_count);
+		let rate = f64::from(config.media.rc_create_per_second);
+		let burst = f64::from(config.media.rc_create_burst_count);
 
 		// Check rate limiting
 		if rate > 0.0 && burst > 0.0 {
@@ -210,7 +212,9 @@ impl Service {
 			}
 		}
 
-		let max_uploads = config.max_pending_media_uploads;
+		self.check_upload_space().await?;
+
+		let max_uploads = config.media.max_pending_uploads;
 		let (current_uploads, earliest_expiration) =
 			self.db.count_pending_mxc_for_user(user).await;
 
@@ -522,7 +526,12 @@ impl Service {
 					return Err!(Request(NotFound("Media not found.")));
 				};
 
-				let limit = self.services.config.url_preview_max_media_size;
+				let limit = self
+					.services
+					.config
+					.media
+					.url_preview
+					.max_media_size;
 
 				self.location_request(Fetch::Preview(Agent::Media), &url, limit)
 					.await?
@@ -571,7 +580,7 @@ impl Service {
 		dim: &Dim,
 		animate: Animate,
 	) -> Result<Option<Url>> {
-		if !self.services.config.media_allow_redirect {
+		if !self.services.config.media.allow_redirect {
 			return Ok(None);
 		}
 
@@ -618,9 +627,9 @@ impl Service {
 		filename: Option<&str>,
 	) -> Result<Option<Url>> {
 		let config = &self.services.config;
-		if !config.media_allow_redirect
-			|| config.media_deny_framing
-			|| config.media_deny_inline_styles
+		if !config.media.allow_redirect
+			|| config.media.deny_framing
+			|| config.media.deny_inline_styles
 		{
 			return Ok(None);
 		}
@@ -920,7 +929,7 @@ impl Service {
 						},
 					}
 				})
-				.boxed()
+				.boxed() // Unpin for next
 				.next()
 				.await
 			{
@@ -1010,14 +1019,8 @@ impl Service {
 		content_type: Option<&str>,
 	) -> Result {
 		let attributes = download_attributes(content_disposition, content_type, None);
-		self.storage_providers()
+		self.upload_providers()
 			.try_stream()
-			.ready_try_filter(|provider| {
-				let store_media_on_providers = &self.services.config.store_media_on_providers;
-
-				store_media_on_providers.is_empty()
-					|| store_media_on_providers.contains(&provider.name)
-			})
 			.and_then(async |provider| {
 				let path = self.get_media_name_sha256(key);
 				debug!(
@@ -1044,21 +1047,6 @@ impl Service {
 			.inspect_ok(|&uploads| assert!(uploads > 0, "Successfully saved to nowhere."))
 			.map_ok(|_| ())
 			.await
-	}
-
-	fn storage_providers(&self) -> impl Iterator<Item = &Arc<Provider>> + Send + '_ {
-		let explicit_providers = &self.services.config.media_storage_providers;
-
-		let or_all_providers = explicit_providers
-			.is_empty()
-			.then(|| self.services.storage.providers())
-			.into_iter()
-			.flatten();
-
-		explicit_providers
-			.iter()
-			.filter_map(|id| self.services.storage.provider(id).ok())
-			.chain(or_all_providers)
 	}
 
 	#[inline]
@@ -1104,6 +1092,42 @@ impl Service {
 			.database_path
 			.join("media")
 	}
+}
+
+/// Storage providers media is read from.
+///
+/// An empty `media.storage_providers` selects every built provider.
+#[implement(Service)]
+#[inline]
+fn storage_providers(&self) -> impl Iterator<Item = &Arc<Provider>> + Send + '_ {
+	self.selected_providers(MediaConfig::reads_from)
+}
+
+/// Storage providers a new media file is written to.
+///
+/// An empty `media.store_on_providers` selects every media provider.
+#[implement(Service)]
+#[inline]
+fn upload_providers(&self) -> impl Iterator<Item = &Arc<Provider>> + Send + '_ {
+	self.selected_providers(MediaConfig::writes_to)
+}
+
+/// Built storage providers that `select` accepts under the live media
+/// settings.
+///
+/// One snapshot of the config judges every provider, so a reload while the
+/// consumer awaits cannot change the selection midway through.
+#[implement(Service)]
+fn selected_providers(
+	&self,
+	select: fn(&MediaConfig, &str) -> bool,
+) -> impl Iterator<Item = &Arc<Provider>> + Send + '_ {
+	let config = Arc::clone(&self.services.server.config);
+
+	self.services
+		.storage
+		.providers()
+		.filter(move |provider| select(&config.media, &provider.name))
 }
 
 #[inline]

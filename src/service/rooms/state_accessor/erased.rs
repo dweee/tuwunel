@@ -11,12 +11,12 @@ use ruma::{
 };
 use tuwunel_core::{
 	implement,
-	matrix::{Event, Pdu},
 	utils::{
 		BoolExt,
 		result::{FlatOk, LogErr},
 	},
 };
+use tuwunel_matrix::{Event, Pdu};
 
 /// Applies MSC4025 pruning to an event served over federation.
 ///
@@ -32,6 +32,8 @@ pub async fn erased_for_server(
 	if !self
 		.services
 		.config
+		.rooms
+		.redaction
 		.enforce_erasure_over_federation
 	{
 		return pdu;

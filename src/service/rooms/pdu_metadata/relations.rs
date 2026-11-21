@@ -1,24 +1,61 @@
-use futures::{Stream, StreamExt};
+use futures::{
+	Stream, StreamExt, TryFutureExt, TryStreamExt,
+	future::{
+		Either::{Left, Right},
+		ready,
+	},
+};
 use ruma::{
 	EventId, OwnedUserId, UserId,
 	api::Direction,
 	events::{reaction::ReactionEventContent, relation::RelationType},
 };
 use tuwunel_core::{
-	PduId,
+	Result,
 	arrayvec::ArrayVec,
 	implement, is_equal_to,
-	matrix::{Event, Pdu, PduCount, RawPduId, event::RelationTypeEqual},
 	utils::{
-		stream::{ReadyExt, TryIgnore, WidebandExt},
+		result::NotFound,
+		stream::{ReadyExt, TryIgnore, TryReadyExt, TryWidebandExt},
 		u64_from_u8,
 	},
 };
+use tuwunel_database::keyval::Key;
+use tuwunel_matrix::{Event, Pdu, PduCount, PduId, RawPduId, event::RelationTypeEqual};
 
 use super::Service;
-use crate::rooms::short::ShortRoomId;
+use crate::{integrity::undecodable_as, rooms::short::ShortRoomId};
 
 type StartKey = ArrayVec<u8, 16>;
+
+/// One row of a checked relation walk.
+///
+/// It is a related event at its position, or `None` for an index key too short
+/// to hold a position or for a related event whose row does not decode.
+type Checked = Option<(PduCount, Pdu)>;
+
+/// Parameters controlling a relation-row query.
+///
+/// The row limit applies before event loading and filtering.
+pub struct RelationQuery<'a> {
+	/// Numeric room identifier containing the relation rows.
+	pub(crate) shortroomid: ShortRoomId,
+
+	/// Event position targeted by each relation row.
+	pub(crate) target: PduCount,
+
+	/// Optional exclusive cursor for the first relation row.
+	pub(crate) from: Option<PduCount>,
+
+	/// Direction in which relation rows are visited.
+	pub(crate) dir: Direction,
+
+	/// Requesting user, used to filter the unsigned fields private to a sender.
+	pub(crate) user_id: Option<&'a UserId>,
+
+	/// Maximum number of raw relation rows to visit.
+	pub(crate) limit: usize,
+}
 
 #[implement(Service)]
 #[tracing::instrument(skip(self, from, to), level = "debug")]
@@ -124,6 +161,138 @@ pub fn get_relations<'a>(
 	dir: Direction,
 	user_id: Option<&'a UserId>,
 ) -> impl Stream<Item = (PduCount, Pdu)> + Send + '_ {
+	self.try_get_relations(shortroomid, target, from, dir, user_id)
+		.ignore_err()
+}
+
+/// Walks related events in the requested direction, preserving read failures.
+///
+/// Missing children are skipped; other load and transaction-ID errors are yielded.
+#[implement(Service)]
+pub fn try_get_relations<'a>(
+	&'a self,
+	shortroomid: ShortRoomId,
+	target: PduCount,
+	from: Option<PduCount>,
+	dir: Direction,
+	user_id: Option<&'a UserId>,
+) -> impl Stream<Item = Result<(PduCount, Pdu)>> + Send + '_ {
+	self.try_get_relations_limited(RelationQuery {
+		shortroomid,
+		target,
+		from,
+		dir,
+		user_id,
+		limit: usize::MAX,
+	})
+}
+
+/// Walks at most `limit` relation rows, preserving read failures.
+///
+/// The limit counts missing children before event loading and filtering.
+#[implement(Service)]
+pub fn try_get_relations_limited<'a>(
+	&'a self,
+	RelationQuery {
+		shortroomid,
+		target,
+		from,
+		dir,
+		user_id,
+		limit,
+	}: RelationQuery<'a>,
+) -> impl Stream<Item = Result<(PduCount, Pdu)>> + Send + '_ {
+	self.relation_counts(target, from, dir, limit)
+		.wide_and_then(move |count| self.related_pdu(user_id, shortroomid, count))
+		.ready_try_filter_map(Ok)
+}
+
+/// Walks the positions of at most `limit` events related to a target.
+///
+/// `from` is exclusive, and without one the walk starts at the end `dir` leads
+/// away from. A position is yielded whether or not its event is still stored,
+/// so `limit` counts index rows rather than loaded events.
+#[implement(Service)]
+pub fn relation_counts(
+	&self,
+	target: PduCount,
+	from: Option<PduCount>,
+	dir: Direction,
+	limit: usize,
+) -> impl Stream<Item = Result<PduCount>> + Send + '_ {
+	self.relation_keys(target, from, dir)
+		.take(limit)
+		.map_ok(|to_from| u64_from_u8(&to_from[8..16]))
+		.map_ok(PduCount::from_unsigned)
+}
+
+/// Walks every event related to a target, reading each index key fallibly.
+///
+/// It walks as [`Service::try_get_relations_limited`] does from the end `dir`
+/// leads away from, with no limit, except that a key under the target too short
+/// to hold a position comes back as `None` where that walk panics, and so does a
+/// child whose row a release build cannot decode. Missing children are skipped,
+/// and storage errors are yielded.
+#[implement(Service)]
+pub fn try_get_relations_checked(
+	&self,
+	shortroomid: ShortRoomId,
+	target: PduCount,
+	dir: Direction,
+) -> impl Stream<Item = Result<Checked>> + Send + '_ {
+	self.relation_keys(target, None, dir)
+		.map_ok(|to_from| {
+			to_from
+				.get(8..16)
+				.map(u64_from_u8)
+				.map(PduCount::from_unsigned)
+		})
+		.wide_and_then(move |count| match count {
+			| None => Left(ready(Ok(Some(None)))),
+			| Some(count) => Right(
+				self.related_pdu_checked(shortroomid, count)
+					.map_ok(|related| related.map(Some))
+					.or_else(|error| ready(undecodable_as(error, Some(None)))),
+			),
+		})
+		.ready_try_filter_map(Ok)
+}
+
+/// Loads a related event as `related_pdu` does for no user, decoding its row as
+/// a release build does.
+///
+/// A debug build of that function panics on a row holding a further record after
+/// the event's, beyond one trailing separator.
+#[implement(Service)]
+async fn related_pdu_checked(
+	&self,
+	shortroomid: ShortRoomId,
+	count: PduCount,
+) -> Result<Option<(PduCount, Pdu)>> {
+	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
+
+	let pdu = self
+		.services
+		.timeline
+		.get_from_id_checked(&pdu_id)
+		.await
+		.optional()?
+		.map(|pdu: Pdu| (count, pdu.without_private_unless_sender(None)));
+
+	Ok(pdu)
+}
+
+/// Walks the index keys of the events related to a target.
+///
+/// `from` is exclusive, and without one the walk starts at the end `dir` leads
+/// away from. Each key begins with the target's count.
+#[implement(Service)]
+fn relation_keys(
+	&self,
+	target: PduCount,
+	from: Option<PduCount>,
+	dir: Direction,
+) -> impl Stream<Item = Result<Key<'_>>> + Send + '_ {
 	let target = target.to_be_bytes();
 	let from = from
 		.map(|from| from.saturating_inc(dir))
@@ -133,12 +302,8 @@ pub fn get_relations<'a>(
 		})
 		.to_be_bytes();
 
-	let mut buf = StartKey::new();
-	let start = {
-		buf.extend(target);
-		buf.extend(from);
-		buf.as_slice()
-	};
+	let start: StartKey = target.into_iter().chain(from).collect();
+	let start = start.as_slice();
 
 	match dir {
 		| Direction::Backward => self
@@ -153,23 +318,25 @@ pub fn get_relations<'a>(
 			.raw_keys_from(start)
 			.right_stream(),
 	}
-	.ignore_err()
-	.ready_take_while(move |key| key.starts_with(&target))
-	.map(|to_from| u64_from_u8(&to_from[8..16]))
-	.map(PduCount::from_unsigned)
-	.map(move |count| (user_id, shortroomid, count))
-	.wide_filter_map(async |(user_id, shortroomid, count)| {
-		let pdu_id: RawPduId = PduId { shortroomid, count }.into();
-		let mut pdu = self
-			.services
-			.timeline
-			.get_pdu_from_id(&pdu_id)
-			.await
-			.ok()?;
+	.ready_try_take_while(move |key| Ok(key.starts_with(&target)))
+}
 
-		pdu.remove_transaction_id_unless_sender(user_id)
-			.ok()?;
+#[implement(Service)]
+async fn related_pdu(
+	&self,
+	user_id: Option<&UserId>,
+	shortroomid: ShortRoomId,
+	count: PduCount,
+) -> Result<Option<(PduCount, Pdu)>> {
+	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
 
-		Some((count, pdu))
-	})
+	let pdu = self
+		.services
+		.timeline
+		.get_pdu_from_id(&pdu_id)
+		.await
+		.optional()?
+		.map(|pdu| (count, pdu.without_private_unless_sender(user_id)));
+
+	Ok(pdu)
 }

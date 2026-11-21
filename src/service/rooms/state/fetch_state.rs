@@ -1,12 +1,10 @@
 use std::collections::HashMap;
 
 use ruma::{OwnedEventId, events::StateEventType};
-use tuwunel_core::{
-	Result, err,
-	matrix::{PduEvent, ShortStateKey, StateKey},
-};
+use tuwunel_core::{Result, err};
+use tuwunel_matrix::{PduEvent, ShortStateKey, StateKey, room::state::resolution::FetchState};
 
-use crate::{Services, rooms::state_res::FetchState};
+use crate::Services;
 
 #[cfg(test)]
 mod tests;

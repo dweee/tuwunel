@@ -5,24 +5,33 @@ use ruma::{
 		StateEventType,
 		room::{
 			member::{MembershipState, RoomMemberEventContent},
-			message::RoomMessageEventContent,
 			power_levels::{RoomPowerLevelsEventContent, UserPowerLevel},
 		},
 	},
 };
 use tuwunel_core::{
-	Err, Result, debug_info, debug_warn, error, implement,
-	matrix::pdu::PduBuilder,
+	Err, Result, debug_info, debug_warn, err, error, implement,
+	result::NotFound,
 	utils::{FutureBoolExt, future::ReadyBoolExt, stream::ReadyExt},
 };
+use tuwunel_matrix::pdu::PduBuilder;
 
+use super::notices::text_markdown;
 use crate::rooms::state::RoomMutexGuard;
 
 /// Invite the user to the tuwunel admin room.
 ///
-/// This is equivalent to granting server admin privileges.
+/// This is equivalent to granting server admin privileges. A local user must
+/// already hold an account, or the grant would wait for whoever registers the
+/// name.
 #[implement(super::Service)]
 pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
+	let is_local = self.services.globals.user_is_local(user_id);
+
+	if is_local && !self.services.users.exists(user_id).await {
+		return Err!(Request(NotFound("User {user_id} does not exist on this server.")));
+	}
+
 	let Ok(room_id) = self.get_admin_room().await else {
 		debug_warn!(
 			"make_user_admin was called without an admin room being available or created"
@@ -93,7 +102,9 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 		.services
 		.server
 		.config
-		.admin_room_tag
+		.admin
+		.room
+		.tag
 		.as_str();
 
 	if !already_granted
@@ -107,16 +118,14 @@ pub async fn make_user_admin(&self, user_id: &UserId) -> Result {
 		error!(?room_id, ?user_id, ?room_tag, "Failed to set tag for admin grant: {e}");
 	}
 
-	if !already_member && self.services.server.config.admin_room_notices {
-		let welcome_message = String::from(
-			"## Thank you for trying out tuwunel!\n\nTuwunel is a continuation of conduwuit which was technically a hard fork of Conduit.\n\nHelpful links:\n> GitHub Repo: https://github.com/matrix-construct/tuwunel\n> Documentation: https://matrix-construct.github.io/tuwunel\n> Report issues: https://github.com/matrix-construct/tuwunel/issues\n\nFor a list of available commands, send the following message in this room: `!admin --help`",
-		);
+	if !already_member && self.services.server.config.admin.room.notices {
+		let welcome_message = "## Thank you for trying out tuwunel!\n\nTuwunel is a continuation of conduwuit which was technically a hard fork of Conduit.\n\nHelpful links:\n> GitHub Repo: https://github.com/matrix-construct/tuwunel\n> Documentation: https://matrix-construct.github.io/tuwunel\n> Report issues: https://github.com/matrix-construct/tuwunel/issues\n\nFor a list of available commands, send the following message in this room: `!admin --help`";
 
 		// Send welcome message
 		self.services
 			.timeline
 			.build_and_append_pdu(
-				PduBuilder::timeline(&RoomMessageEventContent::text_markdown(welcome_message)),
+				PduBuilder::timeline(&text_markdown(welcome_message)),
 				server_user,
 				&room_id,
 				&state_lock,
@@ -280,38 +289,36 @@ async fn invite_new_admin(
 }
 
 /// Demote an admin, removing its rights.
+///
+/// Returns whether there was a grant to revoke. A user holding no invite, knock
+/// or join in the admin room has none, nor does anyone while there is no admin
+/// room, so the demotion is already done and nothing is written. The server
+/// user is refused, since the admin room exists only while the server user
+/// stays joined.
 #[implement(super::Service)]
-pub async fn revoke_admin(&self, user_id: &UserId) -> Result {
+pub async fn revoke_admin(&self, user_id: &UserId) -> Result<bool> {
 	use MembershipState::{Invite, Join, Knock, Leave};
 
-	let Ok(room_id) = self.get_admin_room().await else {
-		return Err!(error!("No admin room available or created."));
+	if user_id == self.services.globals.server_user {
+		return Err!(Request(InvalidParam("The server user's admin rights cannot be revoked.")));
+	}
+
+	let Some(room_id) = self.get_admin_room().await.present()? else {
+		return Ok(false);
 	};
 
 	let state_lock = self.services.state.mutex.lock(&room_id).await;
 
-	let event = match self
+	let Some(event) = self
 		.services
 		.state_accessor
 		.get_member(&room_id, user_id)
 		.await
-	{
-		| Err(e) if e.is_not_found() => return Err!("{user_id} was never an admin."),
-
-		| Err(e) => return Err!(error!(?e, "Failure occurred while attempting revoke.")),
-
-		| Ok(event) if !matches!(event.membership, Invite | Knock | Join) => {
-			return Err!("Cannot revoke {user_id} in membership state {:?}.", event.membership);
-		},
-
-		| Ok(event) => {
-			assert!(
-				matches!(event.membership, Invite | Knock | Join),
-				"Incorrect membership state to remove user."
-			);
-
-			event
-		},
+		.present()
+		.map_err(|e| err!(error!(?e, "Failure occurred while attempting revoke.")))?
+		.filter(|event| matches!(event.membership, Invite | Knock | Join))
+	else {
+		return Ok(false);
 	};
 
 	self.services
@@ -329,7 +336,7 @@ pub async fn revoke_admin(&self, user_id: &UserId) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await
-		.map(|_| ())
+		.map(|_| true)
 }

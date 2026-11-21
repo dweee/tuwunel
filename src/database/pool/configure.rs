@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use tuwunel_core::{
 	Config, Server, at, debug,
@@ -12,9 +15,11 @@ use tuwunel_core::{
 		stream::{AMPLIFICATION_LIMIT, WIDTH_LIMIT},
 		sys::{
 			cgroup_max_tasks,
-			compute::{available_parallelism, cores_available, is_core_available},
+			compute::{
+				CORE_IDS_FROM_OS, available_parallelism, cores_available, is_core_available,
+			},
 			max_threads,
-			storage::{self, MultiDevice},
+			storage::{self, MultiDevice, md_discover},
 		},
 	},
 	warn,
@@ -61,19 +66,19 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 		.log_debug_err()
 		.ok();
 
-	let devices = storage::md_discover(&path);
+	let devices = discover_devices(&path);
 	let topology_detected = devices.md.is_empty().is_false();
 	debug!(?topology_detected, ?device_name, ?devices);
 
 	let default_worker_count = topology_detected
 		.is_false()
-		.then_some(config.db_pool_workers)
+		.then_some(config.database.pool.workers)
 		.map(|workers| workers.saturating_mul(num_cores));
 
 	let total_tags = sum_total_tags(&devices, default_worker_count);
 	let topology = compute_topology(&devices, topology_detected, cores_max);
 	let max_workers =
-		compute_max_workers(&devices, default_worker_count, config.db_pool_max_workers);
+		compute_max_workers(&devices, default_worker_count, config.database.pool.max_workers);
 
 	let chan_limit = expected!(max_workers / num_cores)
 		.saturating_sub(8)
@@ -89,7 +94,7 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 		.iter()
 		.map(|count| {
 			count
-				.saturating_mul(config.db_pool_queue_mult)
+				.saturating_mul(config.database.pool.queue_mult)
 				.min(QUEUE_LIMIT.1)
 		})
 		.collect();
@@ -98,7 +103,7 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 	let total_capacity = queues.iter().sum::<usize>();
 	let num_queues = queues.iter().filter(|&&cap| cap > 0).count();
 
-	if config.stream_width_scale > 0.0 {
+	if config.runtime.stream.width_scale > 0.0 {
 		update_stream_width(server, num_queues, total_workers, total_capacity);
 	}
 
@@ -126,6 +131,17 @@ pub(super) fn configure(server: &Arc<Server>) -> (Vec<usize>, Vec<usize>, Vec<us
 	assert!(!queues.iter().copied().all(is_equal_to!(0)), "positive queue capacity expected");
 
 	(topology, workers, queues)
+}
+
+/// Discovers the storage queues backing `path` when core IDs can be matched
+/// against their CPU lists.
+///
+/// Nominal core IDs would match the wrong CPUs, so the topology then stays
+/// undetected and the pool takes its defaults.
+fn discover_devices(path: &Path) -> MultiDevice {
+	CORE_IDS_FROM_OS
+		.then(|| md_discover(path))
+		.unwrap_or_default()
 }
 
 /// Sum the total number of possible tags. Without hardware detection this
@@ -236,7 +252,9 @@ fn compute_workers(
 				.count();
 
 			let conf_limit = config
-				.db_pool_workers_limit
+				.database
+				.pool
+				.workers_limit
 				.saturating_mul(shares);
 
 			let hard_limit = devices
@@ -361,7 +379,7 @@ fn warn_task_budget(total_workers: usize, num_cores: usize) {
 			?total_workers,
 			?max_tasks,
 			"The database pool may exceed this container's task limit; raise the task limit \
-			 (--pids-limit for docker and podman) or lower db_pool_max_workers."
+			 (--pids-limit for docker and podman) or lower database.pool.max_workers."
 		);
 	}
 }
@@ -377,7 +395,13 @@ fn update_stream_width(
 	assert!(total_workers > 0, "Expected some workers.");
 
 	let config = &server.config;
-	let scale: f64 = config.stream_width_scale.min(100.0).into();
+	let scale: f64 = config
+		.runtime
+		.stream
+		.width_scale
+		.min(100.0)
+		.into();
+
 	let max_width = expected!(total_workers / num_queues);
 
 	let old_width = stream::automatic_width();
@@ -396,7 +420,7 @@ fn update_stream_width(
 		.min(max_width)
 		.clamp(WIDTH_LIMIT.0, WIDTH_LIMIT.1);
 
-	let req_amp = new_scale * config.stream_amplification as f64;
+	let req_amp = new_scale * config.runtime.stream.amplification as f64;
 	let req_amp = usize_from_f64(req_amp * scale)
 		.expect("failed to convert f64 to usize")
 		.next_multiple_of(64)
@@ -405,7 +429,7 @@ fn update_stream_width(
 	let (old_width, new_width) = stream::set_width(req_width);
 	let (old_amp, new_amp) = stream::set_amplification(req_amp);
 	debug!(
-		config_scale = ?config.stream_width_scale,
+		config_scale = ?config.runtime.stream.width_scale,
 		?old_width,
 		?new_scale,
 		?new_width,
@@ -417,7 +441,9 @@ fn update_stream_width(
 
 #[cfg(test)]
 mod tests {
-	use super::constrain_workers;
+	use std::env::current_dir;
+
+	use super::{CORE_IDS_FROM_OS, constrain_workers, discover_devices};
 
 	#[test]
 	fn constrain_respects_the_maximum() {
@@ -430,6 +456,14 @@ mod tests {
 	#[test]
 	fn constrain_floors_populated_groups() {
 		assert_eq!(constrain_workers(vec![8, 0, 8, 8], 2), vec![1, 0, 1, 1]);
+	}
+
+	// Nominal IDs matched to queues 0 -> [2,3] and 1 -> [0,1] under a one-CPU quota give no workers.
+	#[test]
+	fn nominal_core_ids_skip_storage_discovery() {
+		let devices = discover_devices(&current_dir().expect("current directory"));
+
+		assert!(CORE_IDS_FROM_OS || devices.md.is_empty());
 	}
 
 	#[test]

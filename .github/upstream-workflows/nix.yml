@@ -27,7 +27,7 @@ on:
       runner:
         type: string
         description: "Runner mask"
-        default: 'self-hosted'
+        default: 'nix-builder'
       max-parallel:
         type: number
         description: "Limit number of concurrent builds"
@@ -35,10 +35,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: nix-${{github.ref}}
-  cancel-in-progress: false
 
 env:
   # Applies whether Nix came from install-nix-action or was already present on
@@ -54,14 +50,14 @@ jobs:
   discover:
     name: Discover
     if: github.repository == 'matrix-construct/tuwunel'
-    runs-on: ["${{inputs.machine || 'X64'}}", "${{inputs.runner || 'self-hosted'}}"]
+    runs-on: ["${{inputs.machine || 'X64'}}", "${{inputs.runner || 'nix-builder'}}"]
 
     outputs:
       attrs: ${{steps.attrs.outputs.attrs}}
       shells: ${{steps.attrs.outputs.shells}}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{inputs.committish || github.ref}}
           persist-credentials: false
@@ -127,19 +123,20 @@ jobs:
       !failure() && !cancelled()
       && fromJSON(needs.discover.outputs.attrs)[0] != null
 
-    runs-on: ["${{inputs.machine || 'X64'}}", "${{inputs.runner || 'self-hosted'}}"]
+    runs-on: ["${{inputs.machine || 'X64'}}", "${{inputs.runner || 'nix-builder'}}"]
 
-    # Deliberately low. This workflow shares the self-hosted pool with the
+    # Deliberately low. This workflow shares its runners with the
     # release build, which takes priority; publishing the cache is background
     # work and is allowed to take as long as it needs.
     strategy:
       fail-fast: false
-      max-parallel: ${{inputs.max-parallel || 2}}
+      # A dispatched input arrives as a string, which max-parallel rejects.
+      max-parallel: ${{inputs.max-parallel && fromJSON(inputs.max-parallel) || 2}}
       matrix:
         attr: ${{fromJSON(needs.discover.outputs.attrs)}}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{inputs.committish || github.ref}}
           persist-credentials: false
@@ -149,7 +146,7 @@ jobs:
 
       # Installs a post-build hook, so every path realised below is uploaded,
       # build dependencies included, not just the final output.
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: tuwunel
           authToken: ${{secrets.CACHIX_AUTH_TOKEN}}
@@ -178,7 +175,7 @@ jobs:
       && (inputs.devshells == null || fromJSON(inputs.devshells))
       && fromJSON(needs.discover.outputs.shells)[0] != null
 
-    runs-on: ["${{inputs.machine || 'X64'}}", "${{inputs.runner || 'self-hosted'}}"]
+    runs-on: ["${{inputs.machine || 'X64'}}", "${{inputs.runner || 'nix-builder'}}"]
 
     strategy:
       fail-fast: false
@@ -186,7 +183,7 @@ jobs:
         shell: ${{fromJSON(needs.discover.outputs.shells)}}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{inputs.committish || github.ref}}
           persist-credentials: false
@@ -194,7 +191,7 @@ jobs:
       - name: Install Nix
         uses: ./.github/actions/install-nix
 
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: tuwunel
           authToken: ${{secrets.CACHIX_AUTH_TOKEN}}

@@ -37,11 +37,12 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forSystems = inputs.nixpkgs.lib.genAttrs systems;
       unwrappedFor = system: original.packages.${system}.default.override {
-        default_features = false;
-        features = [
-          "brotli_compression" "direct_tls" "element_hacks" "gzip_compression"
-          "media_thumbnail" "release_max_log_level" "systemd" "url_preview"
-          "zstd_compression" "jemalloc" "jemalloc_conf" "io_uring" "ldap"
+        default_features = true;
+        disable_features = [
+          "jemalloc_prof"
+          "jemalloc_stats"
+          "tuwunel_mods"
+          "sentry_telemetry"
         ];
       };
       packageFor = system: import ./nix/package.nix {

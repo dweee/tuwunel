@@ -14,12 +14,14 @@ use tokio::{
 use tuwunel::{Args, Runtime, Server, async_run, async_stop};
 use tuwunel_core::{
 	Err, Result, err,
-	matrix::{Pdu, PduCount, PduId, RawPduId},
 	ruma::{
 		DeviceId, EventId, OwnedEventId, OwnedRoomId, RoomId, UInt, UserId,
-		api::client::push::{
-			Pusher, PusherIds, PusherInit, PusherKind,
-			set_pusher::v3::{PusherAction, Request as SetPusherRequest},
+		api::{
+			client::push::{
+				EmailPusherData, Pusher, PusherIds, PusherInit, PusherKind,
+				set_pusher::v3::{PusherAction, Request as SetPusherRequest},
+			},
+			error::ErrorKind,
 		},
 		device_id,
 		presence::PresenceState,
@@ -28,6 +30,7 @@ use tuwunel_core::{
 	utils::stream::ReadyExt,
 };
 use tuwunel_database::Json;
+use tuwunel_matrix::{Pdu, PduCount, PduId, RawPduId};
 use tuwunel_service::{
 	Services,
 	presence::Ping,
@@ -89,18 +92,12 @@ struct Fixture<'a> {
 fn pusher_notify() -> Result {
 	let db_path = Args::test_database_path("test-pusher-notify");
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
-	args.option
-		.push(format!("database_path={db_path:?}"));
-
-	args.option
-		.push("ip_range_denylist=[]".to_owned());
-	args.option
-		.push("startup_netburst=true".to_owned());
-	args.option
-		.push("suppress_push_when_active=true".to_owned());
-	args.option
-		.push("sender_retry_backoff_limit=1".to_owned());
+	let args = Args::default_test(&["fresh", "cleanup"])
+		.with_database_path(&db_path)
+		.with_option("network.http.ip_range_denylist=[]")
+		.with_option("sending.startup_netburst=true")
+		.with_option("push.suppress_when_active=true")
+		.with_option("sending.retry_backoff_limit=1");
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -602,6 +599,7 @@ async fn run_cases(services: &Services) -> Result {
 	};
 
 	reject_bad_url(&fixture).await?;
+	reject_email_without_smtp(&fixture).await?;
 	full_format_delivery(&fixture).await?;
 	event_id_only_delivery(&fixture).await?;
 	gateway_url_paths(&fixture).await?;
@@ -612,7 +610,8 @@ async fn run_cases(services: &Services) -> Result {
 	account_wide_count_delivery(&fixture, &room_id).await?;
 	badge_count_opt_out(&fixture).await?;
 	badge_delivery_memo(&fixture, &room_id).await?;
-	badge_bypasses_suppression(&fixture).await
+	badge_bypasses_suppression(&fixture).await?;
+	corrupt_count_rows_skipped(&fixture, &room_id).await
 }
 
 fn message_event(room_id: &str, event_id: &str) -> Result<Pdu> {
@@ -666,6 +665,44 @@ async fn reject_bad_url(fixture: &Fixture<'_>) -> Result {
 		.is_err()
 		.then_some(())
 		.ok_or_else(|| err!("set_pusher accepted a non-HTTP(S) pusher URL"))
+}
+
+/// An email pusher is refused while the server has no SMTP transport.
+///
+/// The refusal comes before anything is written, so the address finds no
+/// stored pusher.
+async fn reject_email_without_smtp(fixture: &Fixture<'_>) -> Result {
+	let address = "pushtest@example.com";
+	let action = email_pusher_action(address);
+
+	let refusal = fixture
+		.services
+		.pusher
+		.set_pusher(fixture.user, fixture.device, &action)
+		.await
+		.err()
+		.ok_or_else(|| err!("set_pusher accepted an email pusher without SMTP"))?;
+
+	assert!(
+		matches!(refusal.kind(), ErrorKind::InvalidParam),
+		"email pusher refusal without SMTP: {refusal}"
+	);
+
+	let stored = fixture
+		.services
+		.pusher
+		.get_pusher(fixture.user, address)
+		.await;
+
+	assert!(stored.is_err(), "a refused email pusher was stored");
+
+	Ok(())
+}
+
+fn email_pusher_action(address: &str) -> PusherAction {
+	let ids = PusherIds::new(address.to_owned(), "m.email".to_owned());
+
+	post_action(ids, PusherKind::Email(EmailPusherData::new()))
 }
 
 /// A full-format notification carries the event, sender, content, and device
@@ -1113,6 +1150,38 @@ async fn badge_bypasses_suppression(fixture: &Fixture<'_>) -> Result {
 	Ok(())
 }
 
+/// Rows that do not decode leave the account-wide total at the readable sum.
+///
+/// Runs last, since a corrupt thread row panics any later thread count read in
+/// a debug build. Each row carries a count that would move the total if read.
+async fn corrupt_count_rows_skipped(fixture: &Fixture<'_>, room_id: &RoomId) -> Result {
+	let unread = fixture
+		.services
+		.db
+		.get("userroomid_notificationcount")?;
+
+	let total = || {
+		fixture
+			.services
+			.pusher
+			.global_notification_count(fixture.user)
+	};
+
+	unread.put((fixture.user, room_id), 3_u64);
+	assert_eq!(total().await, 3, "a readable row was not counted");
+
+	unread.put_raw((fixture.user, room_id, "$short"), [1_u8; 7]);
+	assert_eq!(total().await, 3, "a short count moved the total");
+
+	unread.put_raw((fixture.user, room_id, "$long"), [1_u8; 9]);
+	assert_eq!(total().await, 3, "a long count moved the total");
+
+	unread.put((fixture.user, "\u{1}no-sigil"), 11_u64);
+	assert_eq!(total().await, 3, "an unreadable key moved the total");
+
+	Ok(())
+}
+
 /// Registers a pusher for `pushkey` at a fresh stub gateway, drives one
 /// notification, and returns the request path and parsed body the gateway
 /// received. The gateway answers `response_body`.
@@ -1192,9 +1261,15 @@ fn pusher_action(
 	data.data
 		.insert("disable_badge_count".into(), Value::Bool(disable_badge_count));
 
+	let ids = PusherIds::new(pushkey.to_owned(), APP_ID.to_owned());
+
+	post_action(ids, PusherKind::Http(data))
+}
+
+fn post_action(ids: PusherIds, kind: PusherKind) -> PusherAction {
 	let pusher: Pusher = PusherInit {
-		ids: PusherIds::new(pushkey.to_owned(), APP_ID.to_owned()),
-		kind: PusherKind::Http(data),
+		ids,
+		kind,
 		app_display_name: "Tuwunel Test".into(),
 		device_display_name: "Test Device".into(),
 		profile_tag: None,

@@ -76,9 +76,10 @@ inevitably fail on the same error. Only one instance of this is usually run.
 
 `cargo clippy` runs with `--deny warnings` — any lint warning is a build
 failure. Crucially, clippy runs for **every combination** of the build matrix:
-all cargo profiles, all feature sets, stable and nightly toolchains. This
-catches warnings that only manifest under specific feature combinations or with
-a specific compiler, which individual developers rarely exercise locally.
+all cargo profiles, all feature sets, msrv and nightly toolchains, plus one
+cell on the current stable. This catches warnings that only manifest under
+specific feature combinations or with a specific compiler, which individual
+developers rarely exercise locally.
 
 - Bake target: `clippy`
 - Policy: zero warnings permitted across all matrix dimensions
@@ -142,18 +143,20 @@ requests to reduce costs of scaling public contribution.
 
 #### Nix Smoke Test (`nix`)
 
-Verifies that `nix build` still produces a working binary. Beyond the binary,
-the Nix build also runs its own set of tests:
+This job checks that `nix build` produces a working binary. The Nix build
+also runs Cargo unit tests inside the Nix sandbox. Integration tests cannot
+run there. See [Nix tests](../nix.md#tests) for the sandbox limitations.
 
-- Cargo unit and integration tests inside the Nix sandbox
+The build also checks its inputs:
+
 - Requires all dependency Git commits to be reachable from a branch
 - Validates that the SHA256 hash in `flake.nix` matches the current
-  `rust-toolchain.toml` version — this catches MSRV bumps where the flake was
-  not updated
+  `rust-toolchain.toml` version. This catches MSRV bumps where the flake was
+  not updated.
 
-Only runs on `main` and `test` branches with the `stable` toolchain. Pull
-requests skip this test intentionally — it is expensive and rarely fails for
-routine code changes.
+The job runs on branch pushes, `main` and `test` included, when the selected
+matrix includes the `release` profile, the `all` feature set, the `msrv`
+toolchain and the `x86_64-v1-linux-gnu` target. Pull requests skip it.
 
 - Bake target: `smoke-nix`
 - Dockerfile: `docker/Dockerfile.nix`
@@ -219,7 +222,7 @@ Builds the Rust API documentation with `cargo doc`. Runs on `release` profile,
 #### mdBook (`book`)
 
 Builds this documentation site using [mdBook](https://rust-lang.github.io/mdBook/).
-Runs on `release` profile, `stable`, `x86_64-v1`.
+Runs on `release` profile, `msrv`, `x86_64-v1`.
 
 - Bake target: `book`
 - Output: `/book/`

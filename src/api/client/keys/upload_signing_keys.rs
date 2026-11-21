@@ -42,6 +42,19 @@ pub(crate) async fn upload_signing_keys_route(
 ) -> Result<upload_signing_keys::v3::Response> {
 	let sender_user = body.sender_user();
 
+	if body
+		.auth
+		.as_ref()
+		.is_some_and(|auth| auth.session().is_some())
+		&& body.master_key.is_none()
+		&& body.self_signing_key.is_none()
+		&& body.user_signing_key.is_none()
+	{
+		return Err!(Request(MissingParam(
+			"Signing keys are unavailable. Retry with the full request body."
+		)));
+	}
+
 	let keys = validate_keys(Keys {
 		user_id: sender_user,
 		master_key: &body.master_key,
@@ -266,15 +279,15 @@ async fn check_for_new_keys(
 		.map(|()| upload_signing_keys::v3::Response {}))
 }
 
-/// Returns `true` if the user already has a master key matching `new_master`,
-/// `false` if they have no master key. Returns `Err` on mismatch or any other
-/// error.
+/// Returns `true` if the user already has a master key matching
+/// `new_master_key`, `false` if they have no master key. Returns `Err` on
+/// mismatch or any other error.
 async fn master_key_matches(
 	services: &Services,
 	user_id: &UserId,
-	new_master: &Raw<CrossSigningKey>,
+	new_master_key: &Raw<CrossSigningKey>,
 ) -> Result<bool> {
-	let (new_id, new_value) = parse_master_key(user_id, new_master)?;
+	let (new_row_key, new_value) = parse_master_key(user_id, new_master_key)?;
 	let existing = services
 		.users
 		.get_master_key(None, user_id, &|_| true)
@@ -284,8 +297,9 @@ async fn master_key_matches(
 		return Ok(false);
 	}
 
-	let (existing_id, existing_value) = parse_master_key(user_id, &existing?)?;
-	if existing_id != new_id || existing_value != new_value {
+	let (existing_row_key, existing_value) = parse_master_key(user_id, &existing?)?;
+
+	if existing_row_key != new_row_key || existing_value != new_value {
 		return Err!(Request(Forbidden("Tried to change an existing master key, UIA required")));
 	}
 

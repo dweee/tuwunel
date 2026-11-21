@@ -16,21 +16,23 @@ use ruma::{
 };
 use tracing::{Instrument, Span};
 use tuwunel_core::{
-	Result, debug, debug_warn, defer, err, implement,
-	matrix::{
-		Event, PduEvent,
-		pdu::PrevEvents,
-		room_version::{self, from_create_event},
+	Result, debug, debug_warn, defer, err, implement, trace,
+	utils::{
+		math::fetch_add_usize,
+		stream::{BroadbandExt, IterStream, ReadyExt, WidebandExt},
 	},
-	trace,
-	utils::stream::{BroadbandExt, IterStream, ReadyExt, WidebandExt},
+};
+use tuwunel_matrix::{
+	Event, PduEvent,
+	pdu::PrevEvents,
+	room::state::resolution::{AuthCheckOutcome, auth_check},
+	room_version::{self, from_create_event},
 };
 
 use crate::rooms::{
 	short::{ShortStateHash, ShortStateKey},
 	state::IdMapState,
 	state_compressor::CompressedState,
-	state_res::{AuthCheckOutcome, auth_check},
 };
 
 #[cfg(test)]
@@ -145,10 +147,7 @@ fn add_gate_denials(&self, gate_denials: usize) {
 		return;
 	}
 
-	let gate_denials = gate_denials.try_into().unwrap_or(u64::MAX);
-
-	self.gate_denials
-		.fetch_add(gate_denials, Ordering::Relaxed);
+	fetch_add_usize(&self.gate_denials, gate_denials, Ordering::Relaxed);
 }
 
 #[implement(StateLocalCounters)]
@@ -346,6 +345,7 @@ async fn walk_task(
 		.services
 		.server
 		.config
+		.federation
 		.resolve_state_locally_max;
 
 	let mut walk = Walk::new(
@@ -421,6 +421,7 @@ pub async fn local_state_report(&self, event_id: &EventId) -> Result<LocalBuildR
 		.services
 		.server
 		.config
+		.federation
 		.resolve_state_locally_max;
 
 	let top_prevs = pdu.prev_events().map(ToOwned::to_owned).collect();

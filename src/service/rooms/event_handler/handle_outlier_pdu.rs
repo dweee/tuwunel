@@ -3,14 +3,13 @@ use ruma::{
 	CanonicalJsonObject, EventId, RoomId, RoomVersionId, ServerName, events::TimelineEventType,
 };
 use tuwunel_core::{
-	Err, Result, debug, debug_info, implement,
-	matrix::{Event, PduEvent, event::TypeExt, room_version},
-	trace,
+	Err, Result, debug, debug_info, implement, trace,
 	utils::{ReadyExt, future::TryExtExt, stream::IterStream},
 	warn,
 };
-
-use crate::rooms::state_res::auth_check;
+use tuwunel_matrix::{
+	Event, PduEvent, event::TypeExt, room::state::resolution::auth_check, room_version,
+};
 
 #[implement(super::Service)]
 #[cfg_attr(unabridged, tracing::instrument(

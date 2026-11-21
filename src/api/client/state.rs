@@ -1,8 +1,8 @@
 use axum::extract::State;
-use futures::{FutureExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use ruma::{
-	CanonicalJsonObject, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomAliasId, RoomId,
-	UserId,
+	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedEventId,
+	OwnedRoomAliasId, RoomId, UserId,
 	api::client::state::{
 		get_state_event_for_key::{self, v3::StateEventFormat},
 		get_state_events, send_state_event,
@@ -23,16 +23,16 @@ use ruma::{
 use serde_json::{json, value::to_raw_value};
 use tuwunel_core::{
 	Err, Result, err, is_false,
-	matrix::{
-		Event,
-		pdu::{PduBuilder, PduEvent},
-	},
 	result::NotFound,
-	utils::{BoolExt, stream::TryBroadbandExt},
+	utils::{BoolExt, json::serialized_len, stream::BroadbandExt},
 };
-use tuwunel_service::Services;
+use tuwunel_matrix::{
+	Event,
+	pdu::{PduBuilder, PduEvent},
+};
+use tuwunel_service::{Services, profile::check_member_content};
 
-use crate::{Ruma, RumaResponse, client::with_membership};
+use crate::{Ruma, RumaResponse, with_membership};
 
 /// # `PUT /_matrix/client/*/rooms/{roomId}/state/{eventType}/{stateKey}`
 ///
@@ -61,25 +61,12 @@ pub(crate) async fn send_state_event_for_key_route(
 	})
 }
 
-/// # `PUT /_matrix/client/*/rooms/{roomId}/state/{eventType}`
-///
-/// Sends a state event into the room.
-pub(crate) async fn send_state_event_for_empty_key_route(
-	State(services): State<crate::State>,
-	body: Ruma<send_state_event::v3::Request>,
-) -> Result<RumaResponse<send_state_event::v3::Response>> {
-	send_state_event_for_key_route(State(services), body)
-		.boxed()
-		.await
-		.map(RumaResponse)
-}
-
 /// # `GET /_matrix/client/v3/rooms/{roomid}/state`
 ///
 /// Get all state events for a room.
 ///
-/// - If not joined: Only works if current room history visibility is world
-///   readable
+/// A caller who is not joined reads the state as of their departure if they
+/// left the room, and otherwise only while its history visibility admits them.
 pub(crate) async fn get_state_events_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_state_events::v3::Request>,
@@ -99,16 +86,25 @@ pub(crate) async fn get_state_events_route(
 		.is_encrypted_room(&body.room_id)
 		.await;
 
+	let shortstatehash = services
+		.state_accessor
+		.user_visible_shortstatehash(sender_user, &body.room_id, None)
+		.map(|result| {
+			result?.ok_or_else(|| {
+				err!(Request(Forbidden("You don't have permission to view the room state.")))
+			})
+		})
+		.await?;
+
 	let room_state = services
 		.state_accessor
-		.room_state_full_pdus(&body.room_id)
-		.map_ok(Event::into_pdu)
-		.broad_and_then(async |pdu| {
-			Ok(with_membership(&services, pdu, sender_user, encrypted).await)
-		})
-		.map_ok(Event::into_format)
-		.try_collect()
-		.await?;
+		.state_full_pdus(shortstatehash)
+		.map(Event::into_pdu)
+		.map(|pdu| pdu.without_private_unless_sender(Some(sender_user)))
+		.broad_then(async |pdu| with_membership(&services, pdu, sender_user, encrypted).await)
+		.map(Event::into_format)
+		.collect()
+		.await;
 
 	Ok(get_state_events::v3::Response { room_state })
 }
@@ -116,11 +112,11 @@ pub(crate) async fn get_state_events_route(
 /// # `GET /_matrix/client/v3/rooms/{roomid}/state/{eventType}/{stateKey}`
 ///
 /// Get single state event of a room with the specified state key.
-/// The optional query parameter `?format=event|content` allows returning the
-/// full room state event or just the state event's content (default behaviour)
 ///
-/// - If not joined: Only works if current room history visibility is world
-///   readable
+/// The optional query parameter `?format=event|content` allows returning the
+/// full room state event or just the state event's content (default behaviour).
+/// A caller who is not joined reads the state as of their departure if they
+/// left the room, and otherwise only while its history visibility admits them.
 pub(crate) async fn get_state_events_for_key_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_state_event_for_key::v3::Request>,
@@ -137,17 +133,33 @@ pub(crate) async fn get_state_events_for_key_route(
 		))));
 	}
 
+	let failed = |e| {
+		err!(Request(NotFound(debug_warn!(
+			room_id = ?body.room_id,
+			event_type = ?body.event_type,
+			"Failed to get state event: {e}.",
+		))))
+	};
+
+	let shortstatehash = services
+		.state_accessor
+		.user_visible_shortstatehash(sender_user, &body.room_id, None)
+		.map_err(failed)
+		.map(|result| {
+			result?.ok_or_else(|| {
+				err!(Request(NotFound(debug_warn!(
+					"You don't have permission to view the room state."
+				))))
+			})
+		})
+		.await?;
+
 	let event = services
 		.state_accessor
-		.room_state_get(&body.room_id, &body.event_type, &body.state_key)
-		.await
-		.map_err(|e| {
-			err!(Request(NotFound(debug_warn!(
-				room_id = ?body.room_id,
-				event_type = ?body.event_type,
-				"Failed to get state event: {e}.",
-			))))
-		})?;
+		.state_get(shortstatehash, &body.event_type, &body.state_key)
+		.map_err(failed)
+		.map_ok(|event| event.without_private_unless_sender(Some(sender_user)))
+		.await?;
 
 	let event_or_content = match body.format {
 		| StateEventFormat::Event => json!({
@@ -172,11 +184,11 @@ pub(crate) async fn get_state_events_for_key_route(
 /// # `GET /_matrix/client/v3/rooms/{roomid}/state/{eventType}`
 ///
 /// Get single state event of a room.
-/// The optional query parameter `?format=event|content` allows returning the
-/// full room state event or just the state event's content (default behaviour)
 ///
-/// - If not joined: Only works if current room history visibility is world
-///   readable
+/// The optional query parameter `?format=event|content` allows returning the
+/// full room state event or just the state event's content (default behaviour).
+/// A caller who is not joined reads the state as of their departure if they
+/// left the room, and otherwise only while its history visibility admits them.
 pub(crate) async fn get_state_events_for_empty_key_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_state_event_for_key::v3::Request>,
@@ -196,7 +208,12 @@ async fn send_state_event_for_key_helper(
 	timestamp: Option<MilliSecondsSinceUnixEpoch>,
 ) -> Result<OwnedEventId> {
 	allowed_to_send_state_event(services, sender, room_id, event_type, state_key, json).await?;
+
 	let state_lock = services.state.mutex.lock(room_id).await;
+
+	if *event_type == StateEventType::RoomMember {
+		check_member_content_size(services, sender, room_id, state_key, json).await?;
+	}
 
 	let current = match state_dedup_eligible(event_type, timestamp.as_ref()) {
 		| false => None,
@@ -236,10 +253,69 @@ async fn send_state_event_for_key_helper(
 			room_id,
 			&state_lock,
 		)
-		.boxed()
 		.await?;
 
 	Ok(event_id)
+}
+
+/// Refuses a client's member event that is over the configured budget, or that
+/// newly stores a display name or avatar URL past its limit.
+///
+/// A stored name or avatar the write leaves unchanged is not bounded again, as long
+/// as the whole content fits the byte cap. A missing or unreadable stored event
+/// checks every value, as a first write does.
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn check_member_content_size(
+	services: &Services,
+	sender: &UserId,
+	room_id: &RoomId,
+	state_key: &str,
+	json: &Raw<AnyStateEventContent>,
+) -> Result {
+	let content = json.deserialize_as_unchecked::<CanonicalJsonObject>()?;
+	let max_bytes = services.config.profile.member_event_max_bytes;
+	let length = serialized_len(&content)?;
+
+	// A non-string value is not bounded here; the typed content rejects it.
+	let string_field = |field: &str| {
+		content
+			.get(field)
+			.and_then(CanonicalJsonValue::as_str)
+	};
+
+	let check = |displayname, avatar_url| {
+		check_member_content(max_bytes, length, displayname, avatar_url)
+	};
+
+	if check(string_field("displayname"), string_field("avatar_url")).is_ok() {
+		return Ok(());
+	}
+
+	let stored = services
+		.state_accessor
+		.room_state_get_content::<CanonicalJsonObject>(
+			room_id,
+			&StateEventType::RoomMember,
+			state_key,
+		)
+		.map(Result::ok)
+		.await;
+
+	// The owner re-sending its own stored content stores nothing new.
+	if sender.as_str() == state_key && stored.as_ref() == Some(&content) {
+		return Ok(());
+	}
+
+	let is_new = |field: &str| {
+		stored
+			.as_ref()
+			.and_then(|stored| stored.get(field))
+			.ne(&content.get(field))
+	};
+
+	let changed = |field: &str| string_field(field).filter(|_| is_new(field));
+
+	check(changed("displayname"), changed("avatar_url"))
 }
 
 fn state_dedup_eligible(
@@ -252,7 +328,7 @@ fn state_dedup_eligible(
 /// Whether an incoming state event is a content-identical resend by its own
 /// author.
 ///
-/// The caller's guard returns before `state_res::auth_check` runs, so every
+/// The caller's guard returns before `tuwunel_matrix::room::state::resolution::auth_check` runs, so every
 /// conjunct gating that early return must be a version-invariant fact that can
 /// only suppress a dedup, never permit one. Membership class qualifies; power
 /// levels and per-type rules do not, and wanting an exact status code there is
@@ -273,7 +349,14 @@ fn is_duplicate_state(
 	Ok(current_content == *content)
 }
 
-async fn allowed_to_send_state_event(
+/// Applies the server's policy for sending a state event, before the room
+/// lock.
+///
+/// Refuses what room auth alone would allow but this server forbids: changes
+/// to `m.room.create`, a server ACL that would lock this server out, admin
+/// room exposure, foreign aliases, and membership changes the sender is
+/// barred from.
+pub(crate) async fn allowed_to_send_state_event(
 	services: &Services,
 	sender: &UserId,
 	room_id: &RoomId,
@@ -308,7 +391,8 @@ async fn allowed_to_send_state_event(
 fn validate_encryption(services: &Services) -> Result {
 	services
 		.config
-		.allow_encryption
+		.encryption
+		.allow
 		.then_some(())
 		.ok_or_else(|| err!(Request(Forbidden("Encryption is disabled on this homeserver."))))
 }
@@ -489,6 +573,13 @@ async fn validate_member(
 		&& (membership_content.membership != MembershipState::Leave || target_user != sender)
 	{
 		return Err!(Request(UserSuspended("Account is suspended.")));
+	}
+
+	if !matches!(membership_content.membership, MembershipState::Leave | MembershipState::Ban)
+		&& services.metadata.is_banned(room_id).await
+		&& !services.admin.user_is_admin(sender).await
+	{
+		return Err!(Request(Forbidden("This room is banned on this homeserver.")));
 	}
 
 	if membership_content.membership == MembershipState::Invite

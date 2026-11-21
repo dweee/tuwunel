@@ -12,7 +12,7 @@ use crate::admin_command_dispatch;
 #[derive(Debug, Subcommand)]
 /// Query sync service state
 pub(crate) enum SyncCommand {
-	/// List sliding-sync connections.
+	/// List the loaded sliding-sync connections.
 	ListConnections,
 
 	/// Show details of sliding sync connection by ID.
@@ -23,6 +23,9 @@ pub(crate) enum SyncCommand {
 	},
 
 	/// Drop connections for a user, device, or all.
+	///
+	/// Only loaded connections are dropped, and each affected client starts over
+	/// with an initial sync, even one with a request in flight.
 	DropConnections {
 		user_id: Option<OwnedUserId>,
 		device_id: Option<OwnedDeviceId>,

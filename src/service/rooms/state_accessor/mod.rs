@@ -3,6 +3,7 @@
 //! The service resolves current and historical state into typed events. It also
 //! centralizes visibility, redaction, erasure, invite, and tombstone decisions.
 
+mod checked;
 mod erased;
 mod room_state;
 mod server_can;
@@ -23,7 +24,7 @@ use ruma::{
 			create::RoomCreateEventContent,
 			encryption::RoomEncryptionEventContent,
 			guest_access::{GuestAccess, RoomGuestAccessEventContent},
-			history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
+			history_visibility::HistoryVisibility,
 			join_rules::{JoinRule, RoomJoinRulesEventContent},
 			member::RoomMemberEventContent,
 			name::RoomNameEventContent,
@@ -35,11 +36,13 @@ use ruma::{
 };
 use tuwunel_core::{
 	Result, err, implement,
-	matrix::{Pdu, room_version},
-	utils::BoolExt,
+	utils::{BoolExt, OptionExt},
+};
+use tuwunel_matrix::{
+	Event, Pdu, room::state::resolution::events::RoomCreateEvent, room_version,
 };
 
-use crate::rooms::state_res::events::RoomCreateEvent;
+use crate::rooms::{state_compressor::CompressedState, timeline::Mapped};
 
 /// Resolves room state and answers state-based authorization questions.
 ///
@@ -131,12 +134,22 @@ impl Service {
 	/// Missing, unreadable, or invalid history-visibility state is treated as not
 	/// world-readable.
 	pub async fn is_world_readable(&self, room_id: &RoomId) -> bool {
-		self.room_state_get_content(room_id, &StateEventType::RoomHistoryVisibility, "")
+		self.get_history_visibility(room_id).await == HistoryVisibility::WorldReadable
+	}
+
+	/// Returns the room's current history visibility.
+	///
+	/// Falls back to [`HistoryVisibility::Shared`] when the room has no current
+	/// state or its history-visibility state is missing, unreadable, or invalid.
+	pub async fn get_history_visibility(&self, room_id: &RoomId) -> HistoryVisibility {
+		self.services
+			.state
+			.get_room_shortstatehash(room_id)
 			.await
-			.map(|c: RoomHistoryVisibilityEventContent| {
-				c.history_visibility == HistoryVisibility::WorldReadable
-			})
-			.unwrap_or(false)
+			.ok()
+			.map_async(|shortstatehash| self.history_visibility(shortstatehash))
+			.await
+			.unwrap_or(HistoryVisibility::Shared)
 	}
 
 	/// Reports whether guest users may join the room.
@@ -220,6 +233,41 @@ impl Service {
 		self.room_state_get(room_id, &StateEventType::RoomEncryption, "")
 			.await
 			.is_ok()
+	}
+}
+
+/// Returns a user's membership content in a room's current state, as
+/// [`Service::get_member`] does, given that state rebuilt by
+/// `room_state_checked`.
+///
+/// Every outcome is the one that function gives, except that damage from the
+/// member's short ids to the event's timeline mapping is `Mapped::Damaged` where
+/// that function panics, fails or reads a prefix, and a failed read keeps its own
+/// error. Integrity checks read members through here, rebuilding a room's state
+/// once for all of its members.
+#[implement(Service)]
+pub(crate) async fn get_member_checked(
+	&self,
+	state: &CompressedState,
+	user_id: &UserId,
+) -> Result<Mapped<RoomMemberEventContent>> {
+	let event_id = self
+		.state_get_id_checked(state, &StateEventType::RoomMember, user_id.as_str())
+		.await?;
+
+	let Mapped::Event(event_id) = event_id else {
+		return Ok(Mapped::Damaged);
+	};
+
+	let member: Mapped<Pdu> = self
+		.services
+		.timeline
+		.get_checked(&event_id)
+		.await?;
+
+	match member {
+		| Mapped::Event(member) => member.get_content().map(Mapped::Event),
+		| Mapped::Damaged => Ok(Mapped::Damaged),
 	}
 }
 

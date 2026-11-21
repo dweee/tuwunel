@@ -11,7 +11,7 @@
 /// The module also owns backend construction and startup connectivity checks.
 pub mod provider;
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use derive_more::Debug;
@@ -22,11 +22,10 @@ use futures::TryStreamExt;
 /// object-store dependency path. Their behavior is supplied by the selected
 /// storage backend.
 pub use object_store::{CopyMode, GetResult, GetResultPayload, PutPayload, PutResult};
+#[cfg(not(all(feature = "gcs_storage", feature = "s3_storage")))]
+use tuwunel_core::Err;
 use tuwunel_core::{
-	Result, at,
-	config::{StorageProvider, StorageProviderLocal},
-	err, implement,
-	utils::{BoolExt, stream::IterStream},
+	Result, at, config::StorageProvider, err, implement, utils::stream::IterStream,
 };
 
 /// A configured object-storage provider.
@@ -76,40 +75,25 @@ impl crate::Service for Service {
 	skip_all,
 )]
 fn build_providers(args: &crate::Args<'_>) -> Result<Providers> {
-	let default_media_provider = args
-		.server
-		.config
-		.storage_provider
-		.contains_key("media")
-		.is_false()
-		.then(|| {
-			let db_path = args.server.config.database_path.clone();
-			let provider = StorageProviderLocal {
-				create_if_missing: true,
-				base_path: [db_path, "media".into()]
-					.into_iter()
-					.collect::<PathBuf>()
-					.to_string_lossy()
-					.into(),
-
-				..Default::default()
-			};
-
-			("media".into(), StorageProvider::local(provider))
-		});
-
 	args.server
 		.config
-		.storage_provider
-		.iter()
-		.chain(
-			default_media_provider
-				.iter()
-				.map(|(name, conf)| (name, conf)),
-		)
-		.filter_map(|(name, conf)| match conf {
+		.storage_provider_sections()
+		.filter_map(|(name, conf)| match conf.as_ref() {
 			| StorageProvider::local(conf) => provider::local::new(args, name, conf).transpose(),
+			#[cfg(feature = "s3_storage")]
 			| StorageProvider::s3(conf) => provider::s3::new(args, name, conf).transpose(),
+			#[cfg(feature = "gcs_storage")]
+			| StorageProvider::gcs(conf) => provider::gcs::new(args, name, conf).transpose(),
+			#[cfg(not(feature = "s3_storage"))]
+			| StorageProvider::s3(conf) if conf.is_enabled() => Some(Err!(Config(
+				"storage_provider",
+				"tuwunel was not built with S3 support (\"s3_storage\") for provider {name:?}"
+			))),
+			#[cfg(not(feature = "gcs_storage"))]
+			| StorageProvider::gcs(conf) if conf.is_enabled() => Some(Err!(Config(
+				"storage_provider",
+				"tuwunel was not built with GCS support (\"gcs_storage\") for provider {name:?}"
+			))),
 			| _ => None,
 		})
 		.collect::<Result<_>>()

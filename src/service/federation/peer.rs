@@ -5,7 +5,7 @@
 //! the classification and exact failure time. A scan derives the latest
 //! anchor and surviving bucket span before applying the retry curve. Successful
 //! outbound or inbound contact clears the server prefix. The bucket width
-//! comes from `sender_timeout`, keeping this gate aligned with sender backoff.
+//! comes from `sending.timeout`, keeping this gate aligned with sender backoff.
 
 use std::{
 	collections::BTreeMap,
@@ -452,6 +452,15 @@ pub(super) fn failure_secs(bytes: &[u8]) -> Option<u64> {
 		.and_then(|tail| tail.try_into().ok())
 		.map(u64::from_be_bytes)
 }
+
+/// Whether a failed federation attempt is a content rejection from a reachable
+/// peer, the one failure of a sent request the peer-reachability store does not
+/// record.
+///
+/// A caller that retries the same request cannot learn of such a rejection
+/// from peer backoff and has to report it itself.
+#[must_use]
+pub fn is_content_rejection(error: &Error) -> bool { classify_error(error).is_none() }
 
 /// Classifies a failed federation attempt for the peer-reachability store.
 ///

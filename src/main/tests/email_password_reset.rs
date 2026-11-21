@@ -1,4 +1,6 @@
 #![cfg(test)]
+#![cfg(feature = "email")]
+#![cfg(feature = "jwt_login")]
 
 use fixture::run as run_fixture;
 use tuwunel_core::{
@@ -12,6 +14,7 @@ mod fixture;
 mod http;
 #[path = "email_password_reset/scenarios.rs"]
 mod scenarios;
+mod smtp;
 
 #[derive(Deserialize, Serialize)]
 #[serde(crate = "tuwunel_core::ruma::exports::serde")]
@@ -22,6 +25,7 @@ struct RestartState {
 	a_password_hash: String,
 	b_password_hash: String,
 	masked: (u16, String),
+	deactivated_sid: String,
 }
 
 #[derive(Clone, Copy)]

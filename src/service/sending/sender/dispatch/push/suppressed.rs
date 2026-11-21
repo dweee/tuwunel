@@ -4,15 +4,14 @@ use ruma::{
 	push::Ruleset,
 };
 use tuwunel_core::{
-	Event, debug, extract_variant, implement,
-	matrix::Pdu,
-	trace,
+	debug, extract_variant, implement, trace,
 	utils::{
 		IterStream, ReadyExt,
 		stream::{BroadbandExt, WidebandExt},
 	},
 	warn,
 };
+use tuwunel_matrix::{Event, Pdu};
 
 use super::PUSH_WIDTH;
 use crate::{
@@ -294,12 +293,12 @@ async fn suppressable_pdu(&self, user_id: &UserId, pdu_id: &RawPduId) -> Option<
 /// Decide whether pushes for a user are suppressed as active.
 ///
 /// The heuristic combines the presence age and the most recent sync gap, and
-/// only applies when `suppress_push_when_active` is enabled. An offline user
+/// only applies when `push.suppress_when_active` is enabled. An offline user
 /// is never suppressed; the two `ACTIVE_*` constants are the thresholds.
 #[implement(Service)]
 pub(super) async fn pushing_suppressed(&self, user_id: &UserId) -> bool {
-	if !self.services.config.suppress_push_when_active {
-		debug!(?user_id, "push not suppressed: suppress_push_when_active disabled");
+	if !self.services.config.push.suppress_when_active {
+		debug!(?user_id, "push not suppressed: push.suppress_when_active disabled");
 		return false;
 	}
 

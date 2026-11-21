@@ -3,8 +3,12 @@ mod namespace_regex;
 mod ping;
 mod registration_info;
 pub(crate) mod request;
+#[cfg(test)]
+mod tests;
 mod thirdparty;
 
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::{
 	collections::BTreeMap,
 	ffi::OsStr,
@@ -14,15 +18,32 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, TryStreamExt};
+use reqwest::Client;
 use ruma::{RoomAliasId, RoomId, UserId, api::appservice::Registration};
+use serde_yaml::{from_slice as from_yaml, to_string as to_yaml};
 use tokio::sync::{RwLock, RwLockReadGuard, SetOnce};
-use tuwunel_core::{Err, Result, defer, err, utils::stream::IterStream};
+#[cfg(unix)]
+use tuwunel_core::smallstr::SmallString;
+use tuwunel_core::{
+	Err, Result, defer, err, implement,
+	utils::{BoolExt, stream::IterStream},
+};
 use tuwunel_database::Map;
 
 pub use self::{namespace_regex::NamespaceRegex, registration_info::RegistrationInfo};
+#[cfg(unix)]
+use crate::client::make_appservice_unix;
+
+#[cfg(unix)]
+type SocketPath = SmallString<[u8; 64]>;
 
 pub struct Service {
 	registration_info: RwLock<Registrations>,
+	/// Live client pools indexed by socket path.
+	///
+	/// Entries persist for the service lifetime, including after unregistration.
+	#[cfg(unix)]
+	unix_clients: Mutex<BTreeMap<SocketPath, Client>>,
 	loaded: SetOnce<()>,
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
@@ -39,6 +60,8 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			registration_info: RwLock::new(BTreeMap::new()),
+			#[cfg(unix)]
+			unix_clients: Mutex::default(),
 			loaded: SetOnce::new(),
 			services: args.services.clone(),
 			db: Data {
@@ -98,7 +121,7 @@ impl Service {
 				}
 
 				let bytes = fs::read(path)?;
-				let registration: Registration = serde_yaml::from_slice(&bytes)?;
+				let registration: Registration = from_yaml(&bytes)?;
 
 				self.load_appservice(registration).await?;
 			}
@@ -111,56 +134,66 @@ impl Service {
 		Ok(())
 	}
 
+	/// Loads one registration into the runtime registry at startup.
+	///
+	/// An id already loaded is refused, as is an `as_token` another id holds,
+	/// and a missing sender user is created.
 	pub async fn load_appservice(&self, registration: Registration) -> Result {
-		//TODO: Check for collisions between exclusive appservice namespaces
-
 		let registration_info =
 			RegistrationInfo::new(registration, self.services.globals.server_name())?;
 
-		let id = &registration_info.registration.id;
-
 		let mut registrations = self.registration_info.write().await;
 
-		for loaded_registration_info in registrations.values() {
-			let loaded_id = &loaded_registration_info.registration.id;
+		let id = &registration_info.registration.id;
 
-			if loaded_id == id {
-				return Err!("Duplicate id: {id}");
-			}
-
-			if loaded_registration_info.registration.as_token
-				== registration_info.registration.as_token
-			{
-				return Err!("Duplicate as_token: {loaded_id} {id}");
-			}
+		if registrations.contains_key(id) {
+			return Err!("Duplicate id: {id}");
 		}
 
-		let appservice_user = &registration_info.sender;
-
-		if !self.services.users.exists(appservice_user).await {
-			self.services
-				.users
-				.create(appservice_user, None, None)
-				.await?;
-		}
+		self.admit_registration(&registrations, &registration_info)
+			.await?;
 
 		registrations.insert(id.clone(), registration_info);
 
 		Ok(())
 	}
 
+	/// Registers an appservice and persists it for later startups.
+	///
+	/// An id this method registered before is replaced, and its cached room
+	/// participation is dropped. An id loaded from the configuration or
+	/// `appservice_dir` is refused, since both would load at the next startup
+	/// and collide.
 	pub async fn register_appservice(&self, registration: Registration) -> Result {
 		self.loaded().await;
 
 		let id = registration.id.clone();
 
-		let appservice_yaml = serde_yaml::to_string(&registration)?;
+		let yaml = to_yaml(&registration)?;
 
-		self.load_appservice(registration).await?;
+		let registration_info =
+			RegistrationInfo::new(registration, self.services.globals.server_name())?;
+
+		let mut registrations = self.registration_info.write().await;
+
+		if registrations.contains_key(&id) && self.is_persisted(&id).await.is_false() {
+			return Err!("Cannot replace config appservice {id}");
+		}
+
+		self.admit_registration(&registrations, &registration_info)
+			.await?;
 
 		self.db
 			.id_appserviceregistrations
-			.insert(&id, appservice_yaml);
+			.insert(&id, yaml);
+
+		// Room participation lookups run under a registry read guard, so none
+		// built on the replaced registration outlives this write guard.
+		self.services
+			.state_cache
+			.clear_appservice_in_room_cache_for(&id);
+
+		registrations.insert(id, registration_info);
 
 		Ok(())
 	}
@@ -174,13 +207,7 @@ impl Service {
 			return Err!("Appservice not found");
 		}
 
-		if self
-			.db
-			.id_appserviceregistrations
-			.exists(appservice_id)
-			.await
-			.is_err()
-		{
+		if self.is_persisted(appservice_id).await.is_false() {
 			return Err!("Cannot unregister config appservice");
 		}
 
@@ -284,7 +311,7 @@ impl Service {
 			.id_appserviceregistrations
 			.get(id)
 			.await
-			.and_then(|ref bytes| serde_yaml::from_slice(bytes).map_err(Into::into))
+			.and_then(|ref bytes| from_yaml(bytes).map_err(Into::into))
 			.map_err(|e| err!(Database("Invalid appservice {id:?} registration: {e:?}")))
 	}
 
@@ -299,4 +326,96 @@ impl Service {
 	/// will not complete.
 	#[inline]
 	pub async fn loaded(&self) { self.loaded.wait().await; }
+}
+
+/// Refuses an `as_token` another id holds, and creates a missing sender user.
+///
+/// The caller inserts the registration under the same write guard.
+#[implement(Service)]
+async fn admit_registration(
+	&self,
+	registrations: &Registrations,
+	registration_info: &RegistrationInfo,
+) -> Result {
+	//TODO: Check for collisions between exclusive appservice namespaces
+
+	let id = &registration_info.registration.id;
+	let token_holder = registrations
+		.values()
+		.map(|loaded| &loaded.registration)
+		.find(|loaded| {
+			loaded.id != *id && loaded.as_token == registration_info.registration.as_token
+		})
+		.map(|holder| &holder.id);
+
+	if let Some(holder) = token_holder {
+		return Err!("Duplicate as_token: {holder} {id}");
+	}
+
+	let appservice_user = &registration_info.sender;
+
+	if self
+		.services
+		.users
+		.exists(appservice_user)
+		.await
+		.is_false()
+	{
+		self.services
+			.users
+			.create(appservice_user, None, None)
+			.await?;
+	}
+
+	Ok(())
+}
+
+/// Whether `register_appservice` persisted this id, which an id loaded from
+/// the configuration or `appservice_dir` never is.
+#[implement(Service)]
+async fn is_persisted(&self, id: &str) -> bool {
+	self.db
+		.id_appserviceregistrations
+		.exists(id)
+		.await
+		.is_ok()
+}
+
+#[implement(Service)]
+fn transport<'a>(&self, url: &'a str) -> Result<(&'a str, Client)> {
+	match socket_path(url)? {
+		| None => Ok((url, self.services.client.appservice.clone())),
+		#[cfg(not(unix))]
+		| Some(_) => Err!("Unix sockets are not supported on this platform"),
+		#[cfg(unix)]
+		| Some(path) => Ok(("http://localhost", self.unix_client(path)?)),
+	}
+}
+
+#[cfg(unix)]
+#[implement(Service)]
+fn unix_client(&self, path: &str) -> Result<Client> {
+	let mut clients = self.unix_clients.lock().expect("locked");
+
+	match clients.get(path) {
+		| Some(client) => Ok(client.clone()),
+		| None => {
+			let client = make_appservice_unix(&self.services, path)?;
+
+			clients.insert(path.into(), client.clone());
+			Ok(client)
+		},
+	}
+}
+
+fn socket_path(url: &str) -> Result<Option<&str>> {
+	url.split_once(':')
+		.filter(|(scheme, _)| scheme.eq_ignore_ascii_case("unix"))
+		.map(|(_, path)| path.strip_prefix("//").unwrap_or(path))
+		.map(|path| {
+			path.starts_with('/')
+				.then_some(path)
+				.ok_or_else(|| err!("Appservice Unix socket URL must name an absolute path"))
+		})
+		.transpose()
 }

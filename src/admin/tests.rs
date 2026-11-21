@@ -1,8 +1,12 @@
 #![cfg(test)]
 
 use clap::Parser;
+use ruma::room_id;
 
-use crate::{admin::AdminCommand, media::MediaCommand, query::QueryCommand};
+use crate::{
+	admin::AdminCommand, debug::DebugCommand, federation::FederationCommand,
+	integrity::IntegrityCommand, media::MediaCommand, query::QueryCommand,
+};
 
 #[test]
 fn get_help_short() { get_help_inner("-h"); }
@@ -61,6 +65,43 @@ fn delete_range_accepts_one_direction() {
 }
 
 #[test]
+fn federation_incoming_parse() {
+	let command = parse_ok(&["argv[0] doesn't matter", "federation", "incoming-federation"]);
+
+	assert!(
+		matches!(command, AdminCommand::Federation(FederationCommand::IncomingFederation)),
+		"incoming-federation must parse as a federation command"
+	);
+}
+
+#[test]
+fn debug_prev_walk_rooms_parse() {
+	let cases: [(&[&str], _, _); 3] = [
+		(&[], None, 20),
+		(&["--limit", "5"], None, 5),
+		(&["!room:example.org", "-l", "3"], Some(room_id!("!room:example.org")), 3),
+	];
+
+	let command = ["argv[0] doesn't matter", "debug", "prev-walk-rooms"];
+
+	for (args, expected_room, expected_limit) in cases {
+		let argv: Vec<_> = command.iter().chain(args).copied().collect();
+		let AdminCommand::Debug(DebugCommand::PrevWalkRooms { room_id, limit }) = parse_ok(&argv)
+		else {
+			panic!("{argv:?} must parse as a debug prev-walk-rooms command");
+		};
+
+		assert_eq!(room_id.as_deref(), expected_room, "{argv:?} parsed the wrong room");
+		assert_eq!(limit, expected_limit, "{argv:?} parsed the wrong limit");
+	}
+
+	let argv: Vec<_> = command.iter().chain(&["5"]).copied().collect();
+	let error = parse_err(&argv);
+
+	assert!(error.contains("ROOM_ID"), "a bare number must not pass for a limit");
+}
+
+#[test]
 fn query_feds_parse() {
 	for survey in ["version", "state", "head"] {
 		let command =
@@ -104,6 +145,34 @@ fn query_feds_reject_zero_width() {
 	]);
 
 	assert!(error.contains("invalid value '0'"), "a survey width must be nonzero");
+}
+
+#[test]
+fn integrity_repair_parse() {
+	let command = ["argv[0] doesn't matter", "integrity", "repair", "relation-index"];
+
+	for (flag, confirmed) in [(None, false), (Some("--yes-i-know-what-im-doing"), true)] {
+		let argv: Vec<_> = command.iter().copied().chain(flag).collect();
+		let AdminCommand::Integrity(IntegrityCommand::Repair { name, yes_i_know_what_im_doing }) =
+			parse_ok(&argv)
+		else {
+			panic!("{argv:?} must parse as an integrity repair command");
+		};
+
+		assert_eq!(name, "relation-index", "{argv:?} parsed the wrong check");
+		assert_eq!(yes_i_know_what_im_doing, confirmed, "{argv:?} parsed the wrong confirmation");
+	}
+
+	let argv: Vec<_> = command
+		.iter()
+		.copied()
+		.chain(["--yes-i-want-to-do-this"])
+		.collect();
+
+	assert!(
+		parse_err(&argv).contains("unexpected argument"),
+		"only the exact confirmation flag may confirm"
+	);
 }
 
 fn get_help_inner(input: &str) {

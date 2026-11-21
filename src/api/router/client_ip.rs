@@ -1,18 +1,13 @@
-//! Tuwunel's client-IP extractor.
+//! Extracts the client IP address from request metadata.
 //!
-//! Two modes:
-//!
-//! * If the operator configured `ip_source`, a [`ConfiguredIpSource`] marker is
-//!   installed in request extensions and the extractor reads from the chosen
-//!   source. Exception: if the peer shown by `ConnectInfo` is on a loopback
-//!   interface, or sits inside an operator-listed trusted subnet (see
-//!   [`TrustedPeerSubnets`]), the insecure header-scan + `ConnectInfo` fallback
-//!   runs instead, since such peers (e.g. a locally-connected appservice
-//!   bridge, or a containerized bridge on a private Docker network) cannot have
-//!   spoofed the address at the IP layer.
-//! * Otherwise the insecure header-scan + `ConnectInfo` fallback runs directly,
-//!   preserving the prior default behaviour, including the socket-address
-//!   fallback that matters for Unix-socket deployments.
+//! Configuring `http.ip_source` installs [`ConfiguredIpSource`] in request
+//! extensions and selects its address source. Loopback peers and peers in
+//! [`TrustedPeerSubnets`] instead use the insecure header scan and `ConnectInfo`
+//! fallback, because locally connected appservices and containerized bridges on
+//! trusted private networks, including Docker networks, cannot spoof their peer
+//! address at the IP layer.
+//! Without a configured source, that same fallback preserves the default
+//! behavior, including the socket-address fallback needed by UNIX sockets.
 
 use std::{
 	fmt,
@@ -25,18 +20,38 @@ use http::{Extensions, HeaderMap, StatusCode, request::Parts};
 use ipnet::IpNet;
 use tuwunel_core::config::IpSource;
 
-/// Tuwunel client-IP extractor. See module docs.
+/// Resolves the client IP address from request metadata.
+///
+/// Source selection and trusted-peer fallbacks follow the module's policy.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ClientIp(pub(crate) IpAddr);
+pub struct ClientIp(
+	/// Client IP address resolved from the request.
+	pub IpAddr,
+);
 
-/// Marker wrapper around [`IpSource`] placed into request extensions
-/// only when an operator has explicitly configured `ip_source`.
+/// Resolves an address for authentication rate limits.
+///
+/// Uses the configured source without trusted-peer bypasses, or the socket peer
+/// when no source is configured. Header sources require a protected listener and
+/// a proxy that supplies the selected header reliably.
+#[derive(Clone, Copy, Debug)]
+pub struct RateLimitIp(
+	/// Address used to partition authentication attempts.
+	pub IpAddr,
+);
+
+/// Marks the explicitly configured client IP source.
+///
+/// Request extensions contain this wrapper only when an operator has set
+/// `http.ip_source`.
 #[derive(Clone, Copy, Debug)]
 pub struct ConfiguredIpSource(pub IpSource);
 
-/// Operator-configured subnets whose TCP peers bypass the secure
-/// `ip_source` extraction in the same way loopback peers do. Installed
-/// in request extensions only when the configured list is non-empty.
+/// Identifies trusted subnets whose TCP peers bypass secure IP extraction.
+///
+/// Their peers bypass `http.ip_source` in the same way loopback peers do.
+/// Request extensions contain this wrapper only when the configured list is
+/// non-empty.
 #[derive(Clone, Debug)]
 pub struct TrustedPeerSubnets(pub Arc<[IpNet]>);
 
@@ -54,7 +69,7 @@ where
 		{
 			return secure_extract(source, &parts.headers, &parts.extensions)
 				.map(Self)
-				.ok_or((ERROR, "Can't extract client IP from configured ip_source"));
+				.ok_or((ERROR, "Can't extract client IP from configured http.ip_source"));
 		}
 
 		insecure_fallback(&parts.headers, &parts.extensions)
@@ -65,6 +80,28 @@ where
 
 impl fmt::Display for ClientIp {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
+}
+
+impl<S> FromRequestParts<S> for RateLimitIp
+where
+	S: Sync,
+{
+	type Rejection = (StatusCode, &'static str);
+
+	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+		rate_limit_ip(parts).map(Self)
+	}
+}
+
+pub(crate) fn rate_limit_ip(parts: &Parts) -> Result<IpAddr, (StatusCode, &'static str)> {
+	let source = parts
+		.extensions
+		.get()
+		.map(|ConfiguredIpSource(source): &ConfiguredIpSource| *source)
+		.unwrap_or(IpSource::ConnectInfo);
+
+	secure_extract(source, &parts.headers, &parts.extensions)
+		.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Can't extract authentication rate-limit IP"))
 }
 
 fn peer_is_trusted(extensions: &Extensions) -> bool {
@@ -195,16 +232,90 @@ fn cloudfront_viewer_address(headers: &HeaderMap) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-	use std::{iter, net::SocketAddr, sync::Arc};
+	use std::{
+		iter,
+		net::{IpAddr, SocketAddr},
+		sync::Arc,
+	};
 
 	use axum::{
 		extract::{ConnectInfo, FromRequestParts},
 		http::{Request, StatusCode, request::Parts},
 	};
 	use ipnet::IpNet;
-	use tuwunel_core::config::IpSource;
+	use tuwunel_core::config::{IpSource, UNIX_SOCKET_PEER};
 
-	use super::{ClientIp, ConfiguredIpSource, TrustedPeerSubnets};
+	use super::{ClientIp, ConfiguredIpSource, TrustedPeerSubnets, rate_limit_ip};
+
+	#[test]
+	fn rate_limit_default_ignores_forwarded_headers() {
+		let peer: SocketAddr = "203.0.113.9:443".parse().unwrap();
+		let (parts, ()) = Request::builder()
+			.extension(ConnectInfo(peer))
+			.header("X-Forwarded-For", "192.0.2.1")
+			.header("Forwarded", "for=192.0.2.2")
+			.header("X-Real-IP", "192.0.2.3")
+			.body(())
+			.unwrap()
+			.into_parts();
+
+		assert_eq!(rate_limit_ip(&parts).unwrap(), peer.ip());
+	}
+
+	#[test]
+	fn rate_limit_configured_source_has_no_trusted_peer_bypass() {
+		let expected = IpAddr::from([203, 0, 113, 9]);
+
+		for peer in ["127.0.0.1:443", "172.18.0.5:443"] {
+			let peer: SocketAddr = peer.parse().unwrap();
+			let (parts, ()) = Request::builder()
+				.extension(ConnectInfo(peer))
+				.extension(trusted(&["172.18.0.0/16"]))
+				.extension(ConfiguredIpSource(IpSource::RightmostXForwardedFor))
+				.header("X-Forwarded-For", "192.0.2.1, 203.0.113.9")
+				.body(())
+				.unwrap()
+				.into_parts();
+
+			assert_eq!(rate_limit_ip(&parts).unwrap(), expected);
+		}
+	}
+
+	#[test]
+	fn rate_limit_connect_info_ignores_headers_on_loopback() {
+		let peer: SocketAddr = "127.0.0.1:443".parse().unwrap();
+		let (parts, ()) = Request::builder()
+			.extension(ConnectInfo(peer))
+			.extension(ConfiguredIpSource(IpSource::ConnectInfo))
+			.header("X-Forwarded-For", "192.0.2.1")
+			.body(())
+			.unwrap()
+			.into_parts();
+
+		assert_eq!(rate_limit_ip(&parts).unwrap(), peer.ip());
+	}
+
+	#[test]
+	fn rate_limit_missing_address_refuses_fallback() {
+		let headers_only = parts([("X-Forwarded-For", "192.0.2.1")]);
+		let peer: SocketAddr = "127.0.0.1:443".parse().unwrap();
+		let (missing_header, ()) = Request::builder()
+			.extension(ConnectInfo(peer))
+			.extension(ConfiguredIpSource(IpSource::RightmostXForwardedFor))
+			.body(())
+			.unwrap()
+			.into_parts();
+
+		assert_eq!(
+			rate_limit_ip(&headers_only).unwrap_err().0,
+			StatusCode::INTERNAL_SERVER_ERROR
+		);
+
+		assert_eq!(
+			rate_limit_ip(&missing_header).unwrap_err().0,
+			StatusCode::INTERNAL_SERVER_ERROR
+		);
+	}
 
 	fn trusted(nets: &[&str]) -> TrustedPeerSubnets {
 		let nets: Arc<[IpNet]> = nets
@@ -297,7 +408,7 @@ mod tests {
 			.insert(ConfiguredIpSource(IpSource::RightmostXForwardedFor));
 		let err = extract_client_ip(&mut parts).await.unwrap_err();
 		assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-		assert_eq!(err.1, "Can't extract client IP from configured ip_source");
+		assert_eq!(err.1, "Can't extract client IP from configured http.ip_source");
 	}
 
 	#[tokio::test]
@@ -321,6 +432,20 @@ mod tests {
 
 		let ClientIp(ip) = extract_client_ip(&mut parts).await.unwrap();
 		assert_eq!(ip, socket_addr.ip());
+	}
+
+	#[tokio::test]
+	async fn unix_socket_peer_bypasses_configured_source() {
+		let (mut parts, ()) = Request::builder()
+			.extension(ConnectInfo(UNIX_SOCKET_PEER))
+			.extension(ConfiguredIpSource(IpSource::RightmostXForwardedFor))
+			.body(())
+			.unwrap()
+			.into_parts();
+
+		let ClientIp(ip) = extract_client_ip(&mut parts).await.unwrap();
+
+		assert_eq!(ip, UNIX_SOCKET_PEER.ip());
 	}
 
 	#[tokio::test]
@@ -364,7 +489,7 @@ mod tests {
 
 		let err = extract_client_ip(&mut parts).await.unwrap_err();
 		assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-		assert_eq!(err.1, "Can't extract client IP from configured ip_source");
+		assert_eq!(err.1, "Can't extract client IP from configured http.ip_source");
 	}
 
 	#[tokio::test]
@@ -413,7 +538,7 @@ mod tests {
 
 		let err = extract_client_ip(&mut parts).await.unwrap_err();
 		assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-		assert_eq!(err.1, "Can't extract client IP from configured ip_source");
+		assert_eq!(err.1, "Can't extract client IP from configured http.ip_source");
 	}
 
 	#[tokio::test]

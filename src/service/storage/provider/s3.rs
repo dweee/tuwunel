@@ -33,17 +33,26 @@ pub(in super::super) fn new(
 	name: &str,
 	config: &StorageProviderS3,
 ) -> Result<Option<(String, Arc<Provider>)>> {
-	// Fail successfully if this provider is disabled by the configuration..
-	if config.url.is_none() && config.bucket.is_none() {
-		debug!(?name, "s3_provider.bucket not set. This configuration will be skipped");
+	if !config.is_enabled() {
+		debug!(?name, "Neither url nor bucket set. This configuration will be skipped");
 		return Ok(None);
 	}
+
+	let idle_per_host = args
+		.server
+		.config
+		.network
+		.http
+		.idle_per_host
+		.into();
+
+	let idle_timeout = Duration::from_secs(args.server.config.network.http.idle_timeout);
 
 	let mut builder = AmazonS3Builder::from_env().with_client_options(
 		ClientOptions::new()
 			.with_user_agent(user_agent().try_into()?)
-			.with_pool_max_idle_per_host(args.server.config.request_idle_per_host.into())
-			.with_pool_idle_timeout(Duration::from_secs(args.server.config.request_idle_timeout)),
+			.with_pool_max_idle_per_host(idle_per_host)
+			.with_pool_idle_timeout(idle_timeout),
 	);
 
 	if let Some(url) = config.url.clone() {

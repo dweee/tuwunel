@@ -49,7 +49,7 @@ mod tests {
 	/// One of the two client thumbnail surfaces.
 	///
 	/// The legacy arm is reachable only where an operator sets
-	/// `allow_legacy_media`, which defaults off, so this test turns it on to
+	/// `media.allow_legacy`, which defaults off, so this test turns it on to
 	/// sweep a surface most deployments no longer expose.
 	#[derive(Clone, Copy)]
 	enum Surface {
@@ -100,22 +100,23 @@ mod tests {
 
 		let db_path = DatabasePath(Args::test_database_path("media-baseline"));
 
+		let args = Args::default_test(&["fresh", "cleanup"])
+			.with_database_path(&db_path.0)
+			.with_loopback_listener(port);
+
 		let args = [
-			format!("database_path={:?}", db_path.0),
-			"address=[\"127.0.0.1\"]".to_owned(),
-			format!("port={port}"),
 			"listening=true".to_owned(),
-			"allow_legacy_media=true".to_owned(),
-			"log=\"error\"".to_owned(),
+			"media.allow_legacy=true".to_owned(),
+			"logging.filter=\"error\"".to_owned(),
 		]
 		.into_iter()
-		.fold(Args::default_test(&["fresh", "cleanup"]), Args::with_option);
+		.fold(args, Args::with_option);
 
 		let runtime = Runtime::new(Some(&args))?;
 		let server = Server::new(Some(&args), Some(&runtime))?;
 
-		assert!(!server.server.config.media_deny_framing);
-		assert!(!server.server.config.media_deny_inline_styles);
+		assert!(!server.server.config.media.deny_framing);
+		assert!(!server.server.config.media.deny_inline_styles);
 
 		let result = runtime.block_on(async {
 			let services = async_start(&server).await?;

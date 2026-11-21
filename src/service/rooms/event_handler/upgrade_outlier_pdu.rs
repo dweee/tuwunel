@@ -6,26 +6,30 @@ use ruma::{
 	room_version_rules::RoomVersionRules,
 };
 use tuwunel_core::{
-	Result, debug, debug_info, debug_warn, implement, is_equal_to,
-	matrix::{Event, PduEvent, pdu::check_rules, room_version},
-	trace,
+	Result, debug, debug_info, debug_warn, implement, is_equal_to, trace,
 	utils::{
 		BoolExt,
 		stream::{BroadbandExt, ReadyExt},
 	},
 	warn,
 };
+use tuwunel_matrix::{
+	Event, PduEvent,
+	pdu::check_rules,
+	room::state::resolution::{AuthCheckOutcome, auth_check},
+	room_version,
+};
 
 use super::{
 	backoff::{Context, Disposition, UPGRADE_RETRY},
+	handle_prev_pdu::PrevUpgrade,
 	policy_server::PolicyCheck,
 	state_local_build::WalkMode,
 };
 use crate::rooms::{
 	state::{IdMapState, RoomMutexGuard, Trigger, prune_goal},
 	state_compressor::{CompressedState, HashSetCompressStateEvent},
-	state_res::{AuthCheckOutcome, auth_check},
-	timeline::RawPduId,
+	timeline::{Incoming, RawPduId},
 };
 
 #[cfg(test)]
@@ -58,18 +62,22 @@ enum Standing {
 	level = "debug",
 	ret(level = "debug"),
 	skip_all,
-	fields(lev = %recursion_level)
+	fields(
+		lev = %recursion_level,
+	),
 )]
-#[expect(clippy::too_many_arguments)]
 pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	&self,
-	origin: &ServerName,
-	room_id: &RoomId,
+	PrevUpgrade {
+		origin,
+		room_id,
+		room_version,
+		recursion_level,
+		create_event_id,
+		..
+	}: PrevUpgrade<'_>,
 	incoming_pdu: PduEvent,
 	mut pdu_json: CanonicalJsonObject,
-	room_version: &RoomVersionId,
-	recursion_level: usize,
-	create_event_id: &EventId,
 ) -> Result<Option<(RawPduId, bool)>> {
 	// Skip the PDU if we already have it as a timeline event
 	if let Ok(pdu_id) = self
@@ -133,7 +141,7 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 		.await;
 
 	let config = &self.services.server.config;
-	let max = config.forward_extremities_max;
+	let max = config.rooms.extremities.max;
 	let len = extremities
 		.len()
 		.saturating_add(usize::from(!soft_fail));
@@ -142,8 +150,8 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 		let goal = prune_goal(
 			len,
 			max,
-			config.forward_extremities_emergency_max,
-			config.forward_extremities_prune_batch,
+			config.rooms.extremities.emergency_max,
+			config.rooms.extremities.prune_batch,
 		);
 
 		let summary = self
@@ -177,17 +185,16 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 
 	// A soft-failed event is not a forward extremity, so it never drives the
 	// room's current state; only an accepted state event resolves forward.
-	if incoming_pdu.state_key().is_some() && !soft_fail {
-		self.resolve_and_force_state_after(
+	let shortstatehash = self
+		.prepare_accepted_state_after(
 			room_id,
 			room_version,
 			&incoming_pdu,
 			&state_at_incoming_event,
+			soft_fail,
 			&state_lock,
 		)
-		.boxed() // cold arm: state event
 		.await?;
-	}
 
 	// We use the `state_at_event` instead of `state_after` so we accurately
 	// represent the state for this event.
@@ -204,14 +211,15 @@ pub(super) async fn upgrade_outlier_to_timeline_pdu(
 	let pdu_id = self
 		.services
 		.timeline
-		.append_incoming_pdu(
-			&incoming_pdu,
+		.append_incoming_pdu(Incoming {
+			pdu: &incoming_pdu,
 			pdu_json,
-			extremities,
+			new_room_leafs: extremities,
 			state_ids_compressed,
 			soft_fail,
-			&state_lock,
-		)
+			shortstatehash,
+			state_lock: &state_lock,
+		})
 		.await?;
 
 	debug_assert!(
@@ -404,9 +412,9 @@ async fn resolve_state_at_incoming_event(
 	}
 
 	let config = &self.services.server.config;
-	let enabled = config.resolve_state_locally
-		&& config.resolve_state_locally_max > 0
-		&& !config.resolve_state_locally_shadow;
+	let enabled = config.federation.resolve_state_locally
+		&& config.federation.resolve_state_locally_max > 0
+		&& !config.federation.resolve_state_locally_shadow;
 
 	if enabled {
 		match self
@@ -560,14 +568,42 @@ async fn compute_remaining_extremities(
 }
 
 #[implement(super::Service)]
-async fn resolve_and_force_state_after(
+async fn prepare_accepted_state_after(
+	&self,
+	room_id: &RoomId,
+	room_version: &RoomVersionId,
+	incoming_pdu: &PduEvent,
+	state_at_incoming_event: &HashMap<u64, OwnedEventId>,
+	soft_fail: bool,
+	state_lock: &RoomMutexGuard,
+) -> Result<Option<u64>> {
+	incoming_pdu
+		.state_key()
+		.is_some()
+		.and_is(!soft_fail)
+		.then_async(|| {
+			self.resolve_and_prepare_state_after(
+				room_id,
+				room_version,
+				incoming_pdu,
+				state_at_incoming_event,
+				state_lock,
+			)
+			.boxed() // cold arm: state event
+		})
+		.map(Option::transpose)
+		.await
+}
+
+#[implement(super::Service)]
+async fn resolve_and_prepare_state_after(
 	&self,
 	room_id: &RoomId,
 	room_version: &RoomVersionId,
 	incoming_pdu: &PduEvent,
 	state_at_incoming_event: &HashMap<u64, OwnedEventId>,
 	state_lock: &RoomMutexGuard,
-) -> Result {
+) -> Result<u64> {
 	// We also add state after incoming event to the fork states
 	let mut state_after = state_at_incoming_event.clone();
 	if let Some(state_key) = incoming_pdu.state_key() {
@@ -597,7 +633,6 @@ async fn resolve_and_force_state_after(
 		.boxed() // size firewall
 		.await?;
 
-	// Set the new room state to the resolved state
 	trace!("Saving resolved state.");
 	let HashSetCompressStateEvent { shortstatehash, added, removed } = self
 		.services
@@ -609,12 +644,12 @@ async fn resolve_and_force_state_after(
 		?shortstatehash,
 		added = added.len(),
 		removed = removed.len(),
-		"Forcing new room state."
+		"Preparing new room state."
 	);
 	self.services
 		.state
-		.force_state(room_id, shortstatehash, added, removed, state_lock)
+		.prepare_force_state(room_id, &added, state_lock)
 		.await?;
 
-	Ok(())
+	Ok(shortstatehash)
 }

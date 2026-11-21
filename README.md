@@ -1,6 +1,6 @@
 # Tuwunel media-redirect fork
 
-A preserved-history fork of [Tuwunel](https://github.com/matrix-construct/tuwunel), based on release v1.9.3. This fork adds authenticated redirects to existing private object-storage media while retaining the proxy fallback. Upstream's documentation is preserved in [README-upstream.md](README-upstream.md).
+A preserved-history fork of [Tuwunel](https://github.com/matrix-construct/tuwunel), based on release v2.0.0-assets. This fork adds authenticated redirects to existing private object-storage media while retaining the proxy fallback. Upstream's documentation is preserved in [README-upstream.md](README-upstream.md).
 
 Authenticated media and thumbnail requests may return a five-minute signed redirect when `media_allow_redirect` is enabled and the stored object's headers are compatible. Authentication runs before object lookup. Responses use `Cache-Control: private, no-store`. Missing objects, legacy metadata, alternate filenames and strict framing policies retain the normal proxy path. This does not migrate a database or change bucket permissions.
 

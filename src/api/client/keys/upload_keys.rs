@@ -27,7 +27,7 @@ pub(crate) async fn upload_keys_route(
 			sender_user,
 			sender_device,
 			&body.one_time_keys,
-			services.config.one_time_key_limit,
+			services.config.encryption.one_time_key_limit,
 		)
 		.await?;
 
@@ -110,7 +110,5 @@ async fn store_device_keys(
 	services
 		.users
 		.add_device_keys(sender_user, sender_device, device_keys)
-		.await;
-
-	Ok(())
+		.await
 }

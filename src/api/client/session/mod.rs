@@ -1,4 +1,5 @@
 mod appservice;
+#[cfg(feature = "jwt_login")]
 pub(crate) mod jwt;
 mod ldap;
 mod logout;
@@ -21,10 +22,13 @@ use ruma::api::client::session::{
 		v3::{DiscoveryInfo, HomeserverInfo, LoginInfo},
 	},
 };
-use tuwunel_core::{Err, Result, info, utils::stream::ReadyExt};
+use tuwunel_core::{Err, Result, err, info, utils::stream::ReadyExt};
 use tuwunel_service::users::device::generate_refresh_token;
 
-use self::{ldap::ldap_login, password::password_login};
+use self::{
+	ldap::ldap_login,
+	password::{handle_login as password_handle_login, password_login},
+};
 pub(crate) use self::{
 	logout::{logout_all_route, logout_route},
 	refresh::refresh_token_route,
@@ -47,21 +51,24 @@ pub(crate) async fn get_login_types_route(
 	ClientIp(client): ClientIp,
 	_body: Ruma<get_login_types::v3::Request>,
 ) -> Result<get_login_types::v3::Response> {
-	let get_login_token = services.config.login_via_existing_session;
+	let get_login_token = services
+		.config
+		.authentication
+		.login
+		.via_existing_session;
 
-	let list_idps = !services.config.sso_custom_providers_page && !services.config.single_sso;
+	let list_idps = services.config.lists_identity_providers();
 
 	let identity_providers: Option<Vec<_>> = list_idps.then(|| {
 		services
 			.config
 			.identity_provider
 			.values()
-			.cloned()
 			.map(|config| IdentityProvider {
 				id: config.id().to_owned(),
-				brand: Some(config.brand.clone().into()),
-				icon: config.icon,
-				name: config.name.unwrap_or(config.brand),
+				brand: Some(config.brand.as_str().into()),
+				icon: config.icon.clone(),
+				name: config.display_name().to_owned(),
 			})
 			.collect()
 	});
@@ -76,21 +83,26 @@ pub(crate) async fn get_login_types_route(
 
 	let password = services
 		.config
-		.login_with_password
+		.authentication
+		.login
+		.with_password
 		.then(|| LoginType::Password(PasswordLoginType::default()));
 
 	let sso = show_sso.then(|| {
+		let oauth_aware_preferred = services
+			.config
+			.authentication
+			.login
+			.oidc_aware_preferred;
+
 		LoginType::Sso(SsoLoginType {
 			identity_providers: identity_providers.unwrap_or_default(),
-			oauth_aware_preferred: services.config.oidc_aware_preferred,
+			oauth_aware_preferred,
 		})
 	});
 
-	let jwt = services
-		.config
-		.jwt
-		.enable
-		.then(|| LoginType::Jwt(JwtLoginType::default()));
+	let has_jwt = cfg!(feature = "jwt_login") && services.config.jwt.enable;
+	let jwt = has_jwt.then(|| LoginType::Jwt(JwtLoginType::default()));
 
 	let flows = [appservice, token, password, sso, jwt]
 		.into_iter()
@@ -126,9 +138,15 @@ pub(crate) async fn login_route(
 	body: Ruma<login::v3::Request>,
 ) -> Result<login::v3::Response> {
 	let user_id = match &body.login_info {
-		| LoginInfo::Password(info) if services.config.login_with_password =>
-			password::handle_login(&services, &body, info).await?,
 		| LoginInfo::Token(info) => token::handle_login(&services, &body, info).await?,
+		| LoginInfo::Password(info) if services.config.authentication.login.with_password => {
+			let client = body
+				.rate_limit_ip
+				.map_err(|message| err!("{message}"))?;
+
+			password_handle_login(&services, &body, info, client).await?
+		},
+		#[cfg(feature = "jwt_login")]
 		| LoginInfo::Jwt(info) if services.config.jwt.enable =>
 			jwt::handle_login(&services, &body, info).await?,
 		| LoginInfo::ApplicationService(info) =>
@@ -138,13 +156,23 @@ pub(crate) async fn login_route(
 		},
 	};
 
+	// Appservice users are often passwordless, which reads as deactivated.
+	if !matches!(body.login_info, LoginInfo::ApplicationService(_)) {
+		services.users.deactivated_check(&user_id).await?;
+	}
+
 	services.users.locked_check(&user_id).await?;
 
+	// Only another JWT extends an expiring session, so the issuer decides how long it lasts.
+	let expiring =
+		matches!(body.login_info, LoginInfo::Jwt(_)) && services.config.jwt.expire_access_token;
+
+	let refreshable = body.body.refresh_token && !expiring;
 	let (access_token, expires_in) = services
 		.users
-		.generate_access_token(body.body.refresh_token);
+		.generate_access_token(expiring || refreshable);
 
-	let refresh_token = expires_in.is_some().then(generate_refresh_token);
+	let refresh_token = refreshable.then(generate_refresh_token);
 
 	let device_id = if let Some(device_id) = &body.device_id
 		&& services

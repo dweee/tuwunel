@@ -29,18 +29,20 @@ use tokio::{
 };
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
-	PduCount, Result, err,
-	pdu::PduBuilder,
+	Result, err,
 	ruma::{
 		MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedServerName, RoomId,
 		RoomVersionId, ServerName, UInt, UserId,
-		events::room::{
-			member::{MembershipState, RoomMemberEventContent},
-			message::RoomMessageEventContent,
-		},
+		events::room::{member::MembershipState, message::RoomMessageEventContent},
 	},
 };
-use tuwunel_service::{Services, rooms::state_cache::MembershipUpdate, users::Register};
+use tuwunel_matrix::pdu::PduBuilder;
+use tuwunel_service::{Services, users::Register};
+
+use self::state_cache::membership_update;
+
+#[path = "fixture/state_cache.rs"]
+mod state_cache;
 
 const CERTIFICATE: &str = "../../nix/pkgs/complement/certificate.crt";
 const PRIVATE_KEY: &str = "../../nix/pkgs/complement/private_key.key";
@@ -115,18 +117,17 @@ fn timestamp_fallback_confirms_the_requested_event() -> Result {
 	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 	let certificate = manifest.join(CERTIFICATE);
 	let private_key = manifest.join(PRIVATE_KEY);
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	let mut args = Args::default_test(&["fresh", "cleanup"])
+		.with_database_path(&db_path.0)
+		.with_loopback_listener(port);
 
 	args.option.extend([
-		format!("database_path={:?}", db_path.0),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
 		"listening=true".to_owned(),
-		"allow_invalid_tls_certificates=true".to_owned(),
-		"ip_range_denylist=[]".to_owned(),
-		"federation_loopback=true".to_owned(),
-		format!("trusted_servers=[\"{peer_address}\"]"),
-		"log=\"error\"".to_owned(),
+		"network.http.allow_invalid_tls_certificates=true".to_owned(),
+		"network.http.ip_range_denylist=[]".to_owned(),
+		"federation.loopback=true".to_owned(),
+		format!("federation.keys.trusted_servers=[\"{peer_address}\"]"),
+		"logging.filter=\"error\"".to_owned(),
 	]);
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -287,16 +288,12 @@ async fn exercise(
 
 	services
 		.state_cache
-		.update_membership(MembershipUpdate {
-			room_id: &room_id,
-			user_id: &remote_user,
-			membership_event: RoomMemberEventContent::new(MembershipState::Join),
-			sender: &remote_user,
-			last_state: None,
-			invite_via: None,
-			update_joined_count: true,
-			count: PduCount::Normal(*services.globals.next_count()),
-		})
+		.update_membership(membership_update(
+			&room_id,
+			&remote_user,
+			MembershipState::Join,
+			*services.globals.next_count(),
+		))
 		.await?;
 
 	let outcome =

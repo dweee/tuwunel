@@ -7,8 +7,9 @@ use ruma::{
 			AccessToken, AccessTokenOptional, AppserviceToken, AppserviceTokenOptional,
 			AuthScheme, NoAccessToken, NoAuthentication,
 		},
-		client::{account::change_password, rtc::transports},
-		error::{ErrorKind, UnknownTokenErrorData},
+		client::{
+			account::change_password, delayed_events::update_delayed_event, rtc::transports,
+		},
 		federation::authentication::ServerSignatures,
 	},
 };
@@ -78,7 +79,7 @@ impl AuthDispatch for NoAuthentication {
 		match token {
 			// check_auth_still_required already enforced any auth-required config for
 			// these no-auth routes, so a stale or unknown token serves anonymously.
-			| Token::Invalid | Token::Expired(_) | Token::None => Ok(Auth::default()),
+			| Token::Invalid | Token::Expired | Token::None => Ok(Auth::default()),
 
 			| Token::User(user) => Ok(Auth {
 				sender_user: Some(user.0),
@@ -107,7 +108,7 @@ impl AuthDispatch for AccessToken {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired(access_token) => expired_token(services, &access_token).await,
+			| Token::Expired => expired_token(),
 			| Token::Appservice(info) => Ok(auth_appservice(services, request, info).await?),
 			| Token::User(user) => Ok(Auth {
 				sender_user: Some(user.0),
@@ -126,17 +127,20 @@ impl AuthDispatch for AccessToken {
 /// the request authentication gate.
 ///
 /// Transport discovery exposes only configured public metadata. Password reset
-/// derives its target from a validated and bound email proof in the route.
+/// derives its target from a validated and bound email proof in the route. A
+/// delayed event action names its event by an unguessable `delay_id`, and the
+/// route refuses a missing token on its stable path.
 fn allows_missing_access_token(route: TypeId) -> bool {
 	route == TypeId::of::<transports::v1::Request>()
 		|| route == TypeId::of::<change_password::v3::Request>()
+		|| route == TypeId::of::<update_delayed_event::v1::Request>()
 }
 
 impl AuthDispatch for AccessTokenOptional {
 	const SCHEME: Scheme = Scheme::AccessTokenOptional;
 
 	async fn dispatch(
-		services: &Services,
+		_services: &Services,
 		_request: &mut Request,
 		_json_body: Option<&CanonicalJsonValue>,
 		token: Token,
@@ -144,7 +148,7 @@ impl AuthDispatch for AccessTokenOptional {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired(access_token) => expired_token(services, &access_token).await,
+			| Token::Expired => expired_token(),
 			| Token::User(user) => Ok(Auth {
 				sender_user: Some(user.0),
 				sender_device: Some(user.1),
@@ -164,7 +168,7 @@ impl AuthDispatch for AppserviceToken {
 	const SCHEME: Scheme = Scheme::AppserviceToken;
 
 	async fn dispatch(
-		services: &Services,
+		_services: &Services,
 		_request: &mut Request,
 		_json_body: Option<&CanonicalJsonValue>,
 		token: Token,
@@ -172,7 +176,7 @@ impl AuthDispatch for AppserviceToken {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired(access_token) => expired_token(services, &access_token).await,
+			| Token::Expired => expired_token(),
 			| Token::User(_) =>
 				Err!(Request(Unauthorized("Appservice tokens must be used on this endpoint."))),
 			| Token::Appservice(info) => Ok(Auth {
@@ -188,7 +192,7 @@ impl AuthDispatch for AppserviceTokenOptional {
 	const SCHEME: Scheme = Scheme::AppserviceTokenOptional;
 
 	async fn dispatch(
-		services: &Services,
+		_services: &Services,
 		_request: &mut Request,
 		_json_body: Option<&CanonicalJsonValue>,
 		token: Token,
@@ -196,7 +200,7 @@ impl AuthDispatch for AppserviceTokenOptional {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired(access_token) => expired_token(services, &access_token).await,
+			| Token::Expired => expired_token(),
 			| Token::User(user) => Ok(Auth {
 				sender_user: Some(user.0),
 				sender_device: Some(user.1),
@@ -224,7 +228,7 @@ impl AuthDispatch for ServerSignatures {
 	) -> Result<Auth> {
 		match token {
 			| Token::Invalid => unknown_token(),
-			| Token::Expired(access_token) => expired_token(services, &access_token).await,
+			| Token::Expired => expired_token(),
 			| Token::Appservice(_) | Token::User(_) =>
 				Err!(Request(Unauthorized("Server signatures must be used on this endpoint."))),
 			| Token::None => Ok(auth_server(services, request, json_body).await?),
@@ -233,27 +237,24 @@ impl AuthDispatch for ServerSignatures {
 }
 
 fn unknown_token() -> Result<Auth> {
-	Err(Error::BadRequest(
-		ErrorKind::UnknownToken(UnknownTokenErrorData::new()),
-		"Unknown access token.",
-	))
+	let soft_logout = false;
+
+	Err(Error::unknown_token(soft_logout, "Unknown access token."))
 }
 
-async fn expired_token(services: &Services, access_token: &str) -> Result<Auth> {
-	services
-		.users
-		.remove_access_token_value(access_token)
-		.await;
+// Kept until a later device token expires, so a retry or concurrent request reads as expired.
+fn expired_token() -> Result<Auth> {
+	let soft_logout = true;
 
-	Err(Error::BadRequest(
-		ErrorKind::UnknownToken(UnknownTokenErrorData { soft_logout: true }),
-		"Expired access token.",
-	))
+	Err(Error::unknown_token(soft_logout, "Expired access token."))
 }
 
 #[cfg(test)]
 mod tests {
-	use ruma::api::client::discovery::get_supported_versions;
+	use ruma::api::client::{
+		delayed_events::update_delayed_event::unstable_v1::Request as UpdateByBodyRequest,
+		discovery::get_supported_versions,
+	};
 
 	use super::*;
 
@@ -261,6 +262,8 @@ mod tests {
 	fn dedicated_routes_bypass_access_token_auth() {
 		assert!(allows_missing_access_token(TypeId::of::<transports::v1::Request>()));
 		assert!(allows_missing_access_token(TypeId::of::<change_password::v3::Request>()));
+		assert!(allows_missing_access_token(TypeId::of::<update_delayed_event::v1::Request>()));
 		assert!(!allows_missing_access_token(TypeId::of::<get_supported_versions::Request>()));
+		assert!(!allows_missing_access_token(TypeId::of::<UpdateByBodyRequest>()));
 	}
 }

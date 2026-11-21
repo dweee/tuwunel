@@ -24,6 +24,8 @@ use http::{
 	},
 };
 use ipnet::IpNet;
+#[cfg(feature = "sentry_telemetry")]
+use sentry_tower::NewSentryLayer;
 use tower::{
 	Layer, Service, ServiceBuilder,
 	layer::util::Identity,
@@ -77,7 +79,15 @@ pub(crate) fn build(services: &Arc<Services>) -> Result<(Router, Guard)> {
 	let layers = ServiceBuilder::new();
 
 	#[cfg(feature = "sentry_telemetry")]
-	let layers = layers.layer(sentry_tower::NewSentryLayer::<http::Request<_>>::new_from_top());
+	let sentry = server
+		.config
+		.telemetry
+		.sentry
+		.enable
+		.then(NewSentryLayer::<Request>::new_from_top);
+
+	#[cfg(feature = "sentry_telemetry")]
+	let layers = layers.option_layer(sentry);
 
 	#[cfg(any(
 		feature = "zstd_compression",
@@ -100,17 +110,17 @@ pub(crate) fn build(services: &Arc<Services>) -> Result<(Router, Guard)> {
 			services: Arc::clone(services),
 			handler: request::handle,
 		})
-		.layer(trusted_peer_subnets_layer(&server.config.ip_source_trusted_subnets))
-		.layer(ip_source_layer(server.config.ip_source))
+		.layer(trusted_peer_subnets_layer(&server.config.http.ip_source_trusted_subnets))
+		.layer(ip_source_layer(server.config.http.ip_source))
 		.layer(ResponseBodyTimeoutLayer::new(Duration::from_secs(
-			server.config.client_response_timeout,
+			server.config.http.response_timeout,
 		)))
 		.layer(RequestBodyTimeoutLayer::new(Duration::from_secs(
-			server.config.client_receive_timeout,
+			server.config.http.receive_timeout,
 		)))
 		.layer(TimeoutLayer::with_status_code(
 			StatusCode::REQUEST_TIMEOUT,
-			Duration::from_secs(server.config.client_request_timeout),
+			Duration::from_secs(server.config.http.request_timeout),
 		))
 		.layer(SetResponseHeaderLayer::if_not_present(
 			header::X_CONTENT_TYPE_OPTIONS,
@@ -170,7 +180,7 @@ fn compression_layer(server: &Server) -> tower_http::compression::CompressionLay
 
 	#[cfg(feature = "zstd_compression")]
 	{
-		compression_layer = if server.config.zstd_compression {
+		compression_layer = if server.config.http.compression.zstd {
 			compression_layer.zstd(true)
 		} else {
 			compression_layer.no_zstd()
@@ -179,7 +189,7 @@ fn compression_layer(server: &Server) -> tower_http::compression::CompressionLay
 
 	#[cfg(feature = "gzip_compression")]
 	{
-		compression_layer = if server.config.gzip_compression {
+		compression_layer = if server.config.http.compression.gzip {
 			compression_layer.gzip(true)
 		} else {
 			compression_layer.no_gzip()
@@ -188,7 +198,7 @@ fn compression_layer(server: &Server) -> tower_http::compression::CompressionLay
 
 	#[cfg(feature = "brotli_compression")]
 	{
-		compression_layer = if server.config.brotli_compression {
+		compression_layer = if server.config.http.compression.brotli {
 			compression_layer.br(true)
 		} else {
 			compression_layer.no_br()
@@ -221,6 +231,7 @@ fn cors_layer(server: &Server) -> CorsLayer {
 
 	let allow_origin_list = server
 		.config
+		.http
 		.access_control_allow_origin
 		.iter()
 		.map(AsRef::as_ref)
@@ -229,6 +240,7 @@ fn cors_layer(server: &Server) -> CorsLayer {
 
 	let allow_origin = if !server
 		.config
+		.http
 		.access_control_allow_origin
 		.is_empty()
 	{
@@ -246,7 +258,7 @@ fn cors_layer(server: &Server) -> CorsLayer {
 }
 
 fn body_limit_layer(server: &Server) -> DefaultBodyLimit {
-	DefaultBodyLimit::max(server.config.max_request_size)
+	DefaultBodyLimit::max(server.config.http.max_request_size)
 }
 
 fn trusted_peer_subnets_layer(

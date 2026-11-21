@@ -1,17 +1,26 @@
-use std::{collections::HashSet, iter::once};
+use std::{
+	collections::HashSet,
+	iter::{empty, once},
+};
 
 use ruma::{
 	UInt,
-	api::client::sync::sync_events::v5::response::Room as ResponseRoom,
+	api::client::sync::sync_events::v5::{
+		ListId,
+		request::{List, ListConfig},
+		response::Room as ResponseRoom,
+	},
 	events::{StateEventType, room::member::MembershipState},
-	uint, user_id,
+	room_id, uint, user_id,
 };
-use tuwunel_core::matrix::pdu::PduCount;
+use tuwunel_matrix::pdu::PduCount;
 
 use super::{
-	StateMode, membership_allows_required_state, required_state_hash, room_config,
-	room_timeline_limited, room_timeline_metadata, state_is_required, state_may_have_changed,
-	state_mode, state_was_requested,
+	Candidate, Collected, Connection, ListIds, StateMode, TIMELINE_LIMIT_MAX, UnreadState,
+	collected::{recorded_snapshot, unread_state},
+	fingerprints_cover, membership_allows_required_state, merged_room_details,
+	required_state_hash, room_config, room_timeline_limited, room_timeline_metadata,
+	state_is_required, state_may_have_changed, state_mode,
 };
 
 #[test]
@@ -72,15 +81,15 @@ fn required_state_is_full_initially_and_without_coverage() {
 	assert_eq!(state_mode(0, false), StateMode::Full);
 	assert_eq!(state_mode(7, true), StateMode::Full);
 	assert_eq!(state_mode(7, false), StateMode::Delta(PduCount::Normal(7)));
-	assert!(state_is_required(StateMode::Full, Some(PduCount::Normal(1)), false, true));
+	assert!(state_is_required(StateMode::Full, unchanged(Some(PduCount::Normal(1)))));
 }
 
 #[test]
 fn incremental_required_state_omits_unchanged_events() {
 	let mode = StateMode::Delta(PduCount::Normal(7));
 
-	assert!(!state_is_required(mode, Some(PduCount::Normal(7)), false, true));
-	assert!(!state_is_required(mode, Some(PduCount::Normal(6)), false, true));
+	assert!(!state_is_required(mode, unchanged(Some(PduCount::Normal(7)))));
+	assert!(!state_is_required(mode, unchanged(Some(PduCount::Normal(6)))));
 }
 
 #[test]
@@ -88,7 +97,7 @@ fn incremental_required_state_includes_only_changes() {
 	let mode = StateMode::Delta(PduCount::Normal(7));
 	let included = [PduCount::Normal(6), PduCount::Normal(8)]
 		.into_iter()
-		.filter(|count| state_is_required(mode, Some(*count), false, true))
+		.filter(|count| state_is_required(mode, unchanged(Some(*count))))
 		.count();
 
 	assert_eq!(included, 1);
@@ -98,14 +107,24 @@ fn incremental_required_state_includes_only_changes() {
 fn incremental_required_state_keeps_reselected_old_event() {
 	let mode = StateMode::Delta(PduCount::Normal(7));
 
-	assert!(state_is_required(mode, Some(PduCount::Normal(6)), false, false));
+	assert!(state_is_required(mode, Candidate {
+		count: Some(PduCount::Normal(6)),
+		..Default::default()
+	}));
 }
 
 #[test]
 fn incremental_required_state_keeps_uncounted_events() {
 	let mode = StateMode::Delta(PduCount::Normal(7));
 
-	assert!(state_is_required(mode, None, false, false));
+	assert!(state_is_required(mode, Candidate::default()));
+}
+
+#[test]
+fn incremental_required_state_omits_unchanged_uncounted_events() {
+	let mode = StateMode::Delta(PduCount::Normal(7));
+
+	assert!(!state_is_required(mode, unchanged(None)));
 }
 
 #[test]
@@ -121,7 +140,74 @@ fn incremental_required_state_needs_a_newer_timeline_event() {
 fn incremental_required_state_keeps_lazy_members() {
 	let mode = StateMode::Delta(PduCount::Normal(7));
 
-	assert!(state_is_required(mode, Some(PduCount::Normal(1)), true, true));
+	let candidate = Candidate {
+		lazy: true,
+		..unchanged(Some(PduCount::Normal(1)))
+	};
+
+	assert!(state_is_required(mode, candidate));
+}
+
+#[test]
+fn incremental_required_state_sends_events_left_unread() {
+	let mode = StateMode::Delta(PduCount::Normal(7));
+
+	for count in [Some(PduCount::Normal(6)), None] {
+		let candidate = Candidate { left_unread: true, ..unchanged(count) };
+
+		assert!(state_is_required(mode, candidate));
+	}
+}
+
+#[test]
+fn delivered_snapshot_vouches_only_for_keys_it_resolved() {
+	assert_eq!(recorded_snapshot(Some(9), true), Some(9));
+	assert_eq!(recorded_snapshot(None, true), None);
+	assert_eq!(recorded_snapshot(Some(9), false), Some(0));
+	assert_eq!(recorded_snapshot(None, false), Some(0));
+}
+
+#[test]
+fn unread_keys_are_kept_once_in_order() {
+	let unread: UnreadState = [5, 3].into();
+
+	assert_eq!(unread_state([3, 7].into_iter(), unread).as_slice(), &[3, 5, 7]);
+	assert!(unread_state(empty(), UnreadState::new()).is_empty());
+}
+
+#[test]
+fn delivery_records_zero_and_keeps_unsent_keys_when_a_key_is_unresolved() {
+	let collected = Collected {
+		settled: once(7).collect(),
+		unresolved: true,
+		..Default::default()
+	};
+
+	let (_, (snapshot, unread)) = collected.finish(Some(9), &[3, 7]);
+
+	assert_eq!(snapshot, Some(0));
+	assert_eq!(unread.as_slice(), &[3]);
+}
+
+#[test]
+fn delivery_without_a_snapshot_keeps_the_previous_keys() {
+	let (_, (snapshot, unread)) = Collected::default().finish(None, &[3]);
+
+	assert_eq!(snapshot, None);
+	assert_eq!(unread.as_slice(), &[3]);
+}
+
+#[test]
+fn complete_delivery_keeps_only_its_own_unread_keys() {
+	let collected = Collected {
+		unread: once(5).collect(),
+		..Default::default()
+	};
+
+	let (_, (snapshot, unread)) = collected.finish(Some(9), &[3]);
+
+	assert_eq!(snapshot, Some(9));
+	assert_eq!(unread.as_slice(), &[5]);
 }
 
 #[test]
@@ -136,6 +222,54 @@ fn zero_timeline_limit_is_not_limited() {
 	assert!(!room_timeline_limited(0, true));
 	assert!(room_timeline_limited(1, true));
 	assert!(!room_timeline_limited(1, false));
+}
+
+#[test]
+fn timeline_limit_is_capped() {
+	for (list_limit, subscription_limit, expected) in [
+		(uint!(0), uint!(0), 0),
+		(uint!(1), uint!(0), 1),
+		(uint!(0), uint!(99), 99),
+		(uint!(100), uint!(0), TIMELINE_LIMIT_MAX),
+		(uint!(0), uint!(100), TIMELINE_LIMIT_MAX),
+		(uint!(101), uint!(0), TIMELINE_LIMIT_MAX),
+		(uint!(0), uint!(101), TIMELINE_LIMIT_MAX),
+		(UInt::MAX, uint!(1), TIMELINE_LIMIT_MAX),
+		(uint!(1), UInt::MAX, TIMELINE_LIMIT_MAX),
+		(UInt::MAX, UInt::MAX, TIMELINE_LIMIT_MAX),
+	] {
+		let room_id = room_id!("!room:example.com");
+		let list = ListId::from("main");
+		let room_details = ListConfig {
+			timeline_limit: list_limit,
+			required_state: vec![(StateEventType::RoomName, "".into())],
+		};
+
+		let list_config = List { room_details, ..Default::default() };
+		let required_state =
+			vec![(StateEventType::RoomName, "".into()), (StateEventType::RoomTopic, "".into())];
+
+		let subscription = ListConfig {
+			timeline_limit: subscription_limit,
+			required_state,
+		};
+
+		let conn = Connection {
+			lists: [(list.clone(), list_config)].into(),
+			subscriptions: [(room_id.to_owned(), subscription)].into(),
+			..Default::default()
+		};
+
+		let lists: ListIds = once(list).collect();
+		let (timeline_limit, required_state) = merged_room_details(&conn, &lists, room_id);
+		let expected_state = HashSet::from([
+			(StateEventType::RoomName, "".into()),
+			(StateEventType::RoomTopic, "".into()),
+		]);
+
+		assert_eq!(timeline_limit, expected);
+		assert_eq!(required_state, expected_state);
+	}
 }
 
 #[test]
@@ -177,18 +311,13 @@ fn state_coverage_resolves_wildcards_and_own_user() {
 	for key in ["*", "$ME", user.as_str()] {
 		let previous = [required_state_hash(&kind, key)];
 
-		assert!(state_was_requested(&previous, &kind, user.as_str(), user));
+		assert!(fingerprints_cover(&previous, &kind, user.as_str(), user));
 	}
 
 	let previous = [required_state_hash(&kind, "$ME")];
 
-	assert!(!state_was_requested(&previous, &kind, "@other:example.com", user));
-	assert!(!state_was_requested(
-		&previous,
-		&StateEventType::RoomMember,
-		user.as_str(),
-		user
-	));
+	assert!(!fingerprints_cover(&previous, &kind, "@other:example.com", user));
+	assert!(!fingerprints_cover(&previous, &StateEventType::RoomMember, user.as_str(), user));
 }
 
 #[test]
@@ -199,7 +328,7 @@ fn lazy_membership_does_not_claim_general_state_coverage() {
 	let details = (0, [(kind.clone(), "$LAZY".into())].into());
 
 	assert!(room_config(&details).1.is_empty());
-	assert!(!state_was_requested(&previous, &kind, user.as_str(), user));
+	assert!(!fingerprints_cover(&previous, &kind, user.as_str(), user));
 }
 
 fn timeline(positions: &[u64]) -> Vec<(PduCount, ())> {
@@ -208,4 +337,12 @@ fn timeline(positions: &[u64]) -> Vec<(PduCount, ())> {
 		.copied()
 		.map(|position| (PduCount::Normal(position), ()))
 		.collect()
+}
+
+fn unchanged(count: Option<PduCount>) -> Candidate {
+	Candidate {
+		count,
+		same_at_since: true,
+		..Default::default()
+	}
 }

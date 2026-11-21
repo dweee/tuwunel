@@ -20,20 +20,28 @@ use tuwunel_core::{
 	Err, Error, Result,
 	debug::INFO_SPAN_LEVEL,
 	debug_error, debug_warn, err, implement,
+	itertools::Itertools,
 	smallvec::SmallVec,
 	utils::{
 		BoolExt, IterStream, ReadyExt,
-		result::LogErr,
+		result::{LogErr, NotFound},
 		stream::{BroadbandExt, TryIgnore},
 		to_canonical_object,
 	},
+	warn,
 };
 use tuwunel_database::{
-	Deserialized, Ignore, Interfix, Json, KeyBuf, Map, Txn, deserialize_from_slice, serialize_key,
+	Deserialized, Ignore, Interfix, Json, Map, Txn, deserialize_from_slice, serialize_key,
+	serialize_to_vec,
 };
+
+use super::device::DeviceLock;
 
 type Servers = SmallVec<[OwnedServerName; 1]>;
 type Signatures = SmallVec<[(String, String); 1]>;
+type KeyLocks = SmallVec<[DeviceLock; 3]>;
+type ParsedKey<'a> = (&'a Raw<CrossSigningKey>, String, &'a Arc<Map>);
+type ParsedKeys<'a> = SmallVec<[ParsedKey<'a>; 3]>;
 
 /// Mutation announced to clients and federation peers.
 ///
@@ -310,6 +318,10 @@ pub async fn take_fallback_key(
 	Ok((updated.key_id, updated.key))
 }
 
+/// Streams the algorithms of a device's fallback keys that no claim has used.
+///
+/// The scan ends at the device's own rows, so a device whose ID extends this
+/// one's contributes none.
 #[implement(super::Service)]
 pub fn unused_fallback_key_algorithms<'a>(
 	&'a self,
@@ -318,7 +330,8 @@ pub fn unused_fallback_key_algorithms<'a>(
 ) -> impl Stream<Item = OneTimeKeyAlgorithm> + Send + 'a {
 	type KeyVal = ((Ignore, Ignore, OneTimeKeyAlgorithm), Json<FallbackEntry>);
 
-	let prefix = (user_id, device_id);
+	let prefix = (user_id, device_id, Interfix);
+
 	self.db
 		.userdeviceidalgorithm_fallback
 		.stream_prefix(&prefix)
@@ -355,6 +368,11 @@ pub async fn take_one_time_key(
 		.insert(user_id, update_count.to_be_bytes());
 
 	let prefix = (user_id, device_id, Interfix);
+	let _guard = self
+		.claiming_one_time_keys
+		.lock(&(user_id.to_owned(), device_id.to_owned()))
+		.await;
+
 	let one_time_keys = otk
 		.stream_prefix(&prefix)
 		.ignore_err()
@@ -401,7 +419,8 @@ pub async fn count_one_time_keys(
 		.filter_map(Result::ok)
 		.fold(0_usize, usize::saturating_add);
 
-	let limit = self.services.config.one_time_key_limit;
+	let limit = self.services.config.encryption.one_time_key_limit;
+
 	if let Some(excess) = total.checked_sub(limit).filter(|&n| n > 0) {
 		self.prune_one_time_keys(user_id, device_id, excess)
 			.await;
@@ -459,20 +478,38 @@ pub async fn remove_one_time_keys(&self, user_id: &UserId, device_id: &DeviceId)
 		.await;
 }
 
+/// Stores a device's identity keys in place of any it had.
+///
+/// The write holds the device lock and is skipped for a device already
+/// removed, so it neither races a signature merge on the same row nor writes
+/// back keys the removal deleted. A device that cannot be read fails the call.
 #[implement(super::Service)]
 pub async fn add_device_keys(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
 	device_keys: &Raw<DeviceKeys>,
-) {
+) -> Result {
+	let _lock = self.lock_device(user_id, device_id).await;
+
+	if !self.try_device_exists(user_id, device_id).await? {
+		debug_warn!(%user_id, %device_id, "Not storing keys for a removed device.");
+		return Ok(());
+	}
+
 	let key = (user_id, device_id);
 
 	self.db.keyid_key.put(key, Json(device_keys));
 	self.mark_device_key_update(user_id, DeviceListChange::Device(device_id))
 		.await;
+
+	Ok(())
 }
 
+/// Stores a user's cross-signing keys and points the user at them.
+///
+/// Every key given is parsed before any is written, and a key not given keeps
+/// the one stored. `notify` announces the keys on the device list once written.
 #[implement(super::Service)]
 pub async fn add_cross_signing_keys(
 	&self,
@@ -483,68 +520,22 @@ pub async fn add_cross_signing_keys(
 	notify: bool,
 ) -> Result {
 	// TODO: Check signatures
-	{
-		let master_key_key = master_key
-			.as_ref()
-			.map(|master_key| parse_master_key(user_id, master_key).map(|(key, _)| key))
-			.transpose()?;
+	let keys: ParsedKeys<'_> = [
+		(master_key, "Master", &self.db.userid_masterkeyid),
+		(self_signing_key, "Self-signing", &self.db.userid_selfsigningkeyid),
+		(user_signing_key, "User-signing", &self.db.userid_usersigningkeyid),
+	]
+	.into_iter()
+	.filter_map(|(key, label, pointers)| Some((key.as_ref()?, label, pointers)))
+	.map(|(key, label, pointers)| {
+		parse_cross_signing_key(key, label)
+			.and_then(|parsed| single_public_key(parsed.keys.into_values(), label))
+			.map(|public_key| (key, public_key, pointers))
+	})
+	.collect::<Result<_>>()?;
 
-		let self_signing_key_key = self_signing_key
-			.as_ref()
-			.map(|self_signing_key| parse_self_signing_key(user_id, self_signing_key))
-			.transpose()?;
-
-		let user_signing_key_id = user_signing_key
-			.as_ref()
-			.map(parse_user_signing_key)
-			.transpose()?;
-
-		let mut txn = self.services.db.txn();
-
-		if let Some((master_key, master_key_key)) =
-			master_key.as_ref().zip(master_key_key.as_ref())
-		{
-			txn.insert_raw(
-				&self.db.keyid_key,
-				master_key_key,
-				master_key.json().get().as_bytes(),
-			);
-			txn.insert_raw(&self.db.userid_masterkeyid, user_id.as_bytes(), master_key_key);
-		}
-
-		if let Some((self_signing_key, self_signing_key_key)) = self_signing_key
-			.as_ref()
-			.zip(self_signing_key_key.as_ref())
-		{
-			txn.insert_raw(
-				&self.db.keyid_key,
-				self_signing_key_key,
-				self_signing_key.json().get(),
-			);
-			txn.insert_raw(
-				&self.db.userid_selfsigningkeyid,
-				user_id.as_bytes(),
-				self_signing_key_key,
-			);
-		}
-
-		if let Some((user_signing_key, user_signing_key_id)) = user_signing_key
-			.as_ref()
-			.zip(user_signing_key_id.as_ref())
-		{
-			let user_signing_key_key = (user_id, user_signing_key_id);
-
-			txn.put_raw(
-				&self.db.keyid_key,
-				user_signing_key_key,
-				user_signing_key.json().get().as_bytes(),
-			);
-
-			txn.raw_put(&self.db.userid_usersigningkeyid, user_id, user_signing_key_key);
-		}
-
-		txn.execute();
-	};
+	self.store_cross_signing_keys(user_id, &keys)
+		.await;
 
 	if notify {
 		self.mark_device_key_update(user_id, DeviceListChange::CrossSigning)
@@ -554,27 +545,137 @@ pub async fn add_cross_signing_keys(
 	Ok(())
 }
 
-fn parse_self_signing_key(
+/// Stores a remote user's master key, keeping the signatures our copy carries.
+///
+/// The row stays locked from reading our copy to writing the merged key, so a
+/// signature merged meanwhile is kept, and our copy is read unfiltered, so none
+/// of its signatures is dropped. Nothing is announced, since a notification
+/// would prompt another key query without end.
+#[implement(super::Service)]
+#[tracing::instrument(
+	level = "debug",
+	skip(self, master_key),
+	fields(
+		%user_id,
+	)
+)]
+pub async fn store_remote_master_key(
+	&self,
 	user_id: &UserId,
-	self_signing_key: &Raw<CrossSigningKey>,
-) -> Result<KeyBuf> {
-	let mut self_signing_key_ids = self_signing_key
-		.deserialize()
-		.map_err(|e| err!(Request(InvalidParam("Invalid self signing key: {e:?}"))))?
-		.keys
-		.into_values();
+	master_key: &Raw<CrossSigningKey>,
+) -> Result {
+	let remote = parse_cross_signing_key(master_key, "Master")?;
+	let public_key = single_public_key(remote.keys.values(), "Master")?.clone();
+	let _lock = self.lock_key(user_id, &public_key).await;
 
-	let self_signing_key_id = self_signing_key_ids
-		.next()
-		.ok_or_else(|| err!(Request(InvalidParam("Self signing key contained no key."))))?;
+	let ours = self
+		.db
+		.keyid_key
+		.qry(&(user_id, &public_key))
+		.await
+		.optional()?
+		.map(|stored| stored.deserialized())
+		.transpose()
+		.inspect_err(|error| warn!(%user_id, %error, "Replacing an unreadable master key."))
+		.ok()
+		.flatten()
+		.map(|Json(ours): Json<CrossSigningKey>| ours);
 
-	if self_signing_key_ids.next().is_some() {
-		return Err!(Request(InvalidParam("Self signing key contained more than one key.")));
-	}
+	let merged = Raw::new(&with_our_signatures(remote, ours))?;
 
-	serialize_key((user_id, self_signing_key_id))
+	self.put_cross_signing_keys(user_id, &[(&merged, public_key, &self.db.userid_masterkeyid)]);
+
+	Ok(())
 }
 
+/// Parses a cross-signing key a client or a server sent.
+///
+/// `label` names the key in errors.
+fn parse_cross_signing_key(key: &Raw<CrossSigningKey>, label: &str) -> Result<CrossSigningKey> {
+	key.deserialize()
+		.map_err(|e| err!(Request(InvalidParam("{label} key is invalid: {e:?}"))))
+}
+
+/// Returns the one public key of a cross-signing key, which names its row.
+///
+/// A key carrying none or several is refused, and `label` names it in errors.
+fn single_public_key<T>(public_keys: impl Iterator<Item = T>, label: &str) -> Result<T> {
+	public_keys
+		.at_most_one()
+		.map_err(|_| err!(Request(InvalidParam("{label} key contained more than one key."))))?
+		.ok_or_else(|| err!(Request(InvalidParam("{label} key contained no key."))))
+}
+
+/// Adds our copy's signatures to a remote key.
+///
+/// Signatures merge per signer and key ID, ours replacing the remote's where
+/// both carry one.
+fn with_our_signatures(
+	mut remote: CrossSigningKey,
+	ours: Option<CrossSigningKey>,
+) -> CrossSigningKey {
+	remote
+		.signatures
+		.extend(ours.into_iter().flat_map(|ours| ours.signatures));
+
+	remote
+}
+
+/// Writes parsed cross-signing keys while their rows are locked.
+///
+/// The rows are locked against signature merges, in public key order, until
+/// the keys are written.
+#[implement(super::Service)]
+async fn store_cross_signing_keys(&self, user_id: &UserId, keys: &[ParsedKey<'_>]) {
+	let public_keys = keys
+		.iter()
+		.map(|(_, public_key, _)| public_key.as_str());
+
+	let _locks = self.lock_keys(user_id, public_keys).await;
+
+	self.put_cross_signing_keys(user_id, keys);
+}
+
+/// Locks one user's cross-signing key rows, named by their public keys.
+///
+/// The rows are taken in one order for every caller, so writers sharing rows
+/// wait for one another instead of deadlocking.
+#[implement(super::Service)]
+async fn lock_keys<'a, PublicKeys>(&self, user_id: &UserId, public_keys: PublicKeys) -> KeyLocks
+where
+	PublicKeys: Iterator<Item = &'a str> + Send,
+{
+	let rows =
+		public_keys.map(|public_key| (user_id.to_owned(), OwnedDeviceId::from(public_key)));
+
+	self.updating_device.lock_all(rows).await
+}
+
+/// Writes cross-signing keys at their rows and points the user at each.
+///
+/// Each row is keyed by user and public key, and the keys and pointers are
+/// written in one transaction.
+#[implement(super::Service)]
+fn put_cross_signing_keys(&self, user_id: &UserId, keys: &[ParsedKey<'_>]) {
+	let mut txn = self.services.db.txn();
+
+	for (key, public_key, pointers) in keys {
+		let row = (user_id, public_key);
+
+		txn.put_raw(&self.db.keyid_key, row, key.json().get().as_bytes());
+		txn.raw_put(pointers, user_id, row);
+	}
+
+	txn.execute();
+}
+
+/// Merges the sender's signatures into a stored key after verifying them.
+///
+/// A signature the signer's and the target's roles do not allow is ignored or
+/// refused, the call fails unless one is accepted, and a merge changing
+/// nothing writes nothing. The read and the write hold the key's row lock, so
+/// concurrent merges keep one another's signatures and never write stale
+/// contents over a key replaced or removed meanwhile.
 #[implement(super::Service)]
 pub async fn sign_key(
 	&self,
@@ -583,6 +684,7 @@ pub async fn sign_key(
 	signatures: Signatures,
 	sender_id: &UserId,
 ) -> Result {
+	let _lock = self.lock_key(target_id, key_id).await;
 	let key = (target_id, key_id);
 
 	let mut target_key: serde_json::Value = self
@@ -686,6 +788,16 @@ pub async fn sign_key(
 	}
 
 	Ok(())
+}
+
+/// Locks one key row against its other writers.
+///
+/// Device and cross-signing keys share one row space keyed by user and key ID,
+/// so the device lock serves both, and a device's removal and every write to
+/// its keys contend on that one lock.
+#[implement(super::Service)]
+async fn lock_key(&self, user_id: &UserId, key_id: &str) -> DeviceLock {
+	self.lock_device(user_id, key_id.into()).await
 }
 
 #[implement(super::Service)]
@@ -1018,6 +1130,7 @@ pub async fn mark_device_key_update(
 	let update_all_rooms = !self
 		.services
 		.config
+		.encryption
 		.device_key_update_encrypted_rooms_only;
 
 	let all_or_is_encrypted = async |room_id: &RoomId| {
@@ -1091,6 +1204,9 @@ pub async fn mark_device_key_update(
 		.await
 		.log_err()
 		.ok();
+
+	// Retire this change before discovering and waking federation peers.
+	drop(count);
 
 	if !local {
 		return;
@@ -1189,10 +1305,16 @@ pub async fn get_device_keys<'a>(
 		.deserialized()
 }
 
+/// Reads the cross-signing key stored at one row of the key table.
+///
+/// `row_key` is the serialized user ID and public key naming the row, the form
+/// the user's pointer rows store, never a key ID. The sender sees every
+/// signature on their own key; anyone else sees only the owner's and those
+/// `allowed_signatures` accepts.
 #[implement(super::Service)]
 pub async fn get_key<F>(
 	&self,
-	key_id: &[u8],
+	row_key: &[u8],
 	sender_user: Option<&UserId>,
 	user_id: &UserId,
 	allowed_signatures: &F,
@@ -1203,7 +1325,7 @@ where
 	let key: serde_json::Value = self
 		.db
 		.keyid_key
-		.get(key_id)
+		.get(row_key)
 		.await
 		.deserialized()?;
 
@@ -1213,6 +1335,9 @@ where
 	Ok(Raw::from_json(raw_value))
 }
 
+/// Reads a user's master key through its pointer row.
+///
+/// An absent pointer errs as not found. Signatures narrow as in `get_key`.
 #[implement(super::Service)]
 pub async fn get_master_key<F>(
 	&self,
@@ -1223,12 +1348,15 @@ pub async fn get_master_key<F>(
 where
 	F: Fn(&UserId) -> bool + Send + Sync,
 {
-	let key_id = self.db.userid_masterkeyid.get(user_id).await?;
+	let row_key = self.db.userid_masterkeyid.get(user_id).await?;
 
-	self.get_key(&key_id, sender_user, user_id, allowed_signatures)
+	self.get_key(&row_key, sender_user, user_id, allowed_signatures)
 		.await
 }
 
+/// Reads a user's self-signing key through its pointer row.
+///
+/// An absent pointer errs as not found. Signatures narrow as in `get_key`.
 #[implement(super::Service)]
 pub async fn get_self_signing_key<F>(
 	&self,
@@ -1239,68 +1367,42 @@ pub async fn get_self_signing_key<F>(
 where
 	F: Fn(&UserId) -> bool + Send + Sync,
 {
-	let key_id = self
+	let row_key = self
 		.db
 		.userid_selfsigningkeyid
 		.get(user_id)
 		.await?;
 
-	self.get_key(&key_id, sender_user, user_id, allowed_signatures)
+	self.get_key(&row_key, sender_user, user_id, allowed_signatures)
 		.await
 }
 
+/// Reads a user's user-signing key through its pointer row.
+///
+/// An absent pointer errs as not found. The stored signatures come back whole,
+/// unlike the master and self-signing readers.
 #[implement(super::Service)]
 pub async fn get_user_signing_key(&self, user_id: &UserId) -> Result<Raw<CrossSigningKey>> {
 	self.db
 		.userid_usersigningkeyid
 		.get(user_id)
-		.and_then(|key_id| self.db.keyid_key.get(&*key_id))
+		.and_then(|row_key| self.db.keyid_key.get(&*row_key))
 		.await
 		.deserialized()
 }
 
+/// Parses a master key, refusing a key carrying no public key or several.
+///
+/// Returns the key's row in the key table together with the parsed key.
 pub fn parse_master_key(
 	user_id: &UserId,
 	master_key: &Raw<CrossSigningKey>,
 ) -> Result<(Vec<u8>, CrossSigningKey)> {
-	let mut prefix = user_id.as_bytes().to_vec();
-	prefix.push(0xFF);
+	let master_key = parse_cross_signing_key(master_key, "Master")?;
+	let public_key = single_public_key(master_key.keys.values(), "Master")?;
+	let row = serialize_to_vec((user_id, public_key))?;
 
-	let master_key = master_key
-		.deserialize()
-		.map_err(|_| err!(Request(InvalidParam("Invalid master key"))))?;
-
-	let mut master_key_ids = master_key.keys.values();
-	let master_key_id = master_key_ids
-		.next()
-		.ok_or(err!(Request(InvalidParam("Master key contained no key."))))?;
-
-	if master_key_ids.next().is_some() {
-		return Err!(Request(InvalidParam("Master key contained more than one key.")));
-	}
-
-	let mut master_key_key = prefix.clone();
-	master_key_key.extend_from_slice(master_key_id.as_bytes());
-
-	Ok((master_key_key, master_key))
-}
-
-pub(super) fn parse_user_signing_key(user_signing_key: &Raw<CrossSigningKey>) -> Result<String> {
-	let mut user_signing_key_ids = user_signing_key
-		.deserialize()
-		.map_err(|_| err!(Request(InvalidParam("Invalid user signing key"))))?
-		.keys
-		.into_values();
-
-	let user_signing_key_id = user_signing_key_ids
-		.next()
-		.ok_or(err!(Request(InvalidParam("User signing key contained no key."))))?;
-
-	if user_signing_key_ids.next().is_some() {
-		return Err!(Request(InvalidParam("User signing key contained more than one key.")));
-	}
-
-	Ok(user_signing_key_id)
+	Ok((row, master_key))
 }
 
 /// Ensure that a user only sees signatures from themselves and the target user
@@ -1338,10 +1440,10 @@ where
 #[cfg(test)]
 mod tests {
 	use ruma::{
+		OwnedDeviceKeyId,
 		signatures::{Ed25519KeyPair, KeyPair},
 		user_id,
 	};
-	use tuwunel_database::serialize_to_vec;
 
 	use super::*;
 
@@ -1669,6 +1771,53 @@ mod tests {
 
 		assert_eq!(key, expected);
 	}
+
+	#[test]
+	fn device_key_id_with_long_multibyte_algorithm_parses() {
+		let key_id = long_multibyte_key_id();
+		let device_key_id: OwnedDeviceKeyId = key_id
+			.parse()
+			.expect("device key ID should parse");
+
+		assert_eq!(device_key_id.algorithm().as_str(), long_multibyte_algorithm());
+		assert_eq!(device_key_id.key_name().as_str(), "AAAA");
+
+		let keys = serde_json::json!({ &key_id: "public-key" }).to_string();
+		let keys: BTreeMap<OwnedDeviceKeyId, String> =
+			serde_json::from_str(&keys).expect("device key ID map key should deserialize");
+
+		assert!(keys.contains_key(&device_key_id));
+	}
+
+	#[test]
+	fn master_key_with_long_multibyte_key_id_parses() {
+		let user_id = user_id!("@alice:example.com");
+		let key_id = long_multibyte_key_id();
+		let master_key = serde_json::json!({
+			"user_id": user_id,
+			"usage": ["master"],
+			"keys": { &key_id: "public-key" },
+		});
+
+		let master_key: Raw<CrossSigningKey> = serde_json::from_str(&master_key.to_string())
+			.expect("master key should be valid JSON");
+
+		let (storage_key, master_key) =
+			parse_master_key(user_id, &master_key).expect("master key should parse");
+
+		let (parsed_key_id, _) = master_key
+			.keys
+			.first_key_value()
+			.expect("master key should keep its key");
+
+		assert_eq!(parsed_key_id.as_str(), key_id);
+		assert!(storage_key.ends_with(b"public-key"));
+	}
+
+	fn long_multibyte_key_id() -> String { format!("{}:AAAA", long_multibyte_algorithm()) }
+
+	// 129 two-byte characters make a 258-byte algorithm.
+	fn long_multibyte_algorithm() -> String { "é".repeat(129) }
 
 	#[test]
 	fn empty_one_time_key_counts_include_signed_zero() {

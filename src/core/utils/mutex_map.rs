@@ -10,9 +10,11 @@ use std::{
 	sync::{Arc, TryLockError::WouldBlock},
 };
 
+use futures::StreamExt;
+use itertools::Itertools;
 use tokio::sync::OwnedMutexGuard as Omg;
 
-use crate::{Result, err};
+use crate::{Result, err, utils::IterStream};
 
 /// Provides independent asynchronous mutexes keyed by owned values.
 ///
@@ -71,6 +73,29 @@ where
 		self.entry(k).lock().await
 	}
 
+	/// Acquires the asynchronous mutexes of several keys, one after another in
+	/// key order.
+	///
+	/// A key given more than once is locked once. Callers locking overlapping
+	/// sets this way wait for one another and never deadlock, since each takes
+	/// the keys they share in the same order.
+	#[tracing::instrument(level = "trace", skip_all)]
+	pub async fn lock_all<Keys, Guards>(&self, keys: Keys) -> Guards
+	where
+		Key: Debug + Ord + Sync,
+		Keys: IntoIterator<Item = Key>,
+		Keys::IntoIter: Send,
+		Guards: Default + Extend<Guard<Key, Val>> + Send,
+	{
+		keys.into_iter()
+			.sorted_unstable()
+			.dedup()
+			.stream()
+			.then(async move |key| self.lock(&key).await)
+			.collect()
+			.await
+	}
+
 	/// Attempts to acquire a key without waiting for its asynchronous mutex.
 	///
 	/// The key entry is created if absent, and contention returns an error
@@ -119,6 +144,22 @@ where
 	/// check locks the internal map and panics if that mutex is poisoned.
 	#[must_use]
 	pub fn len(&self) -> usize { self.map.lock().expect("locked").len() }
+
+	/// Returns a copy of the keys currently tracked.
+	///
+	/// Each key has a held mutex or contenders still referencing it, and the
+	/// two are not told apart. The copy is taken under the internal map lock,
+	/// which panics if poisoned.
+	#[must_use]
+	pub fn keys(&self) -> impl ExactSizeIterator<Item = Key> + Send + use<Key, Val> {
+		self.map
+			.lock()
+			.expect("locked")
+			.keys()
+			.cloned()
+			.collect::<Vec<_>>()
+			.into_iter()
+	}
 
 	fn entry<K>(&self, k: &K) -> Guard<Key, Val>
 	where

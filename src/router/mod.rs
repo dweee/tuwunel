@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod handle;
 mod layers;
 mod request;
@@ -24,7 +26,7 @@ pub extern "Rust" fn start(
 		.catch_unwind()
 		.map_err(Error::from_panic)
 		.unwrap_or_else(Err)
-		.boxed()
+		.boxed() // type-erasure boundary
 }
 
 #[unsafe(no_mangle)]
@@ -35,7 +37,7 @@ pub extern "Rust" fn stop(
 		.catch_unwind()
 		.map_err(Error::from_panic)
 		.unwrap_or_else(Err)
-		.boxed()
+		.boxed() // type-erasure boundary
 }
 
 #[unsafe(no_mangle)]
@@ -46,5 +48,5 @@ pub extern "Rust" fn run(
 		.catch_unwind()
 		.map_err(Error::from_panic)
 		.unwrap_or_else(Err)
-		.boxed()
+		.boxed() // type-erasure boundary
 }

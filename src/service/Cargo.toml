@@ -18,46 +18,50 @@ crate-type = [
 ]
 
 [features]
+default = [
+	"brotli_compression",
+	"console",
+	"element_hacks",
+	"email",
+	"gcs_storage",
+	"gzip_compression",
+	"ldap",
+	"markdown",
+	"media_thumbnail",
+	"release_max_log_level",
+	"s3_storage",
+	"systemd",
+	"url_preview",
+	"zstd_compression",
+	"tuwunel-core/default",
+	"tuwunel-database/default",
+	"tuwunel-matrix/default",
+]
+
 brotli_compression = [
 	"reqwest/brotli",
 	"tuwunel-core/brotli_compression",
-]
-bzip2_compression = [
-    "tuwunel-database/bzip2_compression",
 ]
 console = [
 	"dep:rustyline-async",
 	"dep:termimad",
 ]
 element_hacks = []
+email = [
+	"dep:lettre",
+]
+gcs_storage = [
+	"object_store/gcp",
+]
 gzip_compression = [
 	"reqwest/gzip",
 	"tuwunel-core/gzip_compression",
 ]
-io_uring = [
-	"tuwunel-database/io_uring",
-]
-jemalloc = [
-	"tuwunel-core/jemalloc",
-	"tuwunel-database/jemalloc",
-]
-jemalloc_conf = [
-	"tuwunel-core/jemalloc_conf",
-	"tuwunel-database/jemalloc_conf",
-]
-jemalloc_prof = [
-	"tuwunel-core/jemalloc_prof",
-	"tuwunel-database/jemalloc_prof",
-]
-jemalloc_stats = [
-	"tuwunel-core/jemalloc_stats",
-	"tuwunel-database/jemalloc_stats",
-]
 ldap = [
 	"dep:ldap3",
 ]
-lz4_compression = [
-	"tuwunel-database/lz4_compression",
+markdown = [
+	"ruma/markdown",
 ]
 media_thumbnail = [
 	"dep:image",
@@ -69,11 +73,14 @@ release_max_log_level = [
 	"tracing/release_max_level_info",
 	"tuwunel-core/release_max_log_level",
 	"tuwunel-database/release_max_log_level",
+	"tuwunel-matrix/release_max_log_level",
+]
+s3_storage = [
+	"object_store/aws",
 ]
 systemd = [
 	"dep:sd-notify",
 ]
-test_utils = []
 url_preview = [
 	"dep:image",
 	"dep:webpage",
@@ -103,6 +110,7 @@ ipaddress.workspace = true
 ldap3.workspace = true
 ldap3.optional = true
 lettre.workspace = true
+lettre.optional = true
 log.workspace = true
 loole.workspace = true
 lru-cache.workspace = true
@@ -120,7 +128,6 @@ serde.workspace = true
 serde_bytes.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
-subtle.workspace = true
 termimad.workspace = true
 termimad.optional = true
 tokio.workspace = true
@@ -130,6 +137,7 @@ url.workspace = true
 webpage.workspace = true
 webpage.optional = true
 tuwunel-core.workspace = true
+tuwunel-matrix.workspace = true
 tuwunel-database.workspace = true
 
 # killpg, for reaping a video thumbnail program's process group
@@ -141,22 +149,9 @@ sd-notify.workspace = true
 sd-notify.optional = true
 
 [dev-dependencies]
-tuwunel_service = { path = ".", features = ["test_utils"] }
-criterion.workspace = true
-insta.workspace = true
-maplit.workspace = true
 minicbor-serde.workspace = true
-similar.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "state_res"
-harness = false
-
-[[bench]]
-name = "state_res_msc4297"
-harness = false

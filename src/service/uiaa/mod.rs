@@ -1,10 +1,11 @@
 use std::{
-	collections::BTreeMap,
+	net::IpAddr,
 	ops::ControlFlow,
-	sync::{Arc, RwLock},
+	sync::{Arc, Mutex},
 };
 
 use futures::{TryStreamExt, pin_mut};
+use lru_cache::LruCache;
 use ruma::{
 	CanonicalJsonValue, DeviceId, OwnedDeviceId, OwnedUserId, UserId,
 	api::{
@@ -17,12 +18,14 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, err, error, extract, implement,
-	utils::{self, BoolExt, hash::verify_password, string::EMPTY},
+	utils::{self, BoolExt, hash::verify_password, json::serialized_len, string::EMPTY},
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
+use crate::users::is_password_hash;
+
 pub struct Service {
-	userdevicesessionid_uiaarequest: RwLock<RequestMap>,
+	userdevicesessionid_uiaarequest: Mutex<Requests>,
 	db: Data,
 	services: Arc<crate::services::OnceServices>,
 }
@@ -31,10 +34,24 @@ struct Data {
 	userdevicesessionid_uiaainfo: Arc<Map>,
 }
 
-type RequestMap = BTreeMap<RequestKey, CanonicalJsonValue>;
+type Requests = LruCache<RequestKey, CanonicalJsonValue>;
 type RequestKey = (OwnedUserId, OwnedDeviceId, String);
 
 pub const SESSION_ID_LENGTH: usize = 32;
+
+/// Maximum number of retained UIAA request bodies.
+///
+/// Inserting another session evicts the least recently used entry.
+const MAX_REQUESTS: usize = 1024;
+
+/// Maximum serialized body and owned key bytes per retained request.
+///
+/// Parsed JSON adds container overhead to this payload budget. Larger entries
+/// are not retained, so the client must resend the request fields.
+const MAX_REQUEST_BYTES: usize = 4_096;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Copy)]
 enum EmailIdentityMode {
@@ -42,10 +59,19 @@ enum EmailIdentityMode {
 	Claim,
 }
 
+struct Request<'a> {
+	user_id: &'a UserId,
+	device_id: &'a DeviceId,
+	auth: &'a AuthData,
+	uiaainfo: &'a UiaaInfo,
+	email_identity_mode: EmailIdentityMode,
+	client_ip: Option<IpAddr>,
+}
+
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
-			userdevicesessionid_uiaarequest: RwLock::new(RequestMap::new()),
+			userdevicesessionid_uiaarequest: Requests::new(MAX_REQUESTS).into(),
 			db: Data {
 				userdevicesessionid_uiaainfo: args.db["userdevicesessionid_uiaainfo"].clone(),
 			},
@@ -88,9 +114,17 @@ pub async fn try_auth(
 	device_id: &DeviceId,
 	auth: &AuthData,
 	uiaainfo: &UiaaInfo,
+	client_ip: Option<IpAddr>,
 ) -> Result<(bool, UiaaInfo)> {
-	self.try_auth_inner(user_id, device_id, auth, uiaainfo, EmailIdentityMode::Validate)
-		.await
+	self.try_auth_inner(Request {
+		user_id,
+		device_id,
+		auth,
+		uiaainfo,
+		email_identity_mode: EmailIdentityMode::Validate,
+		client_ip,
+	})
+	.await
 }
 
 /// Authenticate one registration stage and claim an email proof when present.
@@ -104,20 +138,30 @@ pub async fn try_auth_registration(
 	device_id: &DeviceId,
 	auth: &AuthData,
 	uiaainfo: &UiaaInfo,
+	client_ip: Option<IpAddr>,
 ) -> Result<(bool, UiaaInfo)> {
-	self.try_auth_inner(user_id, device_id, auth, uiaainfo, EmailIdentityMode::Claim)
-		.await
+	self.try_auth_inner(Request {
+		user_id,
+		device_id,
+		auth,
+		uiaainfo,
+		email_identity_mode: EmailIdentityMode::Claim,
+		client_ip,
+	})
+	.await
 }
 
 #[implement(Service)]
-async fn try_auth_inner(
-	&self,
-	user_id: &UserId,
-	device_id: &DeviceId,
-	auth: &AuthData,
-	uiaainfo: &UiaaInfo,
-	email_identity_mode: EmailIdentityMode,
-) -> Result<(bool, UiaaInfo)> {
+async fn try_auth_inner(&self, request: Request<'_>) -> Result<(bool, UiaaInfo)> {
+	let Request {
+		user_id,
+		device_id,
+		auth,
+		uiaainfo,
+		email_identity_mode,
+		client_ip,
+	} = request;
+
 	let mut uiaainfo = if let Some(session) = auth.session() {
 		self.get_uiaa_session(user_id, device_id, session)
 			.await?
@@ -132,8 +176,11 @@ async fn try_auth_inner(
 	match auth {
 		// Find out what the user completed
 		| AuthData::Password(password) => {
+			let client_ip = client_ip
+				.ok_or_else(|| err!("Missing client address for password authentication."))?;
+
 			if let ControlFlow::Break(authed) = self
-				.verify_password(user_id, &mut uiaainfo, password)
+				.verify_password(user_id, &mut uiaainfo, password, client_ip)
 				.await?
 			{
 				return Ok((authed, uiaainfo));
@@ -319,6 +366,7 @@ async fn verify_password(
 	user_id: &UserId,
 	uiaainfo: &mut UiaaInfo,
 	password: &Password,
+	client_ip: IpAddr,
 ) -> Result<ControlFlow<bool>> {
 	let Password { identifier, password, user, .. } = password;
 
@@ -335,39 +383,58 @@ async fn verify_password(
 		return Err!(Request(Forbidden("User ID and access token mismatch.")));
 	}
 
-	let user_id = user_id_from_username;
-	// First try local password hash verification
-	let password_verified = self
+	// A stolen access token must not become an unlimited password oracle.
+	let reservation = self
+		.services
+		.login_ratelimit
+		.reserve_uiaa_attempt(user_id, client_ip)?;
+
+	// First try local password hash verification; `None` when the account has
+	// no local password to check.
+	let verified = self
 		.services
 		.users
-		.password_hash(&user_id)
+		.password_hash(user_id)
 		.await
-		.is_ok_and(|hash| verify_password(password, &hash).is_ok());
+		.ok()
+		.filter(|hash| is_password_hash(hash))
+		.map(|hash| verify_password(password, &hash).is_ok());
 
 	// Only LDAP-origin accounts fall back to LDAP; others would trigger a
 	// directory-wide search.
 	#[cfg(feature = "ldap")]
-	let password_verified = if !password_verified
+	let verified = if verified != Some(true)
 		&& self.services.server.config.ldap.enable
 		&& self
 			.services
 			.users
-			.origin(&user_id)
+			.origin(user_id)
 			.await
 			.is_ok_and(|origin| origin == "ldap")
-		&& let Ok(dns) = self.services.users.search_ldap(&user_id).await
+		&& let Ok(dns) = self.services.users.search_ldap(user_id).await
 		&& let Some((user_dn, _is_admin)) = dns.first()
 	{
-		self.services
+		let bound = self
+			.services
 			.users
 			.auth_ldap(user_dn, password)
 			.await
-			.is_ok()
+			.is_ok();
+
+		Some(bound)
 	} else {
-		password_verified
+		verified
 	};
 
-	if !password_verified {
+	// Only the failed-attempt axis, since re-entering a password opens no
+	// session; a password checked and refused keeps the reservation.
+	if verified != Some(false) {
+		self.services
+			.login_ratelimit
+			.refund_login_attempt(reservation)?;
+	}
+
+	if verified != Some(true) {
 		uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
 			kind: ErrorKind::forbidden(),
 			message: "Invalid username or password.".to_owned(),
@@ -389,11 +456,20 @@ fn set_uiaa_request(
 	session: &str,
 	request: &CanonicalJsonValue,
 ) {
+	let available = MAX_REQUEST_BYTES
+		.saturating_sub(user_id.as_str().len())
+		.saturating_sub(device_id.as_str().len())
+		.saturating_sub(session.len());
+
+	if !serialized_len(request).is_ok_and(|len| len <= available) {
+		return;
+	}
+
 	let key = (user_id.to_owned(), device_id.to_owned(), session.to_owned());
 
 	self.userdevicesessionid_uiaarequest
-		.write()
-		.expect("locked for writing")
+		.lock()
+		.expect("locked")
 		.insert(key, request.to_owned());
 }
 
@@ -408,9 +484,9 @@ pub fn get_uiaa_request(
 	let key = (user_id.to_owned(), device_id.to_owned(), session.to_owned());
 
 	self.userdevicesessionid_uiaarequest
-		.read()
-		.expect("locked for reading")
-		.get(&key)
+		.lock()
+		.expect("locked")
+		.get_mut(&key)
 		.cloned()
 }
 
@@ -430,6 +506,13 @@ pub fn update_uiaa_session(
 			.put(key, Json(uiaainfo));
 	} else {
 		self.db.userdevicesessionid_uiaainfo.del(key);
+
+		let key = (user_id.to_owned(), device_id.to_owned(), session.to_owned());
+
+		self.userdevicesessionid_uiaarequest
+			.lock()
+			.expect("locked")
+			.remove(&key);
 	}
 }
 

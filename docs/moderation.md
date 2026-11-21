@@ -62,8 +62,11 @@ commands. Run any command with `--help` for argument detail.
   Neither command touches the `m.federate` property of the room's
   `m.room.create` event, which is fixed when the room is created; see
   [Troubleshooting](./troubleshooting.md).
-- `!admin federation incoming-federation`: lists rooms with active inbound
-  PDU handlers.
+- `!admin federation incoming-federation`: lists the incoming events whose
+  missing earlier events the server is fetching or processing (room, event,
+  origin server, phase, elapsed time), then the rooms where another federation
+  step, such as a transaction, a join or a backfill, holds the room's
+  federation lock. A room with a listed event is left out of the second list.
 - `!admin federation fetch-support-well-known <server>`: fetches a remote
   server's `.well-known/matrix/support` record (administrator and security
   contacts), letting you raise abuse reports out-of-band before resorting to
@@ -72,7 +75,8 @@ commands. Run any command with `--help` for argument detail.
 ### Users
 
 - `!admin users deactivate <user>`: deactivates a local account; by default
-  also leaves all rooms.
+  also leaves all rooms. The last active admin cannot be deactivated, by this
+  command or any other route: make another user an admin first.
 - `!admin users deactivate-all`: bulk variant accepting a code block of
   usernames.
 - `!admin users reject-invites <user>`: rejects all pending invites, with
@@ -226,10 +230,11 @@ Domain policy:
   loose; treat as "anything mentioning this string passes".
 - `url_preview_domain_explicit_allowlist`: strict equality match on the host.
 - `url_preview_domain_explicit_denylist`: strict equality match, evaluated
-  before the allowlist.
-- `url_preview_check_root_domain`: when `true`, applies the contains and
-  explicit allowlists against the root domain, so an allow on `wikipedia.org`
-  also lets `en.m.wikipedia.org` through.
+  before the allowlists unless one of them holds `"*"`.
+- `url_preview_check_root_domain`: when `true`, retries the explicit
+  denylist and allowlist against the host with its first label removed, so an
+  explicit allow on `wikipedia.org` also lets `en.wikipedia.org` through, but
+  not `en.m.wikipedia.org`.
 - `url_preview_max_spider_size` (bytes; SI/IEC suffix accepted): caps the
   spider response body.
 - `url_preview_bound_interface`: pins outbound preview requests to a specific

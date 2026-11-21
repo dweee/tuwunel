@@ -50,7 +50,17 @@ pub(crate) enum RoomModerationCommand {
 }
 
 async fn do_ban_room(services: &Services, room_id: &RoomId) {
+	let federation_lock = services
+		.event_handler
+		.mutex_federation
+		.lock(room_id)
+		.await;
+
+	let state_lock = services.state.mutex.lock(room_id).await;
+
 	services.metadata.ban_room(room_id);
+	drop(state_lock);
+	drop(federation_lock);
 
 	debug!("Banned {room_id} successfully");
 
@@ -60,7 +70,7 @@ async fn do_ban_room(services: &Services, room_id: &RoomId) {
 		.room_members(room_id)
 		.ready_filter(|user| services.globals.user_is_local(user))
 		.map(ToOwned::to_owned)
-		.boxed();
+		.boxed(); // Unpin for next
 
 	while let Some(ref user_id) = users.next().await {
 		debug!(
@@ -78,9 +88,12 @@ async fn do_ban_room(services: &Services, room_id: &RoomId) {
 			warn!("Failed to leave room: {e}");
 		}
 
-		drop(state_lock);
-
-		services.state_cache.forget(room_id, user_id);
+		services
+			.state_cache
+			.forget(room_id, user_id)
+			.await
+			.inspect_err(|error| warn!(%user_id, %room_id, %error, "Failed to forget room"))
+			.ok();
 	}
 
 	// remove any local aliases, ignore errors

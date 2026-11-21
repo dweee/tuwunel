@@ -7,11 +7,18 @@ connections. The packaged service units wire `systemctl reload` to that signal:
 systemctl reload tuwunel
 ```
 
-Sending the signal by hand does the same thing, and is the route to use in a
-container or when running the binary directly:
+If you run the binary directly, send the same signal by hand:
 
 ```bash
 kill -USR1 "$(pidof tuwunel)"
+```
+
+For a container deployment, send the signal from the host with `docker kill`.
+The release images have no shell, `kill` or `pidof` to run inside them. Their
+entrypoint is `tuwunel`, so it receives the signal directly:
+
+```bash
+docker kill --signal=USR1 <container>
 ```
 
 A reload rebuilds the configuration from the same sources the server started
@@ -60,10 +67,12 @@ a freshly started server reads `Running`.
 ## What a reload applies
 
 Options documented `reloadable: yes` in `tuwunel-example.toml` take effect
-immediately. Two are rejected outright, failing the whole reload:
+immediately. Three are rejected outright, failing the whole reload:
 
 - `server_name`
 - `ip_source`
+- any `[global.storage_provider.<ID>]` section, whether added, removed or
+  changed
 
 Two more are refused outright rather than merely ignored, because the server
 would refuse to start with them set in a file: `maintenance` and

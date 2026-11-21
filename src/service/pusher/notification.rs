@@ -4,22 +4,25 @@ use futures::{StreamExt, future::join3, stream::select};
 use ruma::{EventId, OwnedEventId, RoomId, UserId, events::receipt::ReceiptThread};
 use serde::Serialize;
 use tuwunel_core::{
-	Result, implement, trace,
+	Error, Result, implement, trace,
 	utils::{
+		bytes::{escape_bytes, u64_from_bytes},
 		stream::{BroadbandExt, ReadyExt, TryIgnore},
-		u64_from_u8,
 	},
+	warn,
 };
 use tuwunel_database::{
 	Deserialized, Ignore, IgnoreAll, Interfix, KeyBuf, deserialize_from_slice as deserialize_key,
 };
+use tuwunel_matrix::Event;
 
 /// Per-thread unread counts: `(notification, highlight)` keyed by thread root.
 type ThreadCounts = BTreeMap<OwnedEventId, (u64, u64)>;
 
-/// Per-thread last-read counts keyed by thread root. Used by sync v3 to
-/// gate emission of `unread_thread_notifications` to threads whose read
-/// cursor advanced within the sync window.
+/// Per-thread last-read counts keyed by thread root.
+///
+/// Sync compares each count against its window to tell whether a thread's zero
+/// is news to the client.
 type ThreadLastReads = BTreeMap<OwnedEventId, u64>;
 
 /// Reset the room's main-timeline notification counts.
@@ -177,7 +180,8 @@ pub async fn notification_count(&self, user_id: &UserId, room_id: &RoomId) -> u6
 
 /// Return the user's account-wide unread notification count.
 ///
-/// Joined main and thread rows contribute to a saturating total.
+/// Joined main and thread rows contribute to a saturating total. A row whose
+/// key or count cannot be read is logged and contributes nothing.
 #[implement(super::Service)]
 #[tracing::instrument(level = "trace", skip(self), ret)]
 pub async fn global_notification_count(&self, user_id: &UserId) -> u64 {
@@ -186,13 +190,16 @@ pub async fn global_notification_count(&self, user_id: &UserId) -> u64 {
 		.stream_prefix_raw(&(user_id, Interfix))
 		.ignore_err()
 		.ready_filter_map(|(key, count)| {
-			let count = u64_from_u8(count);
+			let count = u64_from_bytes(count)
+				.inspect_err(|error| warn_unreadable(key, error))
+				.ok()?;
 
-			(count > 0).then(|| (KeyBuf::from(key), count))
+			count.gt(&0).then(|| (KeyBuf::from(key), count))
 		})
 		.broad_filter_map(async |(key, count)| {
-			let (_, room_id, _): (Ignore, &RoomId, IgnoreAll) =
-				deserialize_key(&key).expect("notification count key");
+			let (_, room_id, _): (Ignore, &RoomId, IgnoreAll) = deserialize_key(&key)
+				.inspect_err(|error| warn_unreadable(&key, error))
+				.ok()?;
 
 			self.services
 				.state_cache
@@ -202,6 +209,11 @@ pub async fn global_notification_count(&self, user_id: &UserId) -> u64 {
 		})
 		.ready_fold(0_u64, u64::saturating_add)
 		.await
+}
+
+fn warn_unreadable(key: &[u8], error: &Error) {
+	// Stock release builds strip `debug_warn!`, and nothing else would show this row.
+	warn!(key = %escape_bytes(key), %error, "Skipping unreadable notification count.");
 }
 
 #[implement(super::Service)]
@@ -268,10 +280,69 @@ fn merge_thread_count(
 	counts
 }
 
+/// Whether the user has read past one notified event.
+///
+/// The room's main watermark covers every notification up to it, and a
+/// notification in a thread is also read once that thread's watermark passes
+/// it. `count` is the event's position, comparable with both.
+#[implement(super::Service)]
+#[tracing::instrument(
+	level = "debug",
+	skip(self, event),
+	fields(
+		event_id = %event.event_id(),
+	),
+)]
+pub async fn notification_read<E>(&self, user_id: &UserId, event: &E, count: u64) -> bool
+where
+	E: Event,
+{
+	let room_id = event.room_id();
+	let read_past = |last_read: Result<u64>| last_read.is_ok_and(|last_read| last_read >= count);
+
+	let main_read = self
+		.last_notification_read(user_id, room_id)
+		.await;
+
+	if read_past(main_read) {
+		return true;
+	}
+
+	let Some(thread_root) = self.services.threads.get_thread_id(event).await else {
+		return false;
+	};
+
+	let thread_read = self
+		.last_thread_notification_read(user_id, room_id, &thread_root)
+		.await;
+
+	read_past(thread_read)
+}
+
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self), ret(level = "trace"))]
 pub async fn last_notification_read(&self, user_id: &UserId, room_id: &RoomId) -> Result<u64> {
 	let key = (room_id, user_id);
+	self.db
+		.roomuserid_lastnotificationread
+		.qry(&key)
+		.await
+		.deserialized()
+}
+
+/// Read the last notification watermark for one thread.
+///
+/// Uses the same room, user and thread key as thread count resets.
+#[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip(self), ret(level = "trace"))]
+pub async fn last_thread_notification_read(
+	&self,
+	user_id: &UserId,
+	room_id: &RoomId,
+	thread_root: &EventId,
+) -> Result<u64> {
+	let key = (room_id, user_id, thread_root);
+
 	self.db
 		.roomuserid_lastnotificationread
 		.qry(&key)

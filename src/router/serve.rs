@@ -28,11 +28,39 @@ pub(super) async fn serve(services: Arc<Services>, handle: ServerHandle) -> Resu
 	let server = &services.server;
 	let config = &server.config;
 
+	#[cfg(not(feature = "oidc"))]
+	if services.oauth.get_server().is_ok() {
+		return if config.authentication.oidc.native_auth {
+			Err!(Config(
+				"authentication.oidc.native_auth",
+				"tuwunel was not built with OIDC support (\"oidc\")"
+			))
+		} else {
+			Err!(Config(
+				"identity_provider",
+				"tuwunel was not built with OIDC support (\"oidc\")"
+			))
+		};
+	}
+
+	#[cfg(not(feature = "mas"))]
+	if config
+		.authentication
+		.mas_secret
+		.as_deref()
+		.is_some_and(|secret| !secret.is_empty())
+	{
+		return Err!(Config(
+			"authentication.mas_secret",
+			"tuwunel was not built with MAS provisioning support (\"mas\")"
+		));
+	}
+
 	let (app, _guard) = layers::build(&services)?;
 
 	let mut join_set = JoinSet::new();
 
-	let socket_path = &config.unix_socket_path;
+	let socket_path = &config.http.listen.unix_socket_path;
 
 	#[cfg(unix)]
 	let (passed_tcp_listeners, passed_unix_listeners) = systemd_listeners()?;
@@ -266,7 +294,7 @@ fn bind_addrs(
 				error!(%addr, %e, "Not binding: the default address is unavailable.");
 				continue;
 			},
-			| Err(e) => return Err!(Config("address", "Failed to bind {addr}: {e}")),
+			| Err(e) => return Err!(Config("http.listen.address", "Failed to bind {addr}: {e}")),
 		};
 
 		listener.set_nonblocking(true)?;

@@ -16,6 +16,10 @@ use self::client::{Client, field, register, wait_until_ready};
 
 mod client;
 
+#[expect(dead_code)] // Only the self-membership action is used from the add-on.
+#[path = "client/membership.rs"]
+mod membership;
+
 const IGNORED_TOKEN: &str = "threads-ignored-replies-ignored-token";
 const READER_TOKEN: &str = "threads-ignored-replies-reader-token";
 const VISIBLE_TOKEN: &str = "threads-ignored-replies-visible-token";
@@ -25,10 +29,9 @@ fn threads_retain_roots_when_every_reply_is_ignored() -> Result {
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
 	let port = listener.local_addr()?.port();
 	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_loopback_listener(port)
 		.with_option("listening=true")
-		.with_option("bundle_edit_relations=true");
+		.with_option("rooms.relations.bundle_edits=true");
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -74,8 +77,8 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.create_room(&json!({ "preset": "public_chat" }))
 		.await?;
 
-	ignored.join(&room).await?;
-	visible.join(&room).await?;
+	ignored.act(&room, "join").await?;
+	visible.act(&room, "join").await?;
 
 	let root_visible = visible
 		.message(&room, "root-visible", "visible root")
@@ -214,22 +217,6 @@ fn event<'a>(pages: &'a [&Value], event_id: &EventId) -> Result<&'a Value> {
 
 fn thread_summary(event: &Value) -> Option<&Value> {
 	event.pointer("/unsigned/m.relations/m.thread")
-}
-
-#[implement(Client, params = "<'_>")]
-async fn join(&self, room_id: &RoomId) -> Result {
-	self.services
-		.client
-		.clients
-		.default
-		.post(self.url(&format!("rooms/{room_id}/join")))
-		.bearer_auth(self.token)
-		.json(&json!({}))
-		.send()
-		.await?
-		.error_for_status()?;
-
-	Ok(())
 }
 
 #[implement(Client, params = "<'_>")]

@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use futures::{
 	FutureExt, StreamExt, TryFutureExt,
 	future::{join, ready},
-	pin_mut,
 };
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedServerName, RoomId, UserId,
@@ -17,16 +16,20 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Error, Result, async_noinline, debug_info, debug_warn, err, implement,
-	matrix::{PduCount, pdu::check_rules, room_version},
-	pdu::PduBuilder,
 	utils::{self, FutureBoolExt, future::ReadyBoolExt},
 	warn,
+};
+use tuwunel_matrix::{
+	PduCount,
+	pdu::{PduBuilder, check_rules},
+	room_version,
 };
 
 use super::Service;
 use crate::rooms::{state_cache::MembershipUpdate, timeline::RoomMutexGuard};
 
 #[implement(Service)]
+// cross-crate codegen firewall
 #[async_noinline]
 #[tracing::instrument(
     name = "leave",
@@ -52,15 +55,6 @@ pub async fn leave<'a>(
 		third_party_invite: None,
 		blurhash: None,
 	};
-
-	let is_banned = self.services.metadata.is_banned(room_id);
-	let is_disabled = self.services.metadata.is_disabled(room_id);
-	pin_mut!(is_banned, is_disabled);
-	if is_banned.or(is_disabled).await {
-		return self
-			.clear_local_leave(user_id, room_id, leave_content, None)
-			.await;
-	}
 
 	let member_event = self
 		.services
@@ -102,11 +96,16 @@ async fn leave_via_remote(
 	reason: Option<String>,
 	leave_content: RoomMemberEventContent,
 ) -> Result {
-	if let Err(e) = self
-		.remote_leave(user_id, room_id, reason)
-		.boxed()
-		.await
-	{
+	let is_banned = self.services.metadata.is_banned(room_id);
+	let is_disabled = self.services.metadata.is_disabled(room_id);
+
+	if is_banned.or(is_disabled).await {
+		return self
+			.clear_local_leave(user_id, room_id, leave_content, None)
+			.await;
+	}
+
+	if let Err(e) = self.remote_leave(user_id, room_id, reason).await {
 		warn!(%user_id, "Failed to leave room {room_id} remotely: {e}");
 	}
 
@@ -234,18 +233,30 @@ async fn clear_local_leave(
 	leave_content: RoomMemberEventContent,
 	last_state: Option<Vec<Raw<AnyStrippedStateEvent>>>,
 ) -> Result {
+	// Preserve the departure position used for history visibility.
+	if self
+		.services
+		.state_cache
+		.user_membership(user_id, room_id)
+		.map(|membership| membership.as_ref().is_some_and(is_leaveable))
+		.is_false()
+		.await
+	{
+		return Ok(());
+	}
+
 	let count = self.services.globals.next_count();
+
 	self.services
 		.state_cache
 		.update_membership(MembershipUpdate {
-			room_id,
-			user_id,
-			membership_event: leave_content,
-			sender: user_id,
 			last_state,
-			invite_via: None,
-			update_joined_count: true,
-			count: PduCount::Normal(*count),
+			..MembershipUpdate::self_sent(
+				room_id,
+				user_id,
+				leave_content,
+				PduCount::Normal(*count),
+			)
 		})
 		.await
 }

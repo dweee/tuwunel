@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use futures::{Stream, StreamExt, TryStreamExt};
 use ruma::{
-	MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomId, UInt, UserId,
+	EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomId, UInt, UserId,
 	api::appservice::event::push_events::v1::EphemeralData,
 	events::{
 		AnySyncEphemeralRoomEvent, SyncEphemeralRoomEvent,
@@ -21,15 +21,15 @@ use tuwunel_core::{
 	Result, debug,
 	debug::INFO_SPAN_LEVEL,
 	err,
-	matrix::{
-		Event,
-		pdu::{PduCount, PduId, RawPduId},
-	},
 	result::NotFound,
 	smallstr::SmallString,
 	smallvec::SmallVec,
 	utils::{BoolExt, IterStream},
 	warn,
+};
+use tuwunel_matrix::{
+	Event,
+	pdu::{PduCount, PduId, RawPduId},
 };
 
 use self::data::{Data, ReceiptItem};
@@ -129,6 +129,16 @@ impl Service {
 		}
 
 		true
+	}
+
+	/// Whether a marker at `incoming` supersedes one stored at `current`, by
+	/// the ordering read receipts are gated on.
+	///
+	/// An identical event id never advances, and an id that does not resolve
+	/// to a known PDU on either side counts as an advance.
+	#[tracing::instrument(level = "debug", skip(self), ret(level = "trace"))]
+	pub async fn receipt_advanced(&self, current: Option<&EventId>, incoming: &EventId) -> bool {
+		self.db.receipt_advanced(current, incoming).await
 	}
 
 	/// Gets every stored private read receipt for `(room, user)`. Returns
@@ -490,20 +500,34 @@ pub fn pack_receipts_fallible<I>(
 where
 	I: Iterator<Item = Raw<AnySyncEphemeralRoomEvent>>,
 {
-	let json = receipts.try_fold(BTreeMap::new(), |mut json, value| -> Result<_> {
-		let value = serde_json::from_str::<SyncEphemeralRoomEvent<ReceiptEventContent>>(
-			value.json().get(),
-		)?;
+	let content =
+		receipts.try_fold(ReceiptEventContent(BTreeMap::new()), |json, value| -> Result<_> {
+			let value = serde_json::from_str::<SyncEphemeralRoomEvent<ReceiptEventContent>>(
+				value.json().get(),
+			)?;
 
-		for (event, receipt) in value.content {
-			json.insert(event, receipt);
-		}
+			Ok(merge_receipts(json, value.content))
+		})?;
 
-		Ok(json)
-	})?;
-
-	let content = ReceiptEventContent(json);
 	let event = to_raw_value(&SyncEphemeralRoomEvent { content })?;
 
 	Ok(Raw::from_json(event))
+}
+
+fn merge_receipts(
+	mut content: ReceiptEventContent,
+	incoming: ReceiptEventContent,
+) -> ReceiptEventContent {
+	for (event, receipts) in incoming {
+		let merged = content.0.entry(event).or_default();
+
+		for (receipt_type, users) in receipts {
+			merged
+				.entry(receipt_type)
+				.or_default()
+				.extend(users);
+		}
+	}
+
+	content
 }

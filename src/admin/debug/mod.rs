@@ -1,4 +1,6 @@
+mod backoff_metrics;
 mod change_log_level;
+#[cfg(feature = "jwt_login")]
 mod create_jwt;
 mod database_files;
 mod database_stats;
@@ -22,12 +24,15 @@ mod list_dependencies;
 mod memory_stats;
 mod parse_pdu;
 mod ping;
+mod prev_walk_metrics;
+mod prev_walk_rooms;
 mod rebuild_relation_index;
 mod rebuild_thread_index;
 mod resolve_true_destination;
 mod resync_database;
 mod runtime_interval;
 mod runtime_metrics;
+mod show_remote_pdu;
 mod sign_json;
 mod state_at_incoming;
 mod state_local_metrics;
@@ -86,6 +91,16 @@ pub(super) enum DebugCommand {
 
 		/// PduCount integer
 		count: i64,
+	},
+
+	/// - Requests a PDU from a remote server and prints the result. The PDU is
+	///   not inserted into the database.
+	ShowRemotePdu {
+		/// An event ID (a $ followed by the base64 reference hash)
+		event_id: OwnedEventId,
+
+		/// Server to fetch the PDU from
+		server: OwnedServerName,
 	},
 
 	/// - Attempts to retrieve a PDU from a remote server. Inserts it into our
@@ -265,6 +280,30 @@ pub(super) enum DebugCommand {
 	/// Difference two snapshots to observe an interval.
 	StateLocalMetrics,
 
+	/// - Print process-lifetime incoming prev-walk metrics.
+	///
+	/// Difference two snapshots to observe an interval.
+	PrevWalkMetrics,
+
+	/// - Print process-lifetime backoff verdict metrics.
+	///
+	/// Difference two snapshots to observe an interval.
+	BackoffMetrics,
+
+	/// - Print the prev walk passes recorded per room, kept for up to three days.
+	///
+	/// Without a room, lists the rooms with the most recorded passes and their
+	/// totals. With a room, lists its latest passes. A pass is recorded when it
+	/// ends, unless a backoff hold withheld it or its fetch left nothing to walk.
+	PrevWalkRooms {
+		/// The room to list the latest passes of
+		room_id: Option<OwnedRoomId>,
+
+		/// How many rooms or passes to list
+		#[arg(short, long, default_value_t = 20)]
+		limit: usize,
+	},
+
 	/// - Print detailed tokio task metrics accumulated since last command
 	///   invocation.
 	TaskInterval,
@@ -298,6 +337,7 @@ pub(super) enum DebugCommand {
 	},
 
 	/// - Create a JWT token for login
+	#[cfg(feature = "jwt_login")]
 	CreateJwt {
 		/// Localpart of the user's MXID
 		user: String,

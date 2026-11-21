@@ -2,17 +2,16 @@ use std::{
 	borrow::Cow,
 	collections::BTreeMap,
 	ffi::c_int,
-	fmt::Write as _,
-	fs,
+	fs::{read, write},
 	sync::{Mutex, OnceLock, PoisonError},
 };
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Ident, TokenStream as TokenStream2};
 use quote::{ToTokens, format_ident, quote};
 use syn::{
-	Error, Expr, ExprLit, Field, Fields, FieldsNamed, ItemStruct, Lit, LitStr, Meta, MetaList,
-	MetaNameValue, Token, Type, TypePath, ext::IdentExt as _, parse::Parser,
+	Attribute, Error, Expr, ExprLit, Field, Fields, FieldsNamed, ItemStruct, Lit, LitStr, Meta,
+	MetaList, MetaNameValue, Token, Type, TypePath, ext::IdentExt as _, parse::Parser,
 	punctuated::Punctuated, spanned::Spanned,
 };
 
@@ -23,15 +22,47 @@ use crate::{
 
 const UNDOCUMENTED: &str = "# This item is undocumented. Please contribute documentation for it.";
 
-const HIDDEN: &[&str] = &["default", "display", "config-example"];
+const HIDDEN: &[&str] = &["default", "display", "config-example", "legacy"];
 
-// Per-filename buffer, accumulated across all macro invocations in this rustc
-// process and flushed once at process exit. The `global` section truncates the
-// buffer; subsequent sections append. The flush hook compares the accumulated
-// buffer against the file on disk and only rewrites when content differs, so
-// `cargo check` / `clippy` runs that produce identical output do not bump the
-// file mtime.
-static FILE_BUFFERS: Mutex<BTreeMap<String, Vec<u8>>> = Mutex::new(BTreeMap::new());
+const RULE_WIDTH: usize = 80;
+
+type Sections = BTreeMap<String, Vec<u8>>;
+
+struct Registration<'a> {
+	input: &'a ItemStruct,
+	cfg_attrs: &'a [TokenStream2],
+	section: &'a str,
+	section_aliases: &'a str,
+	about: &'a str,
+	section_buf: &'a str,
+	fields: &'a [TokenStream2],
+	group: bool,
+}
+
+struct Rendering<'a> {
+	section: &'a str,
+	undocumented: &'a str,
+	ignore: &'a str,
+	hidden: &'a str,
+	forbidden: &'a str,
+	group: bool,
+}
+
+#[derive(Default)]
+struct Rendered {
+	summary: TokenStream2,
+	fields: Vec<TokenStream2>,
+	example: String,
+}
+
+struct RenderedField {
+	summary: TokenStream2,
+	spec: TokenStream2,
+	example: String,
+}
+
+// Section paths give both writers the same parent-before-child ordering.
+static FILE_BUFFERS: Mutex<BTreeMap<String, Sections>> = Mutex::new(BTreeMap::new());
 static FLUSH_REGISTERED: OnceLock<()> = OnceLock::new();
 
 unsafe extern "C" {
@@ -72,144 +103,64 @@ fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<Tok
 
 	let section_aliases = settings
 		.get("section_aliases")
-		.map_or("", String::as_str)
-		.split_ascii_whitespace();
+		.map_or("", String::as_str);
 
-	let contains = |fields: &str, name: &str| {
-		fields
-			.split_ascii_whitespace()
-			.any(|field| field == name)
+	let group = settings
+		.get("group")
+		.is_some_and(|value| value == "true");
+
+	let rendering = Rendering {
+		section,
+		undocumented,
+		ignore,
+		hidden,
+		forbidden,
+		group,
 	};
 
-	let truncate = section == "global";
-	let mut section_buf = String::new();
-
-	if let Some(header) = settings.get("header") {
-		section_buf.push_str(header);
-	}
-
-	let comment_prefix = if section != "global" { "\n#" } else { "" };
-
-	write!(&mut section_buf, "\n\n{comment_prefix}[{section}]\n")
-		.expect("written to section buffer");
-
-	let (summary, fields) = if let Fields::Named(FieldsNamed { named, .. }) = &input.fields {
+	let rendered = if let Fields::Named(FieldsNamed { named, .. }) = &input.fields {
 		let capacity = named.len();
+		let output = Rendered {
+			summary: TokenStream2::new(),
+			fields: Vec::with_capacity(capacity),
+			example: String::new(),
+		};
 
 		named
 			.iter()
 			.filter(|field| get_type_name(field).is_some())
 			.filter_map(|field| field.ident.as_ref().map(|ident| (field, ident)))
-			.fold(
-				(Vec::with_capacity(capacity), Vec::with_capacity(capacity)),
-				|(mut summary, mut fields), (field, ident)| {
-					let name = ident.to_string();
-					let is_hidden = contains(hidden, name.as_str());
-					let (class, documented) = match () {
-						| () if contains(forbidden, name.as_str()) =>
-							(quote! { crate::config::regenerate::FieldClass::Forbidden }, false),
-						| () if is_hidden =>
-							(quote! { crate::config::regenerate::FieldClass::Hidden }, false),
-						| () if contains(ignore, name.as_str()) =>
-							(quote! { crate::config::regenerate::FieldClass::Structural }, false),
-						| () =>
-							(quote! { crate::config::regenerate::FieldClass::Documented }, true),
-					};
-
-					let example = example_value(field);
-					let aliases = get_serde_aliases(field);
-					let spec_example = is_hidden
-						.then_some(example.as_ref())
-						.unwrap_or_default();
-
-					let field_spec = quote! {
-						crate::config::regenerate::FieldSpec {
-							name: #name,
-							aliases: &[#(#aliases),*],
-							example: #spec_example,
-							class: #class,
-						}
-					};
-
-					fields.push(field_spec);
-
-					if !documented {
-						return (summary, fields);
-					}
-
-					let doc = get_doc_comment(field)
-						.unwrap_or_else(|| undocumented.into())
-						.trim_end()
-						.to_owned();
-
-					// A `reloadable:` directive alone does not satisfy the documentation
-					// request; prepend the undocumented placeholder when prose is absent.
-					let doc = if doc.lines().all(|line| {
-						let body = line.trim_start_matches('#').trim();
-						body.is_empty() || body.starts_with("reloadable:")
-					}) {
-						format!("{undocumented}\n{doc}")
-					} else {
-						doc
-					};
-
-					let doc = if doc.ends_with('#') {
-						format!("{doc}\n")
-					} else {
-						format!("{doc}\n#\n")
-					};
-
-					let example_separator = (!example.is_empty())
-						.then_some(" ")
-						.unwrap_or_default();
-
-					write!(&mut section_buf, "\n{doc}").expect("written to section buffer");
-
-					writeln!(&mut section_buf, "#{ident} ={example_separator}{example}")
-						.expect("written to section buffer");
-
-					let display = get_doc_comment_line(field, "display");
-					let display_directive = |key| {
-						display
-							.as_ref()
-							.into_iter()
-							.flat_map(|display| display.split(' '))
-							.any(|directive| directive == key)
-					};
-
-					if !display_directive("hidden") {
-						let value = if display_directive("sensitive") {
-							quote! { "***********" }
-						} else {
-							quote! { format_args!("{:?}", self.#ident) }
-						};
-
-						let display = quote! {
-							writeln!(out, "| {} | {} |", #name, #value)?;
-						};
-
-						summary.push(display);
-					}
-
-					(summary, fields)
-				},
-			)
+			.map(|field| render_field(field, &rendering))
+			.fold(output, merge_rendered)
 	} else {
-		(Vec::new(), Vec::new())
+		Rendered::default()
 	};
 
-	if let Some(footer) = settings.get("footer") {
-		section_buf.push_str(footer);
-	}
+	let header = settings.get("header").map_or("", String::as_str);
+	let footer = settings.get("footer").map_or("", String::as_str);
+	let about = section_documentation(input, header)?;
+	let comment_prefix = if section != "global" { "#" } else { "" };
+	let Rendered { summary, fields, example } = rendered;
+	let section_buf = format!("{comment_prefix}[{section}]\n{example}{footer}");
 
 	if emit {
-		append_section(filename, truncate, section_buf.as_bytes());
+		append_section(filename, section, &[about.as_bytes(), section_buf.as_bytes()]);
 	}
 
 	let struct_name = &input.ident;
 	let cfg_attrs = cfg_attrs(input)?;
-	let registration =
-		generate_registration(input, &cfg_attrs, section, section_aliases, &section_buf, &fields);
+	let registration = Registration {
+		input,
+		cfg_attrs: &cfg_attrs,
+		section,
+		section_aliases,
+		about: &about,
+		section_buf: &section_buf,
+		fields: &fields,
+		group,
+	};
+
+	let registration = generate_registration(&registration);
 
 	let display = quote! {
 		#(#cfg_attrs)*
@@ -217,7 +168,14 @@ fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<Tok
 			fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 				writeln!(out, "| name | value |")?;
 				writeln!(out, "| :--- | :---  |")?;
-				#( #summary )*
+				self.fmt_config(out)
+			}
+		}
+
+		#(#cfg_attrs)*
+		impl #struct_name {
+			pub(super) fn fmt_config(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				#summary
 				Ok(())
 			}
 		}
@@ -229,6 +187,172 @@ fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<Tok
 	};
 
 	Ok(generated)
+}
+
+fn section_documentation(input: &ItemStruct, header: &str) -> Result<String> {
+	let doc = get_doc_comment(&input.attrs)
+		.ok_or_else(|| Error::new(input.ident.span(), "config section requires a doc comment"))?;
+
+	let (doc, suffix) = trim_comment(&doc);
+
+	Ok(format!("{header}\n\n{:#<RULE_WIDTH$}\n{doc}{suffix}", ""))
+}
+
+fn render_field((field, ident): (&Field, &Ident), rendering: &Rendering<'_>) -> RenderedField {
+	let Rendering {
+		section,
+		undocumented,
+		ignore,
+		hidden,
+		forbidden,
+		group,
+	} = rendering;
+
+	let contains = |fields: &str, name: &str| {
+		fields
+			.split_ascii_whitespace()
+			.any(|field| field == name)
+	};
+
+	let name = ident.to_string();
+	let is_hidden = contains(hidden, name.as_str());
+	let (class, documented) = match () {
+		| () if contains(forbidden, name.as_str()) =>
+			(quote! { crate::config::regenerate::FieldClass::Forbidden }, false),
+		| () if is_hidden => (quote! { crate::config::regenerate::FieldClass::Hidden }, false),
+		| () if contains(ignore, name.as_str()) =>
+			(quote! { crate::config::regenerate::FieldClass::Structural }, false),
+		| () => (quote! { crate::config::regenerate::FieldClass::Documented }, true),
+	};
+
+	let example = example_value(field);
+	let spec_example = is_hidden
+		.then_some(example.as_ref())
+		.unwrap_or_default();
+
+	let (path, field_spec) = generate_field_spec(field, section, &name, &class, spec_example);
+
+	let nested = has_display_directive(field, "section")
+		.then(|| quote! { self.#ident.fmt_config(out)?; })
+		.unwrap_or_default();
+
+	if !documented {
+		return RenderedField {
+			summary: nested,
+			spec: field_spec,
+			example: String::new(),
+		};
+	}
+
+	let doc = field_documentation(field, undocumented);
+
+	let example_separator = if example.is_empty() { "" } else { " " };
+	let example = format!("\n{doc}#{ident} ={example_separator}{example}\n");
+
+	let display = has_display_directive(field, "hidden")
+		.then_some(TokenStream2::new())
+		.unwrap_or_else(|| {
+			let value = display_value(ident, |directive| has_display_directive(field, directive));
+			let name = if *group { &path } else { &name };
+
+			quote! { writeln!(out, "| {} | {} |", #name, #value)?; }
+		});
+
+	RenderedField {
+		summary: quote! { #nested #display },
+		spec: field_spec,
+		example,
+	}
+}
+
+fn has_display_directive(field: &Field, directive: &str) -> bool {
+	get_doc_comment_line(field, "display")
+		.unwrap_or_default()
+		.split(' ')
+		.any(|candidate| candidate == directive)
+}
+
+fn merge_rendered(mut output: Rendered, field: RenderedField) -> Rendered {
+	output.summary.extend(field.summary);
+	output.fields.push(field.spec);
+	output.example.push_str(&field.example);
+	output
+}
+
+fn generate_field_spec(
+	field: &Field,
+	section: &str,
+	name: &str,
+	class: &TokenStream2,
+	example: &str,
+) -> (String, TokenStream2) {
+	let aliases = get_serde_aliases(field).collect::<Vec<_>>();
+	let section = section.trim_matches(['[', ']']);
+	let path = section
+		.strip_prefix("global.")
+		.map(|section| format!("{section}.{name}"))
+		.unwrap_or_else(|| name.to_owned());
+
+	let legacy = get_doc_comment_line(field, "legacy").unwrap_or_default();
+	let local_alias = |alias: &LitStr| {
+		Cow::Owned(format!("{}.{}", section.trim_start_matches("global."), alias.value()))
+	};
+
+	let legacy = legacy
+		.split_ascii_whitespace()
+		.map(Cow::Borrowed)
+		.chain(
+			aliases
+				.iter()
+				.filter(|_| !legacy.is_empty())
+				.map(local_alias),
+		);
+
+	let sensitive = has_display_directive(field, "sensitive");
+	let spec = quote! {
+		crate::config::regenerate::FieldSpec {
+			name: #name,
+			path: #path,
+			legacy: &[#(#legacy),*],
+			aliases: &[#(#aliases),*],
+			example: #example,
+			class: #class,
+			sensitive: #sensitive,
+		}
+	};
+
+	(path, spec)
+}
+
+fn field_documentation(field: &Field, undocumented: &str) -> String {
+	let doc = get_doc_comment(&field.attrs);
+	let (doc, suffix) = trim_comment(doc.as_deref().unwrap_or(undocumented));
+	let empty = doc.lines().all(|line| {
+		let body = line.trim_start_matches('#').trim();
+
+		body.is_empty() || body.starts_with("reloadable:")
+	});
+
+	let prefix = if empty { undocumented } else { "" };
+	let separator = if empty { "\n" } else { "" };
+
+	format!("{prefix}{separator}{doc}{suffix}")
+}
+
+fn trim_comment(doc: &str) -> (&str, &'static str) {
+	let doc = doc.trim_end();
+	let suffix = if doc.ends_with('#') { "\n" } else { "\n#\n" };
+
+	(doc, suffix)
+}
+
+fn display_value(ident: &Ident, directive: impl Fn(&str) -> bool) -> TokenStream2 {
+	match () {
+		| () if directive("sensitive") => quote! { "***********" },
+		| () if directive("uri-userinfo") =>
+			quote! { crate::config::format::UriUserinfo(self.#ident.as_deref()) },
+		| () => quote! { format_args!("{:?}", self.#ident) },
+	}
 }
 
 fn cfg_attrs(input: &ItemStruct) -> Result<Vec<TokenStream2>> {
@@ -270,17 +394,20 @@ fn cfg_attrs(input: &ItemStruct) -> Result<Vec<TokenStream2>> {
 		})
 }
 
-fn generate_registration<'a, SectionAliases>(
-	input: &ItemStruct,
-	cfg_attrs: &[TokenStream2],
-	section: &str,
-	section_aliases: SectionAliases,
-	section_buf: &str,
-	fields: &[TokenStream2],
-) -> TokenStream2
-where
-	SectionAliases: Iterator<Item = &'a str>,
-{
+fn generate_registration(registration: &Registration<'_>) -> TokenStream2 {
+	let Registration {
+		input,
+		cfg_attrs,
+		section,
+		section_aliases,
+		about,
+		section_buf,
+		fields,
+		group,
+	} = registration;
+
+	let section_aliases = section_aliases.split_ascii_whitespace();
+
 	let registration_name = format_ident!(
 		"TUWUNEL_CONFIG_SECTION_{}",
 		input.ident.unraw().to_string().to_uppercase(),
@@ -293,13 +420,10 @@ where
 			crate::config::regenerate::SectionSpec {
 				section: #section,
 				aliases: &[#(#section_aliases),*],
+				about: #about,
 				example: #section_buf,
 				fields: &[#(#fields),*],
-				position: crate::config::regenerate::SourcePosition {
-					file: file!(),
-					line: line!(),
-					column: column!(),
-				},
+				group: #group,
 			};
 	}
 }
@@ -333,18 +457,16 @@ fn get_serde_aliases(field: &Field) -> impl Iterator<Item = LitStr> + '_ {
 		})
 }
 
-fn append_section(filename: &str, truncate: bool, content: &[u8]) {
+fn append_section(filename: &str, section: &str, parts: &[&[u8]]) {
 	let mut buffers = FILE_BUFFERS
 		.lock()
 		.unwrap_or_else(PoisonError::into_inner);
 
-	let buf = buffers.entry(filename.to_owned()).or_default();
+	buffers
+		.entry(filename.to_owned())
+		.or_default()
+		.insert(section.trim_matches(['[', ']']).to_owned(), parts.concat());
 
-	if truncate {
-		buf.clear();
-	}
-
-	buf.extend_from_slice(content);
 	drop(buffers);
 
 	FLUSH_REGISTERED.get_or_init(|| {
@@ -357,12 +479,18 @@ extern "C" fn flush_file_buffers() {
 		.lock()
 		.unwrap_or_else(PoisonError::into_inner);
 
-	for (filename, buf) in buffers.iter() {
+	for (filename, sections) in buffers.iter() {
+		let buf = sections
+			.values()
+			.flatten()
+			.copied()
+			.collect::<Vec<_>>();
+
 		let unchanged =
-			fs::read(filename).is_ok_and(|existing| existing.as_slice() == buf.as_slice());
+			read(filename).is_ok_and(|existing| existing.as_slice().eq(buf.as_slice()));
 
 		if !unchanged {
-			fs::write(filename, buf).ok();
+			write(filename, &buf).ok();
 		}
 	}
 }
@@ -420,73 +548,64 @@ fn example_value(field: &Field) -> Cow<'static, str> {
 		.unwrap_or_default()
 }
 
-fn get_doc_comment(field: &Field) -> Option<String> {
-	let comment = get_doc_comment_full(field)?;
+fn get_doc_comment(attrs: &[Attribute]) -> Option<String> {
+	let comment = doc_values(attrs).fold(String::new(), |comment, value| {
+		value
+			.split('\n')
+			.filter(|line| !is_hidden_line(line))
+			.fold(comment, push_comment_line)
+	});
 
-	let out = comment
-		.lines()
-		.filter(|line| {
-			!HIDDEN.iter().any(|key| {
-				line.trim().starts_with(key) && line.trim().chars().nth(key.len()) == Some(':')
-			})
-		})
-		.fold(String::new(), |mut full, line| {
-			full.push('#');
-			full.push_str(line);
-			full.push('\n');
-			full
-		});
-
-	(!out.is_empty()).then_some(out)
+	Some(comment).filter(|comment| !comment.is_empty())
 }
 
 fn get_doc_comment_line(field: &Field, label: &str) -> Option<String> {
-	let comment = get_doc_comment_full(field)?;
-
-	comment
-		.lines()
-		.map(str::trim)
-		.filter(|line| line.starts_with(label))
-		.filter(|line| line.chars().nth(label.len()) == Some(':'))
-		.map(|line| {
-			line.split_once(':')
-				.map(|(_, v)| v)
-				.map(str::trim)
-				.map(ToOwned::to_owned)
-		})
-		.next()
-		.flatten()
+	doc_values(&field.attrs).find_map(|value| {
+		value
+			.split('\n')
+			.map(str::trim)
+			.find_map(|line| directive(line, label))
+			.map(str::trim)
+			.map(ToOwned::to_owned)
+	})
 }
 
-fn get_doc_comment_full(field: &Field) -> Option<String> {
-	let mut out = String::new();
-	for attr in &field.attrs {
-		let Meta::NameValue(MetaNameValue { path, value, .. }) = &attr.meta else {
-			continue;
-		};
+fn doc_values(attrs: &[Attribute]) -> impl Iterator<Item = String> + '_ {
+	attrs.iter().filter_map(doc_value)
+}
 
-		if path
-			.segments
+fn doc_value(attr: &Attribute) -> Option<String> {
+	let Meta::NameValue(MetaNameValue {
+		path,
+		value: Expr::Lit(ExprLit { lit: Lit::Str(token), .. }),
+		..
+	}) = &attr.meta
+	else {
+		return None;
+	};
+
+	path.is_ident("doc").then(|| token.value())
+}
+
+fn is_hidden_line(line: &str) -> bool {
+	let line = line.trim();
+
+	// Fences keep TOML examples out of rustdoc's doctests.
+	line.starts_with("```")
+		|| HIDDEN
 			.iter()
-			.next()
-			.is_none_or(|s| s.ident != "doc")
-		{
-			continue;
-		}
+			.any(|key| directive(line, key).is_some())
+}
 
-		let Expr::Lit(ExprLit { lit, .. }) = &value else {
-			continue;
-		};
+fn directive<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+	line.strip_prefix(key)?.strip_prefix(':')
+}
 
-		let Lit::Str(token) = &lit else {
-			continue;
-		};
-
-		let value = token.value();
-		writeln!(&mut out, "{value}").expect("wrote to output string buffer");
-	}
-
-	(!out.is_empty()).then_some(out)
+fn push_comment_line(mut comment: String, line: &str) -> String {
+	comment.push('#');
+	comment.push_str(line);
+	comment.push('\n');
+	comment
 }
 
 fn get_type_name(field: &Field) -> Option<String> {
@@ -502,9 +621,29 @@ fn get_type_name(field: &Field) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-	use syn::{Field, parse_quote};
+	use quote::quote;
+	use syn::{Field, ItemStruct, parse_quote};
 
-	use super::{example_value, get_default, get_doc_comment, get_serde_aliases};
+	use super::{
+		example_value, generate_field_spec, get_default, get_doc_comment, get_serde_aliases,
+		section_documentation,
+	};
+
+	#[test]
+	fn bracketed_sections_keep_qualified_field_metadata() {
+		let field: Field = parse_quote! { client_id: String };
+		let class = quote! { FieldClass::Documented };
+
+		for section in [
+			"global.identity_provider",
+			"[global.identity_provider]",
+			"[[global.identity_provider]]",
+		] {
+			let (path, _) = generate_field_spec(&field, section, "client_id", &class, "");
+
+			assert_eq!(path, "identity_provider.client_id");
+		}
+	}
 
 	#[test]
 	fn empty_collection_defaults_render_as_arrays() {
@@ -564,8 +703,48 @@ mod tests {
 			name: String
 		};
 
-		let comment = get_doc_comment(&field).expect("visible comment to be emitted");
+		let comment = get_doc_comment(&field.attrs).expect("visible comment to be emitted");
 		assert!(comment.contains("#visible setting docs"));
 		assert!(!comment.contains("config-example:"));
+	}
+
+	#[test]
+	fn section_documentation_renders_rule_doc_and_closing_line() {
+		let input: ItemStruct = parse_quote! {
+			/// Section title.
+			///
+			/// Section overview.
+			struct Section;
+		};
+
+		let about = section_documentation(&input, "").expect("documented section");
+		let rule = "#".repeat(80);
+
+		assert_eq!(about, format!("\n\n{rule}\n# Section title.\n#\n# Section overview.\n#\n"));
+	}
+
+	#[test]
+	fn code_fences_are_hidden_from_emitted_comments() {
+		let input: ItemStruct = parse_quote! {
+			/// Section title.
+			///
+			/// ```toml
+			///     [section]
+			/// ```
+			struct Section;
+		};
+
+		let about = section_documentation(&input, "").expect("documented section");
+		let rule = "#".repeat(80);
+
+		assert_eq!(about, format!("\n\n{rule}\n# Section title.\n#\n#     [section]\n#\n"));
+	}
+
+	#[test]
+	fn undocumented_section_is_rejected() {
+		let input: ItemStruct = parse_quote! { struct Section; };
+		let error = section_documentation(&input, "").unwrap_err();
+
+		assert!(error.to_string().contains("doc comment"));
 	}
 }

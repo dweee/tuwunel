@@ -1,0 +1,505 @@
+use serde::{Deserialize, Serialize};
+use tuwunel_core::{
+	Err, Result, async_noinline, debug_warn, err, implement, info, result::NotFound,
+	smallvec::SmallVec, utils::TryReadyExt, warn,
+};
+use tuwunel_database::{Database, Json, Txn, keyval::ValBuf, serialize_key, serialize_val};
+
+use self::{
+	identity::{cleanup, repair as repair_identities},
+	rooms::repair as repair_rooms,
+	state::{gc::collect, repair as repair_states},
+};
+use crate::{
+	Services,
+	integrity::short_ids::{
+		Identity, Reason, Shape,
+		check::{Finding, Subject, scan},
+		identity::consistent,
+		references::References,
+	},
+};
+
+mod identity;
+mod rooms;
+mod state;
+#[cfg(test)]
+mod tests;
+
+type Samples = SmallVec<[Sample; 1]>;
+type Observed = (Outcome, Uncertain);
+
+pub(super) const MARKER: &str = "repair_short_injectivity_seen";
+const VERSION: u8 = 1;
+const SAMPLE_LIMIT: usize = 4;
+const IDENTITY_LIMIT: usize = 128;
+const RECORD_LIMIT: usize = 4096;
+
+// Stored count positions, so the order is part of the record format.
+const SHAPES: [Shape; 15] = [
+	Shape::EventAlias,
+	Shape::StatekeyAlias,
+	Shape::DanglingWinner,
+	Shape::PromotableReverse,
+	Shape::EventAliasEntry,
+	Shape::StatekeyAliasEntry,
+	Shape::AffectedState,
+	Shape::DiffCollision,
+	Shape::EventOrphanEntry,
+	Shape::StatekeyOrphanEntry,
+	Shape::AuthChainCache,
+	Shape::UnreachableState,
+	Shape::PurgeResidue,
+	Shape::LiveRoomAlias,
+	Shape::DeclinedMarker,
+];
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Outcome {
+	version: u8,
+	status: Status,
+
+	/// Each count tallies occurrences, including overlaps and unknown censuses.
+	counts: [u64; SHAPES.len()],
+	samples: Samples,
+	truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Status {
+	/// The repair verified that no residue remains.
+	Clean,
+
+	/// The repair left residue, which the counts and samples describe.
+	Unfinished,
+
+	/// The superseded repair settled the database and its short-id families agree.
+	Superseded,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Sample {
+	shape: Shape,
+	identity: Identity,
+	reason: Reason,
+}
+
+struct Boundary<'a> {
+	db: &'a Database,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Uncertain {
+	states: bool,
+	collected: bool,
+	rooms: bool,
+}
+
+impl From<Shape> for u8 {
+	fn from(shape: Shape) -> Self {
+		match shape {
+			| Shape::EventAlias => 1,
+			| Shape::StatekeyAlias => 2,
+			| Shape::DanglingWinner => 3,
+			| Shape::PromotableReverse => 4,
+			| Shape::EventAliasEntry => 12,
+			| Shape::StatekeyAliasEntry => 13,
+			| Shape::AffectedState => 15,
+			| Shape::DiffCollision => 19,
+			| Shape::EventOrphanEntry => 23,
+			| Shape::StatekeyOrphanEntry => 24,
+			| Shape::AuthChainCache => 27,
+			| Shape::UnreachableState => 29,
+			| Shape::PurgeResidue => 32,
+			| Shape::LiveRoomAlias => 33,
+			| Shape::DeclinedMarker => 37,
+		}
+	}
+}
+
+impl TryFrom<u8> for Shape {
+	type Error = u8;
+
+	fn try_from(code: u8) -> Result<Self, Self::Error> {
+		match code {
+			| 1 => Ok(Self::EventAlias),
+			| 2 => Ok(Self::StatekeyAlias),
+			| 3 => Ok(Self::DanglingWinner),
+			| 4 => Ok(Self::PromotableReverse),
+			| 12 => Ok(Self::EventAliasEntry),
+			| 13 => Ok(Self::StatekeyAliasEntry),
+			| 15 => Ok(Self::AffectedState),
+			| 19 => Ok(Self::DiffCollision),
+			| 23 => Ok(Self::EventOrphanEntry),
+			| 24 => Ok(Self::StatekeyOrphanEntry),
+			| 27 => Ok(Self::AuthChainCache),
+			| 29 => Ok(Self::UnreachableState),
+			| 32 => Ok(Self::PurgeResidue),
+			| 33 => Ok(Self::LiveRoomAlias),
+			| 37 => Ok(Self::DeclinedMarker),
+			| unknown => Err(unknown),
+		}
+	}
+}
+
+/// Records the superseded repair's settlement when the short-id families agree.
+///
+/// Returns whether the settlement stands; disagreement or a failed check leaves
+/// the full repair to run.
+#[tracing::instrument(level = "debug", skip_all)]
+pub(super) async fn settle(services: &Services) -> bool {
+	stands(&services.db, async || {
+		services.server.progress.begin(MARKER);
+		consistent(services).await
+	})
+	.await
+}
+
+/// Runs the repair unless a recognized outcome is already recorded.
+///
+/// The repair must finish its durability barriers and uncached verification
+/// before returning, and its outcome is recorded only after another sync. A
+/// read-only open or any error leaves completion unestablished without failing
+/// startup.
+#[tracing::instrument(level = "debug", skip_all)]
+pub(super) async fn run(
+	db: &Database,
+	repair: impl AsyncFnOnce() -> Result<Outcome>,
+) -> Option<Outcome> {
+	Boundary::writable(db)?
+		.attempt(repair)
+		.await
+		.inspect_err(|error| {
+			warn!(%error, "Injectivity repair interrupted; completion remains unestablished.");
+		})
+		.ok()
+		.flatten()
+}
+
+/// Records a clean outcome for a fresh database without scanning it.
+///
+/// The record is written and synced before it counts. A read-only open or a
+/// failed write or sync returns `None` and leaves completion unestablished.
+#[tracing::instrument(level = "debug", skip_all)]
+pub(super) fn stamp(db: &Database) -> Option<Outcome> {
+	Boundary::writable(db)?
+		.stamp(Status::Clean)
+		.inspect_err(|error| {
+			warn!(%error, "Injectivity clean stamp failed; completion remains unestablished.");
+		})
+		.ok()
+}
+
+/// Completes independent repair passes and verifies their residual populations.
+///
+/// Identity mutations refresh the census before final alias reclamation. Every
+/// final inspection is read-only and uses freshly scanned committed raw rows.
+// query-depth firewall
+#[async_noinline]
+#[tracing::instrument(level = "debug", skip_all)]
+pub(super) async fn repair(services: &Services) -> Result<Outcome> {
+	let progress = &services.server.progress;
+
+	progress.enter("short ids");
+	let identities = repair_identities(services).await?;
+
+	progress.enter("state snapshots");
+	let (states, identities) = repair_states(services, identities).await?;
+
+	progress.enter("unreachable states");
+	let collected = collect(services).await?;
+
+	progress.enter("rooms");
+	let rooms = repair_rooms(services).await?;
+
+	progress.enter("references");
+	let references = References::census(services, &identities).await?;
+
+	cleanup(services, &identities.events, &references.events, references.event_complete).await?;
+
+	cleanup(
+		services,
+		&identities.statekeys,
+		&references.statekeys,
+		references.statekey_complete,
+	)
+	.await?;
+
+	// A verified restore leaves its own unit unestablished; independent stages still ran.
+	if states.restored || rooms.restored {
+		return Err!(
+			"published data failed verification and was restored; completion remains \
+			 unestablished"
+		);
+	}
+
+	progress.enter("verify");
+	services.server.check_running()?;
+	services.db.engine.sync()?;
+
+	let uncertain = Uncertain {
+		states: states.uncertain,
+		collected: collected.unknown,
+		rooms: rooms.unknown,
+	};
+
+	let outcome = verify(services, uncertain).await?;
+
+	info!(
+		rewritten = states.rewritten,
+		original_bytes = states.original_bytes,
+		snapshot_bytes = states.snapshot_bytes,
+		collected = collected.deleted,
+		purged = rooms.deleted,
+		moved = rooms.moved,
+		?outcome.counts,
+		"Injectivity repair verified; purge residue counts include unclassified room strays."
+	);
+
+	Ok(outcome)
+}
+
+/// Folds the census into the outcome a completed repair records.
+///
+/// A finding counts where the stream yields it, except a census that could not
+/// prove further residue absent: that joins the uncertainty the repair captured
+/// before its writes, and each kind counts once at the end. A clean final census
+/// therefore never erases what an earlier pass could not prove.
+#[tracing::instrument(level = "debug", skip_all)]
+async fn verify(services: &Services, uncertain: Uncertain) -> Result<Outcome> {
+	services.server.check_running()?;
+	let (outcome, uncertain) = scan(services)
+		.ready_try_fold((Outcome::clean(), uncertain), observe)
+		.await?;
+
+	outcome
+		.uncertain(Shape::AffectedState, uncertain.states, Reason::HistoricalState)?
+		.uncertain(Shape::UnreachableState, uncertain.collected, Reason::References)?
+		.uncertain(Shape::PurgeResidue, uncertain.rooms, Reason::Ownership)
+}
+
+fn observe((outcome, uncertain): Observed, finding: Finding) -> Result<Observed> {
+	match (&finding.subject, uncertain.raised(finding.shape)) {
+		| (Subject::Uncertain, Some(uncertain)) => Ok((outcome, uncertain)),
+		| _ => outcome
+			.observed(finding)
+			.map(|outcome| (outcome, uncertain)),
+	}
+}
+
+#[implement(Uncertain)]
+fn raised(self, shape: Shape) -> Option<Self> {
+	match shape {
+		| Shape::AffectedState => Some(Self { states: true, ..self }),
+		| Shape::UnreachableState => Some(Self { collected: true, ..self }),
+		| Shape::PurgeResidue => Some(Self { rooms: true, ..self }),
+		| _ => None,
+	}
+}
+
+#[implement(Outcome)]
+fn observed(self, finding: Finding) -> Result<Self> {
+	let Finding { shape, subject, reason } = finding;
+
+	match subject {
+		| Subject::Identity(identity) => self.residue(shape, 1, &identity, reason),
+		| Subject::Short(id) | Subject::State(id) | Subject::Room(id) =>
+			self.residue(shape, 1, &id.to_be_bytes(), reason),
+		| Subject::Malformed(count) => self.residue(shape, count, &[], reason),
+		| Subject::Incomplete | Subject::Uncertain => self.residue(shape, 1, &[], reason),
+	}
+}
+
+#[implement(Outcome)]
+fn uncertain(self, shape: Shape, unknown: bool, reason: Reason) -> Result<Self> {
+	self.residue(shape, u64::from(unknown), &[], reason)
+}
+
+/// Whether the settlement stands, recording it when the check agrees.
+///
+/// The record claims only that agreement. A read-only open is left unchecked,
+/// and a failed record leaves the check to the next start.
+#[tracing::instrument(level = "debug", skip_all)]
+async fn stands(db: &Database, check: impl AsyncFnOnce() -> Result<bool>) -> bool {
+	let Some(boundary) = Boundary::writable(db) else {
+		return true;
+	};
+
+	let Ok(agree) = check().await.inspect_err(|error| {
+		if !error.is_interrupted() {
+			warn!(%error, "Short id family check failed; running the full repair.");
+		}
+	}) else {
+		return false;
+	};
+
+	if !agree {
+		warn!("Short id families disagree after the superseded repair; running the full repair.");
+		return false;
+	}
+
+	boundary
+		.stamp(Status::Superseded)
+		.inspect(|_| {
+			info!("Short id families verified; the superseded repair's settlement stands.");
+		})
+		.inspect_err(|error| {
+			warn!(%error, "Injectivity settlement record failed; the check repeats on the next start.");
+		})
+		.ok();
+
+	true
+}
+
+#[implement(Boundary, generics = "<'a>", params = "<'a>")]
+fn writable(db: &'a Database) -> Option<Self> {
+	if db.engine.is_read_only() {
+		warn!("Injectivity repair cannot run on a read-only or secondary database.");
+		return None;
+	}
+
+	Some(Self { db })
+}
+
+#[implement(Boundary, params = "<'_>")]
+#[tracing::instrument(level = "debug", skip_all)]
+async fn attempt(
+	&self,
+	repair: impl AsyncFnOnce() -> Result<Outcome>,
+) -> Result<Option<Outcome>> {
+	let db = self.db;
+	let recorded = db["global"]
+		.get(MARKER)
+		.await
+		.present()?
+		.as_deref()
+		.and_then(Outcome::decode);
+
+	if let Some(outcome) = recorded {
+		db.engine.sync()?;
+		if outcome.status == Status::Unfinished {
+			debug_warn!(
+				?outcome.counts,
+				"Injectivity repair left unrepaired rows on an earlier start."
+			);
+		}
+
+		return Ok(None);
+	}
+
+	let outcome = repair().await?;
+	let bytes = outcome.encode()?;
+
+	db.engine.sync()?;
+	self.record(bytes)?;
+	if outcome.status == Status::Unfinished {
+		debug_warn!(
+			?outcome.counts,
+			?outcome.samples,
+			truncated = outcome.truncated,
+			"Injectivity repair left unrepaired rows; purge residue counts include \
+			 unclassified room strays."
+		);
+	}
+
+	Ok(Some(outcome))
+}
+
+#[implement(Boundary, params = "<'_>")]
+#[tracing::instrument(level = "debug", skip_all)]
+fn stamp(&self, status: Status) -> Result<Outcome> {
+	let outcome = Outcome { status, ..Outcome::clean() };
+
+	self.record(outcome.encode()?)?;
+
+	Ok(outcome)
+}
+
+#[implement(Boundary, params = "<'_>")]
+#[tracing::instrument(level = "debug", skip_all)]
+fn record(&self, bytes: ValBuf) -> Result {
+	let key = serialize_key((MARKER,))?;
+
+	Txn::insert(&self.db["global"], [(key, bytes)])
+		.try_execute()
+		.map_err(Into::into)
+}
+
+#[implement(Outcome)]
+fn clean() -> Self {
+	Self {
+		version: VERSION,
+		status: Status::Clean,
+		counts: [0; SHAPES.len()],
+		samples: Samples::new(),
+		truncated: false,
+	}
+}
+
+#[implement(Outcome)]
+fn residue(mut self, shape: Shape, count: u64, identity: &[u8], reason: Reason) -> Result<Self> {
+	if count == 0 {
+		return Ok(self);
+	}
+
+	let total = shape
+		.slot()
+		.and_then(|slot| self.counts.get_mut(slot))
+		.ok_or_else(|| err!("unsupported injectivity diagnostic shape"))?;
+
+	*total = total.saturating_add(count);
+	self.status = Status::Unfinished;
+	if self.samples.len() < SAMPLE_LIMIT {
+		let identity = identity.get(..IDENTITY_LIMIT).unwrap_or(identity);
+
+		self.samples.push(Sample {
+			shape,
+			identity: Identity::from_slice(identity),
+			reason,
+		});
+	} else {
+		self.truncated = true;
+	}
+
+	self.truncated |= identity.len() > IDENTITY_LIMIT || count > 1;
+	Ok(self)
+}
+
+impl Shape {
+	fn slot(self) -> Option<usize> { SHAPES.iter().position(|shape| *shape == self) }
+}
+
+#[implement(Outcome)]
+fn encode(&self) -> Result<ValBuf> {
+	if !self.valid() {
+		return Err!("invalid injectivity repair outcome");
+	}
+
+	serialize_val(Json(self))
+}
+
+#[implement(Outcome)]
+fn decode(bytes: &[u8]) -> Option<Self> {
+	Some(bytes)
+		.filter(|bytes| bytes.len() <= RECORD_LIMIT)
+		.and_then(|bytes| serde_json::from_slice(bytes).ok())
+		.filter(Self::valid)
+}
+
+#[implement(Outcome)]
+fn valid(&self) -> bool {
+	self.version == VERSION
+		&& self.samples.len() <= SAMPLE_LIMIT
+		&& self
+			.samples
+			.iter()
+			.all(|sample| sample.identity.len() <= IDENTITY_LIMIT)
+		&& match self.status {
+			| Status::Unfinished => self.counts.iter().any(|count| *count > 0),
+			| Status::Clean | Status::Superseded =>
+				self.counts == [0; SHAPES.len()] && self.samples.is_empty() && !self.truncated,
+		}
+}

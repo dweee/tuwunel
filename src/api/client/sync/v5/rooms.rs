@@ -1,33 +1,37 @@
 mod bump_stamp;
+mod collected;
 mod heroes;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+	borrow::Cow,
+	collections::{BTreeMap, HashSet},
+};
 
 use futures::{
-	FutureExt, StreamExt, TryFutureExt,
+	FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 	future::{join, join3, join4},
 };
 use ruma::{
 	JsOption, MxcUri, OwnedEventId, OwnedMxcUri, RoomId, UInt, UserId,
 	api::client::sync::sync_events::{
 		UnreadNotificationsCount,
-		v5::{DisplayName, response, response::Heroes},
+		v5::{
+			DisplayName,
+			response::{Heroes, Room as ResponseRoom},
+		},
 	},
 	events::{
-		AnySyncStateEvent, StateEventType, TimelineEventType, room::member::MembershipState,
+		AnyStrippedStateEvent, AnySyncStateEvent, StateEventType, TimelineEventType,
+		room::member::MembershipState,
 	},
 	serde::Raw,
 };
+use serde::Deserialize;
 use tuwunel_core::{
-	Error, Result, at, format_small_string, is_equal_to,
-	matrix::{
-		Event, StateKey,
-		pdu::{PduCount, PduEvent, RawPduId},
-	},
-	ref_at,
+	Error, Result, at, format_small_string, is_equal_to, ref_at,
 	smallstr::SmallString,
 	smallvec::SmallVec,
 	utils::{
@@ -35,22 +39,32 @@ use tuwunel_core::{
 		hash::sha256::{
 			Digest as Sha256Digest, delimited as sha256_delimited, hash as sha256_hash,
 		},
-		math::usize_from_ruma,
-		result::FlatOk,
+		math::usize_from_ruma_bounded,
+		result::{FlatOk, NotFound},
 		stream::{BroadbandExt, WidebandExt},
 	},
+	warn,
+};
+use tuwunel_matrix::{
+	Event, StateKey,
+	pdu::{PduCount, PduEvent, RawPduId},
 };
 use tuwunel_service::{
 	Services,
-	sync::{RequiredState, Room, RoomConfig},
+	rooms::short::ShortStateHash,
+	sync::{RequiredState, Room, RoomConfig, UnreadState},
 };
 
-use self::{bump_stamp::room_bump_stamp, heroes::calculate_heroes};
-use super::{
-	super::{load_timeline_fallible, strip_prev_state},
-	Connection, ListIds, SyncInfo, WindowRoom,
+use self::{
+	bump_stamp::{knock_bump_stamp, room_bump_stamp},
+	collected::{Collected, Outcome, Unread},
+	heroes::calculate_heroes,
 };
-use crate::client::{annotate_membership, ignored_filter, with_membership};
+use super::{
+	super::{load_timeline_fallible, own_departure, stand_in_leave, strip_state_unsigned},
+	Connection, ListIds, SyncInfo, WindowRoom, departed, stripped_content, stripped_state,
+};
+use crate::{ignored_filter, with_membership};
 
 #[derive(Debug)]
 pub(super) enum Failure {
@@ -58,10 +72,31 @@ pub(super) enum Failure {
 	Payload(Error),
 }
 
+#[derive(Deserialize)]
+struct NameContent<'a> {
+	#[serde(borrow)]
+	name: Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+struct AvatarContent {
+	url: Option<OwnedMxcUri>,
+}
+
 type ThreadCounts = BTreeMap<OwnedEventId, (u64, u64)>;
 type EventTypeString = SmallString<[u8; 32]>;
 type TimelineMembers<'a> = SmallVec<[&'a str; 2]>;
 pub(super) type RoomDetails = (usize, HashSet<(StateEventType, StateKey)>);
+pub(super) type Delivery = (ResponseRoom, StateRead);
+type StateRead = (Option<ShortStateHash>, UnreadState);
+type StateEvent = Raw<AnySyncStateEvent>;
+type StrippedEvent = Raw<AnyStrippedStateEvent>;
+type Selected = ((StateEventType, StateKey), Option<OwnedEventId>, bool);
+type CollectedState = (Vec<StateEvent>, StateRead);
+type Snapshots = (Option<ShortStateHash>, Option<(PduCount, ShortStateHash)>);
+
+/// Most timeline events one room returns per response, as legacy sync allows.
+const TIMELINE_LIMIT_MAX: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum StateMode {
@@ -74,6 +109,28 @@ struct StateSelection<'a> {
 	mode: StateMode,
 	previous: Option<&'a [u64]>,
 	changed: bool,
+	delivered: ShortStateHash,
+	unread: &'a [u64],
+}
+
+/// What decides whether a delta sends one requested state event.
+///
+/// The event is sent when it is newer than the delta's base, when the room held
+/// a different event at the base, when the last delivery could not read it, or
+/// when it is a lazily loaded member.
+#[derive(Clone, Copy, Debug, Default)]
+struct Candidate {
+	/// The event's timeline position, absent for an outlier.
+	count: Option<PduCount>,
+
+	/// Whether it was selected as a lazily loaded member.
+	lazy: bool,
+
+	/// Whether the last delivery found its event due but could not read it.
+	left_unread: bool,
+
+	/// Whether the room held the same event at the delta's base.
+	same_at_since: bool,
 }
 
 #[tracing::instrument(
@@ -89,7 +146,7 @@ pub(super) async fn handle_room(
 	room: &Room,
 	config_changed: bool,
 	room_details: RoomDetails,
-) -> Result<response::Room, Failure> {
+) -> Result<Delivery, Failure> {
 	let SyncInfo {
 		services,
 		sender_user,
@@ -101,19 +158,21 @@ pub(super) async fn handle_room(
 	let WindowRoom { lists, membership, room_id, .. } = window_room;
 	let roomsince = room.roomsince;
 
-	if matches!(*membership, Some(MembershipState::Leave | MembershipState::Ban)) {
+	if departed(membership.as_ref()) {
 		return leave_or_ban_response(sync_info, conn, window_room, roomsince)
+			.map_ok(|payload| (payload, (None, room.unread_state.clone())))
 			.map_err(Failure::Payload)
 			.await;
 	}
 
-	let is_invite = *membership == Some(MembershipState::Invite);
+	let pending = matches!(membership, Some(MembershipState::Invite | MembershipState::Knock));
 
 	let encrypted = services.state_accessor.is_encrypted_room(room_id);
 
 	let (timeline_limit, required_state) = room_details;
+	let allowed = membership_allows_required_state(membership.as_ref());
 
-	let timeline = is_invite.is_false().then_async(|| {
+	let timeline = allowed.then_async(|| {
 		load_timeline_fallible(
 			services,
 			sender_user,
@@ -143,25 +202,34 @@ pub(super) async fn handle_room(
 		.as_ref()
 		.map(ToString::to_string);
 
-	let bump_stamp = room_bump_stamp(
-		services,
-		sender_user,
-		room_id,
-		PduCount::Normal(roomsince),
-		PduCount::from(conn.next_batch),
-		last_timeline_count,
-	)
-	.map_err(Failure::Timeline)
-	.await?;
+	let bump_stamp = match membership {
+		| Some(MembershipState::Knock) => {
+			// Redelivered rooms retain their own membership baseline even before roomsince.
+			knock_bump_stamp(window_room.event_count, conn.next_batch)
+		},
+		| _ =>
+			room_bump_stamp(
+				services,
+				sender_user,
+				room_id,
+				PduCount::Normal(roomsince),
+				PduCount::from(conn.next_batch),
+				last_timeline_count,
+			)
+			.map_err(Failure::Timeline)
+			.await?,
+	};
 
 	let mode = state_mode(roomsince, room.required_state.is_empty());
 	let state = StateSelection {
 		mode,
 		previous: config_changed.then_some(room.required_state.as_slice()),
-		changed: state_may_have_changed(mode, last_timeline_count),
+		changed: allowed && state_may_have_changed(mode, last_timeline_count),
+		delivered: room.shortstatehash,
+		unread: &room.unread_state,
 	};
 
-	let required_state = membership_allows_required_state(membership.as_ref())
+	let required_state = allowed
 		.and_is(state.changed || state.previous.is_some())
 		.then_some(required_state)
 		.unwrap_or_default();
@@ -177,12 +245,7 @@ pub(super) async fn handle_room(
 	);
 
 	// TODO: figure out a timestamp we can use for remote invites
-	let invite_state = is_invite.then_async(|| {
-		services
-			.state_cache
-			.invite_state(sender_user, room_id)
-			.ok()
-	});
+	let stripped_state = stripped_state(services, sender_user, room_id, membership.as_ref());
 
 	let timeline = timeline_pdus
 		.iter()
@@ -201,17 +264,20 @@ pub(super) async fn handle_room(
 		.collect::<Vec<_>>();
 
 	let meta = room_meta_future(services, room_id);
-	let events = join3(timeline, required_state, invite_state);
+	let events = join3(timeline, required_state, stripped_state);
 	let member_counts = member_counts_future(services, room_id);
 	let notification_counts = notification_counts_future(services, sender_user, room_id);
 	let (
 		(room_name, room_avatar),
-		(timeline, required_state, invite_state),
+		(timeline, (required_state, state_read), stripped_state),
 		(joined_count, invited_count),
 		(highlight_count, notification_count, _last_notification_read, thread_counts),
 	) = join4(meta, events, member_counts, notification_counts)
-		.boxed()
+		.boxed() // size firewall
 		.await;
+
+	let (room_name, room_avatar) =
+		knock_meta(membership.as_ref(), stripped_state.as_deref(), room_name, room_avatar);
 
 	let (heroes, heroes_name, heroes_avatar) = resolve_heroes(
 		services,
@@ -222,13 +288,15 @@ pub(super) async fn handle_room(
 	)
 	.await;
 
-	let previous_connection_pos = previous_connection_pos.filter(|_| !is_invite);
+	let previous_connection_pos = previous_connection_pos.filter(|_| !pending);
 	let (initial, num_live) =
 		room_timeline_metadata(roomsince, previous_connection_pos, &timeline);
 
 	let timeline = timeline.into_iter().map(at!(1)).collect();
+	let unread_notifications =
+		merge_unread_notifications(highlight_count, notification_count, &thread_counts);
 
-	Ok(response::Room {
+	let payload = ResponseRoom {
 		initial,
 		lists: lists.clone(),
 		membership: membership.clone(),
@@ -237,7 +305,7 @@ pub(super) async fn handle_room(
 		is_dm: direct_rooms.contains(room_id).then_some(true),
 		heroes,
 		required_state,
-		invite_state: invite_state.flatten(),
+		invite_state: stripped_state,
 		prev_batch: prev_batch.as_deref().map(Into::into),
 		num_live,
 		limited,
@@ -245,12 +313,10 @@ pub(super) async fn handle_room(
 		bump_stamp,
 		joined_count,
 		invited_count,
-		unread_notifications: merge_unread_notifications(
-			highlight_count,
-			notification_count,
-			&thread_counts,
-		),
-	})
+		unread_notifications,
+	};
+
+	Ok((payload, state_read))
 }
 
 async fn leave_or_ban_response(
@@ -258,17 +324,28 @@ async fn leave_or_ban_response(
 	conn: &Connection,
 	WindowRoom { lists, membership, room_id, .. }: &WindowRoom,
 	roomsince: u64,
-) -> Result<response::Room> {
-	// A rejected federated invite has no resolved state; the retraction still
-	// delivers on the membership alone.
-	let member_event = services
-		.state_accessor
-		.room_state_get(room_id, &StateEventType::RoomMember, sender_user.as_str())
-		.map_ok(Event::into_format)
-		.await
-		.ok();
+) -> Result<ResponseRoom> {
+	// Clients read the departure from this event, not `membership`.
+	let member_event = match membership {
+		| Some(MembershipState::Ban) => services
+			.state_accessor
+			.room_state_get(room_id, &StateEventType::RoomMember, sender_user.as_str())
+			.await
+			.optional()
+			.inspect_err(|error| warn!(%room_id, %sender_user, %error, "Unreadable member event"))
+			.ok()
+			.flatten()
+			.map(|event| event.without_private_unless_sender(Some(sender_user))),
+		| _ => own_departure(services, room_id, sender_user).await,
+	};
 
-	Ok(response::Room {
+	let member_event = member_event.map(Event::into_format).or_else(|| {
+		matches!(membership, Some(MembershipState::Leave))
+			.then(|| stand_in_leave(services, room_id, sender_user))
+			.and_then(Result::ok)
+	});
+
+	Ok(ResponseRoom {
 		initial: roomsince.eq(&0).then_some(true),
 		lists: lists.clone(),
 		membership: membership.clone(),
@@ -289,9 +366,18 @@ pub(super) fn merged_room_details(
 		.filter_map(|list_id| conn.lists.get(list_id))
 		.map(|list| &list.room_details)
 		.chain(conn.subscriptions.get(room_id))
-		.fold((0_usize, HashSet::new()), |(timeline_limit, mut required_state), config| {
-			required_state.extend(config.required_state.iter().cloned());
-			(timeline_limit.max(usize_from_ruma(config.timeline_limit)), required_state)
+		.fold((0_usize, HashSet::new()), |mut details, config| {
+			details.0 = details.0.max(usize_from_ruma_bounded(
+				config.timeline_limit,
+				TIMELINE_LIMIT_MAX,
+				TIMELINE_LIMIT_MAX,
+			));
+
+			details
+				.1
+				.extend(config.required_state.iter().cloned());
+
+			details
 		})
 }
 
@@ -374,6 +460,34 @@ fn room_timeline_metadata<Event>(
 	(initial, num_live)
 }
 
+/// The name and avatar a knocked room's summary gives where room state has none.
+///
+/// A remote knock leaves this server no room state, so its summary names the
+/// room.
+fn knock_meta(
+	membership: Option<&MembershipState>,
+	stripped_state: Option<&[StrippedEvent]>,
+	room_name: Option<DisplayName>,
+	room_avatar: Option<OwnedMxcUri>,
+) -> (Option<DisplayName>, Option<OwnedMxcUri>) {
+	let summary = stripped_state
+		.filter(|_| membership == Some(&MembershipState::Knock))
+		.unwrap_or_default();
+
+	let room_name = room_name.or_else(|| {
+		stripped_content(summary, &StateEventType::RoomName)
+			.filter(|content: &NameContent<'_>| !content.name.is_empty())
+			.map(|content| DisplayName::from(&*content.name))
+	});
+
+	let room_avatar = room_avatar.or_else(|| {
+		stripped_content(summary, &StateEventType::RoomAvatar)
+			.and_then(|content: AvatarContent| content.url)
+	});
+
+	(room_name, room_avatar)
+}
+
 async fn resolve_heroes(
 	services: &Services,
 	sender_user: &UserId,
@@ -383,6 +497,8 @@ async fn resolve_heroes(
 ) -> (Option<Heroes>, Option<DisplayName>, Option<OwnedMxcUri>) {
 	services
 		.config
+		.client
+		.sync
 		.calculate_heroes
 		.then_async(|| calculate_heroes(services, sender_user, room_id, room_name, room_avatar))
 		.await
@@ -488,39 +604,33 @@ async fn collect_required_state(
 	required_state: &HashSet<(StateEventType, StateKey)>,
 	timeline_pdus: &[(PduCount, PduEvent)],
 	encrypted: bool,
-) -> Vec<Raw<AnySyncStateEvent>> {
-	let StateSelection { mode: state_mode, previous, changed } = selection;
+) -> CollectedState {
+	let StateSelection {
+		mode: state_mode,
+		previous,
+		changed,
+		delivered,
+		unread: unread_keys,
+	} = selection;
+
 	let lazy = required_state
 		.iter()
 		.any(is_equal_to!(&(StateEventType::RoomMember, "$LAZY".into())));
 
-	let needs_since_state = required_state
-		.iter()
-		.any(|(_, state_key)| state_key != "$LAZY");
+	let compared = changed
+		&& required_state
+			.iter()
+			.any(|(_, state_key)| state_key != "$LAZY");
 
-	// Falling back to current state would match every entry against itself.
-	let since_state = match state_mode {
-		| StateMode::Delta(since) if changed && needs_since_state => services
-			.timeline
-			.next_shortstatehash(room_id, since)
-			.ok()
-			.await
-			.map(|shortstatehash| (since, shortstatehash)),
-		| _ => None,
-	};
+	let (current, since_state) = state_snapshots(services, room_id, selection, compared).await;
 
 	// Equal hashes exclude changes, but newly requested keys may still be due.
 	let state_unchanged = !changed
 		|| since_state
-			.map_async(|(_, since_shortstatehash)| {
-				services
-					.state
-					.get_room_shortstatehash(room_id)
-					.ok()
-					.map(move |current| current == Some(since_shortstatehash))
-			})
-			.await
-			.unwrap_or(false);
+			.is_some_and(|(_, since_shortstatehash)| current == Some(since_shortstatehash));
+
+	// Keys skipped as unchanged vouch for no snapshot, so the room keeps its last one.
+	let snapshot = current.filter(|_| !state_unchanged);
 
 	let timeline_senders = timeline_pdus
 		.iter()
@@ -535,20 +645,6 @@ async fn collect_required_state(
 		.map(ref_at!(1))
 		.filter(|event| *event.event_type() == TimelineEventType::RoomMember)
 		.filter_map(Event::state_key);
-
-	let wildcard_state = required_state
-		.iter()
-		.filter(|(_, state_key)| (!state_unchanged || previous.is_some()) && state_key == "*")
-		.stream()
-		.flat_map(|(event_type, _)| {
-			services
-				.state_accessor
-				.room_state_keys_with_ids(room_id, event_type)
-				.ready_filter_map(Result::ok)
-				.map(move |(state_key, event_id)| {
-					((event_type.clone(), state_key), Some(event_id), false)
-				})
-		});
 
 	let mut timeline_members: TimelineMembers<'_> = timeline_senders
 		.chain(timeline_member_targets)
@@ -569,51 +665,65 @@ async fn collect_required_state(
 			.any(is_equal_to!(event.event_id()))
 	};
 
+	let evaluated = !state_unchanged || previous.is_some();
+
 	required_state
 		.iter()
-		.filter(|_| !state_unchanged || previous.is_some())
+		.filter(|_| evaluated)
 		.cloned()
-		.map(|state| (state, None, false))
+		.map(|state| Ok((state, None, false)))
 		.stream()
-		.chain(wildcard_state)
+		.chain(wildcard_state(services, room_id, required_state, evaluated))
 		.chain(
 			timeline_members
-				.map(|state| (state, None, true))
+				.map(|state| Ok((state, None, true)))
 				.stream(),
 		)
-		.broad_filter_map(async |(state, event_id, lazy)| {
-			let (event_type, state_key) = state;
+		.broad_then(async |selected| -> Outcome {
+			let ((event_type, state_key), event_id, lazy) = selected?;
 			let state_key: StateKey = match state_key.as_str() {
-				| "$LAZY" | "*" => return None,
+				| "$LAZY" | "*" => return Ok(None),
 				| "$ME" => sender_user.as_str().into(),
 				| _ => state_key,
 			};
 
 			let state_mode = previous
 				.filter(|previous| {
-					!state_was_requested(previous, &event_type, state_key.as_str(), sender_user)
+					!fingerprints_cover(previous, &event_type, state_key.as_str(), sender_user)
 				})
 				.map(|_| StateMode::Full)
 				.unwrap_or(state_mode);
 
 			if state_unchanged && !lazy && state_mode != StateMode::Full {
-				return None;
+				return Ok(None);
 			}
 
+			// A key that cannot be resolved is not yet known to be due, so it records zero.
 			let event_id = match event_id {
-				| Some(event_id) => event_id,
+				| Some(event_id) => Some(event_id),
 				| None =>
-					services
-						.state_accessor
-						.room_state_get_id(room_id, &event_type, &state_key)
-						.ok()
+					current_state_id(services, room_id, &event_type, &state_key)
+						.map_err(|_| Unread::Unresolved)
 						.await?,
+			};
+
+			let Some(event_id) = event_id else {
+				return Ok(None);
 			};
 
 			let pdu_id = services.timeline.get_pdu_id(&event_id).await.ok();
 			let count = pdu_id.map(RawPduId::pdu_count);
+			let left_unread =
+				fingerprints_cover(unread_keys, &event_type, state_key.as_str(), sender_user);
+
+			let comparable = !lazy && !left_unread && state_mode != StateMode::Full;
+
+			// Only a delivered snapshot vouches for an outlier; the cursor's snapshot
+			// may already hold one the client was never sent.
 			let same_at_since = since_state
-				.filter(|(since, _)| !lazy && count.is_some_and(|count| count <= *since))
+				.filter(|(since, _)| {
+					comparable && count.map_or(delivered != 0, |count| count <= *since)
+				})
 				.map_async(|(_, shortstatehash)| {
 					services
 						.state_accessor
@@ -624,52 +734,158 @@ async fn collect_required_state(
 				.flatten()
 				.is_some_and(|previous_event_id| previous_event_id == event_id);
 
-			let pdu_id =
-				state_is_required(state_mode, count, lazy, same_at_since).then_some(pdu_id)?;
+			let candidate = Candidate { count, lazy, left_unread, same_at_since };
 
-			let mut pdu = match pdu_id {
-				| None => services
-					.timeline
-					.get_outlier_pdu(&event_id)
-					.await
-					.ok()?,
-				| Some(pdu_id) => services
-					.timeline
-					.get_pdu_from_id(&pdu_id)
-					.or_else(|_| services.timeline.get_outlier_pdu(&event_id))
-					.await
-					.ok()?,
+			if !state_is_required(state_mode, candidate) {
+				return Ok(None);
+			}
+
+			let pdu = match pdu_id {
+				| None => services.timeline.get_outlier_pdu(&event_id).await,
+				| Some(pdu_id) =>
+					services
+						.timeline
+						.get_pdu_from_id(&pdu_id)
+						.or_else(|_| services.timeline.get_outlier_pdu(&event_id))
+						.await,
 			};
 
-			annotate_membership(services, &mut pdu, sender_user, encrypted).await;
+			// A due event that cannot be read leaves its key for the next delivery to send.
+			let unread_key =
+				|_: Error| Unread::Unreadable(required_state_hash(&event_type, &state_key));
 
-			let pdu = strip_prev_state(pdu, sender_user, in_timeline);
+			let pdu = pdu
+				.inspect_err(|error| {
+					warn!(%room_id, %event_id, %error, "Unreadable required state event");
+				})
+				.map_err(unread_key)?;
 
-			Some(Event::into_format(pdu))
+			let pdu = with_membership(services, pdu, sender_user, encrypted).await;
+			let pdu = strip_state_unsigned(pdu, sender_user, in_timeline);
+
+			let settled = left_unread.then(|| required_state_hash(&event_type, &state_key));
+
+			Ok(Some((Event::into_format(pdu), settled)))
 		})
-		.collect()
+		.ready_fold_default(Collected::push)
+		.map(|collected| collected.finish(snapshot, unread_keys))
 		.await
 }
 
-fn state_was_requested(
-	previous: &[u64],
+/// The room's current snapshot and the base a delta compares requested state with.
+///
+/// The current snapshot is read before any state key, so a change racing the
+/// read is sent again rather than lost. The base is the snapshot the room's
+/// required state was last delivered from, or without one, the snapshot before
+/// the first event past the cursor.
+async fn state_snapshots(
+	services: &Services,
+	room_id: &RoomId,
+	StateSelection { mode, changed, delivered, .. }: StateSelection<'_>,
+	compared: bool,
+) -> Snapshots {
+	let current = changed
+		.then_async(|| {
+			services
+				.state
+				.get_room_shortstatehash(room_id)
+				.inspect_err(|error| warn!(%room_id, %error, "Unreadable room state snapshot"))
+				.ok()
+		})
+		.await
+		.flatten();
+
+	// Falling back to current state would match every entry against itself.
+	let since_state = match mode {
+		| StateMode::Delta(since) if compared && delivered != 0 => Some((since, delivered)),
+		| StateMode::Delta(since) if compared =>
+			services
+				.timeline
+				.next_shortstatehash(room_id, since)
+				.map_ok(|shortstatehash| (since, shortstatehash))
+				.inspect_err(|error| warn!(%room_id, %error, "Unreadable state past the cursor"))
+				.ok()
+				.await,
+		| _ => None,
+	};
+
+	(current, since_state)
+}
+
+/// The current state listed under each wildcard selector a delivery evaluates.
+///
+/// A listing that cannot be read is logged and yielded as an unresolved key: it
+/// may hide an event that was due, so the delivery records zero.
+fn wildcard_state<'a>(
+	services: &'a Services,
+	room_id: &'a RoomId,
+	required_state: &'a HashSet<(StateEventType, StateKey)>,
+	evaluated: bool,
+) -> impl Stream<Item = Result<Selected, Unread>> + Send + 'a {
+	required_state
+		.iter()
+		.filter(move |(_, state_key)| evaluated && state_key == "*")
+		.stream()
+		.flat_map(move |(event_type, _)| {
+			services
+				.state_accessor
+				.room_state_keys_with_ids(room_id, event_type)
+				.inspect_err(move |error| {
+					warn!(%room_id, %event_type, %error, "Unreadable required state keys");
+				})
+				.map_err(|_| Unread::Unresolved)
+				.map_ok(move |(state_key, event_id)| {
+					((event_type.clone(), state_key), Some(event_id), false)
+				})
+		})
+}
+
+/// Whether a set of key fingerprints covers one state key.
+///
+/// A fingerprint covers its own key, every key of its type when it is a wildcard,
+/// and the syncing user's key when it is `$ME`.
+fn fingerprints_cover(
+	fingerprints: &[u64],
 	event_type: &StateEventType,
 	state_key: &str,
 	sender_user: &UserId,
 ) -> bool {
-	let contains = |key| previous.contains(&required_state_hash(event_type, key));
+	let contains = |key| fingerprints.contains(&required_state_hash(event_type, key));
 
-	contains("*") || contains(state_key) || (state_key == sender_user.as_str() && contains("$ME"))
+	!fingerprints.is_empty()
+		&& (contains("*")
+			|| contains(state_key)
+			|| (state_key == sender_user.as_str() && contains("$ME")))
+}
+
+/// The ID of the event the room's current state holds under one requested key.
+///
+/// A key the state does not hold is absent; any other failure is logged and
+/// returned, since the event it hides may still be due.
+async fn current_state_id(
+	services: &Services,
+	room_id: &RoomId,
+	event_type: &StateEventType,
+	state_key: &str,
+) -> Result<Option<OwnedEventId>> {
+	services
+		.state_accessor
+		.room_state_get_id(room_id, event_type, state_key)
+		.map(NotFound::present)
+		.inspect_err(|error| {
+			warn!(%room_id, %event_type, %state_key, %error, "Unreadable required state key");
+		})
+		.await
 }
 
 fn state_is_required(
 	state_mode: StateMode,
-	count: Option<PduCount>,
-	lazy: bool,
-	same_at_since: bool,
+	Candidate { count, lazy, left_unread, same_at_since }: Candidate,
 ) -> bool {
-	lazy || match state_mode {
-		| StateMode::Full => true,
-		| StateMode::Delta(since) => count.is_none_or(|count| count > since) || !same_at_since,
-	}
+	lazy || left_unread
+		|| match state_mode {
+			| StateMode::Full => true,
+			| StateMode::Delta(since) =>
+				count.is_some_and(|count| count > since) || !same_at_since,
+		}
 }

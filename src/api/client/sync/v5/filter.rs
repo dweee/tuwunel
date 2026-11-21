@@ -1,20 +1,30 @@
-use futures::{StreamExt, pin_mut};
+use futures::StreamExt;
 use ruma::{
-	RoomId,
+	RoomId, UserId,
 	api::client::sync::sync_events::v5::request::ListFilters,
 	directory::RoomTypeFilter,
-	events::{room::member::MembershipState, tag::TagName},
+	events::{StateEventType, room::member::MembershipState, tag::TagName},
+	room::RoomType,
 };
+use serde::{Deserialize, de::IgnoredAny};
 use tuwunel_core::{
 	is_equal_to, is_true,
 	utils::{
 		BoolExt, FutureBoolExt, IterStream, ReadyExt,
-		future::{self, OptionFutureExt, ReadyBoolExt},
+		future::{self, OptionFutureExt, ReadyBoolExt, ReadyEqExt},
 		option::OptionExt,
 	},
+	warn,
 };
+use tuwunel_service::{Services, rooms::state_cache::StrippedRoomState};
 
-use super::SyncInfo;
+use super::{SyncInfo, stripped_content, stripped_state};
+
+#[derive(Deserialize)]
+struct CreateContent {
+	#[serde(rename = "type")]
+	room_type: Option<RoomType>,
+}
 
 #[tracing::instrument(name = "filter", level = "trace", skip_all)]
 pub(super) async fn filter_room(
@@ -24,31 +34,37 @@ pub(super) async fn filter_room(
 	membership: Option<&MembershipState>,
 ) -> bool {
 	#[expect(clippy::match_same_arms)] // helps readability
-	let match_invite = filter
-		.is_invite
-		.map_async(async |is_invite| match (membership, is_invite) {
-			| (Some(MembershipState::Invite), true) => true,
-			| (Some(MembershipState::Invite), false) => false,
-			| (Some(_), true) => false,
-			| (Some(_), false) => true,
-			| _ =>
-				services
-					.state_cache
-					.is_invited(sender_user, room_id)
-					.await == is_invite,
-		});
+	let invite_matches = async |is_invite| match (membership, is_invite) {
+		| (Some(MembershipState::Invite), true) => true,
+		| (Some(MembershipState::Invite), false) => false,
+		| (Some(_), true) => false,
+		| (Some(_), false) => true,
+		| _ =>
+			services
+				.state_cache
+				.is_invited(sender_user, room_id)
+				.eq(&is_invite)
+				.await,
+	};
+
+	let match_invite = filter.is_invite.map_async(invite_matches);
 
 	let match_direct = filter
 		.is_dm
 		.is_none_or(is_equal_to!(direct_rooms.contains(room_id)));
 
+	let pending_knock = membership == Some(&MembershipState::Knock);
 	let match_encrypted = filter
 		.is_encrypted
 		.map_async(async |is_encrypted| {
-			services
+			// Encryption is never turned off, so the knock summary can only add it.
+			let encrypted = services
 				.state_accessor
 				.is_encrypted_room(room_id)
-				.await == is_encrypted
+				.await
+				|| (pending_knock && knock_encrypted(services, sender_user, room_id).await);
+
+			encrypted == is_encrypted
 		});
 
 	let match_space_child = filter
@@ -88,7 +104,13 @@ pub(super) async fn filter_room(
 			.await
 			.ok();
 
+		let room_type = match room_type {
+			| None if pending_knock => knock_room_type(services, sender_user, room_id).await,
+			| room_type => room_type,
+		};
+
 		let room_type = RoomTypeFilter::from(room_type);
+
 		(filter.not_room_types.is_empty() || !filter.not_room_types.contains(&room_type))
 			&& (filter.room_types.is_empty() || filter.room_types.contains(&room_type))
 	});
@@ -104,11 +126,45 @@ pub(super) async fn filter_room(
 		.await
 }
 
+async fn knock_encrypted(services: &Services, sender_user: &UserId, room_id: &RoomId) -> bool {
+	knock_summary(services, sender_user, room_id)
+		.await
+		.is_some_and(|summary| {
+			let encryption: Option<IgnoredAny> =
+				stripped_content(&summary, &StateEventType::RoomEncryption);
+
+			encryption.is_some()
+		})
+}
+
+async fn knock_room_type(
+	services: &Services,
+	sender_user: &UserId,
+	room_id: &RoomId,
+) -> Option<RoomType> {
+	let summary = knock_summary(services, sender_user, room_id).await?;
+
+	stripped_content(&summary, &StateEventType::RoomCreate)
+		.and_then(|content: CreateContent| content.room_type)
+}
+
+async fn knock_summary(
+	services: &Services,
+	sender_user: &UserId,
+	room_id: &RoomId,
+) -> StrippedRoomState {
+	stripped_state(services, sender_user, room_id, Some(&MembershipState::Knock)).await
+}
+
 #[tracing::instrument(name = "filter_meta", level = "trace", skip_all)]
 pub(super) async fn filter_room_meta(
-	SyncInfo { services, sender_user, .. }: SyncInfo<'_>,
+	sync_info @ SyncInfo { services, sender_user, .. }: SyncInfo<'_>,
 	room_id: &RoomId,
 ) -> bool {
+	if is_forgotten(sync_info, room_id).await {
+		return false;
+	}
+
 	let not_exists = services.metadata.exists(room_id).is_false();
 
 	let is_disabled = services.metadata.is_disabled(room_id);
@@ -130,13 +186,26 @@ pub(super) async fn filter_room_meta(
 		.once_joined(sender_user, room_id)
 		.is_false();
 
-	pin_mut!(not_visible, not_invited, not_once_joined, not_exists, is_disabled, is_banned);
 	not_visible
-		.and(not_invited)
-		.and(not_once_joined)
-		.or(not_exists)
-		.or(is_disabled)
-		.or(is_banned)
+		.and2(not_invited, not_once_joined)
+		.or3(not_exists, is_disabled, is_banned)
 		.is_false()
 		.await
+}
+
+/// Tests whether the sender forgot a room.
+///
+/// An unreadable marker counts as forgotten, so a failed read withholds
+/// rather than exposes.
+#[tracing::instrument(level = "trace", skip_all)]
+pub(super) async fn is_forgotten(
+	SyncInfo { services, sender_user, .. }: SyncInfo<'_>,
+	room_id: &RoomId,
+) -> bool {
+	services
+		.state_cache
+		.is_forgotten(sender_user, room_id)
+		.await
+		.inspect_err(|error| warn!(%sender_user, %room_id, %error, "Unreadable forgotten state"))
+		.unwrap_or(true)
 }

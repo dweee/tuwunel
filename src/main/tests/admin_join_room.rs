@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use reqwest::Method;
 use serde_json::{Value, json};
 use tuwunel_core::{
 	Result,
@@ -15,6 +16,9 @@ use self::{
 mod client;
 mod fixture;
 
+#[path = "client/admin_api.rs"]
+mod admin_api;
+
 const ADMIN_TOKEN: &str = "admin-join-room-admin-access-token";
 const OWNER_TOKEN: &str = "admin-join-room-owner-access-token";
 const USER_TOKEN: &str = "admin-join-room-user-access-token";
@@ -27,7 +31,7 @@ const USER_TOKEN: &str = "admin-join-room-user-access-token";
 /// user already meets, admits the join without the admin present at all.
 #[test]
 fn invites_only_where_the_join_rule_requires_it() -> Result {
-	let options = ["create_admin_room=true", "grant_admin_to_first_user=false"];
+	let options = ["admin.room.create=true", "registration.grant_admin_to_first_user=false"];
 
 	boot("admin-join-room", options, exercise)
 }
@@ -111,24 +115,17 @@ fn restricted(allowed: &RoomId) -> Value {
 	})
 }
 
-/// Posts the admin join of `user_id` to `room_id`, asserts the `expected`
-/// status, and returns the parsed body.
-///
-/// The status assertion carries the response body, so a routing or fixture
-/// failure reads differently from the refusal a case expects.
 async fn admin_join(
 	client: &Client<'_>,
 	room_id: &RoomId,
 	user_id: &UserId,
 	expected: u16,
 ) -> Result<Value> {
-	let url = format!("{}/_synapse/admin/v1/join/{room_id}", client.base);
+	let path = format!("v1/join/{room_id}");
 	let body = json!({ "user_id": user_id });
-	let response = client.post_url(&url, &body).await?;
-	let status = response.status().as_u16();
-	let response = response.text().await?;
-
-	assert_eq!(status, expected, "{url}: {response}");
+	let response = client
+		.admin_api(Method::POST, &path, &body, expected)
+		.await?;
 
 	Ok(response.parse()?)
 }

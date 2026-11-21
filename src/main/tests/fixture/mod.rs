@@ -5,7 +5,7 @@
 //! binary declaring it also declares the client harness, whose readiness
 //! probe the boot awaits.
 
-use std::{fs::remove_dir_all, net::TcpListener};
+use std::{fs::remove_dir_all, net::TcpListener, path::Path};
 
 use futures::{FutureExt, TryFutureExt, future::join};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
@@ -20,19 +20,46 @@ use super::client::wait_until_ready;
 /// apply after, so they can override, the settings every test shares. The
 /// exercise starts once the listener answers, and the server shuts down
 /// whatever it returns.
-pub(crate) fn boot<Options, Exercise>(name: &str, options: Options, exercise: Exercise) -> Result
+pub(crate) fn boot<'a, Options, Exercise>(
+	name: &str,
+	options: Options,
+	exercise: Exercise,
+) -> Result
 where
-	Options: IntoIterator<Item: Into<String>>,
+	Options: IntoIterator<Item = &'a str>,
+	Exercise: AsyncFnOnce(&Services, &str) -> Result,
+{
+	let database = Args::test_database_path(name);
+	let outcome = boot_at(&database, &["fresh", "cleanup"], options, exercise);
+
+	remove_dir_all(database).ok();
+
+	outcome
+}
+
+/// Boot a server on the database at a given path and run one exercise on it.
+///
+/// Only the named test harnesses apply and the database is left in place, so a
+/// test reopening one database across boots, one process each, names neither
+/// `fresh` nor `cleanup` after its first. Otherwise this boots as [`boot`] does.
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) fn boot_at<'a, Options, Exercise>(
+	database: &Path,
+	harnesses: &[&str],
+	options: Options,
+	exercise: Exercise,
+) -> Result
+where
+	Options: IntoIterator<Item = &'a str>,
 	Exercise: AsyncFnOnce(&Services, &str) -> Result,
 {
 	let listener = TcpListener::bind(("127.0.0.1", 0))?;
 	let address = listener.local_addr()?;
-	let database = Args::test_database_path(name);
 
-	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_database_path(&database)
-		.with_option(format!("address=[\"{}\"]", address.ip()))
-		.with_option(format!("port={}", address.port()))
+	let args = Args::default_test(harnesses)
+		.with_database_path(database)
+		.with_option(format!("http.listen.address=[\"{}\"]", address.ip()))
+		.with_option(format!("http.listen.port={}", address.port()))
 		.with_option("listening=true");
 
 	let args = options.into_iter().fold(args, Args::with_option);
@@ -67,7 +94,6 @@ where
 	});
 
 	drop(runtime);
-	remove_dir_all(database).ok();
 
 	outcome
 }

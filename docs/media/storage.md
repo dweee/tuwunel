@@ -24,8 +24,8 @@ When `store_media_on_providers` is empty, all providers in
 
 Providers are declared as TOML sections named
 `[global.storage_provider.<NAME>.<brand>]`, where `<NAME>` is the identifier
-you reference in `media_storage_providers`, and `<brand>` is either `local`
-or `s3`. For container deployments (Docker Compose, Podman, Kubernetes) where
+you reference in `media_storage_providers`, and `<brand>` is `local`,
+`s3` or `gcs`. For container deployments (Docker Compose, Podman, Kubernetes) where
 mounting a configuration file is inconvenient, please refer to the section on
 [environment variables](#environment-variables) instead.
 
@@ -57,33 +57,92 @@ key    = "AKIAIOSFODNN7EXAMPLE"
 secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 ```
 
-Alternatively, supply a full S3 URL that encodes bucket, region, and path:
+Alternatively, supply an S3 URL in place of `bucket`. An `s3://` URL sets only
+the bucket and its path is ignored, so set an object prefix with `base_path`:
 
 ```toml
 [global.storage_provider.media_on_s3.s3]
-url    = "s3://my-matrix-media/prefix"
-key    = "AKIAIOSFODNN7EXAMPLE"
-secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+url       = "s3://my-matrix-media"
+base_path = "prefix"
+key       = "AKIAIOSFODNN7EXAMPLE"
+secret    = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 ```
 
 #### S3 configuration reference
 
 | Field | Default | Description |
 |---|---|---|
-| `url` | — | S3 URL of the form `s3://bucket/path`. Components not present in the URL can be set individually below. |
-| `bucket` | — | Bucket name. |
+| `url` | none | S3 URL such as `s3://bucket`, or an AWS `https://` bucket URL. An `s3://` URL sets only the bucket and its path is ignored; an `https://s3.<region>.amazonaws.com/<bucket>` or `https://<bucket>.s3.<region>.amazonaws.com` URL also sets the region, and a Cloudflare R2 URL sets it to `auto`. Values from the URL override `bucket` and `region`. Use `base_path` for an object prefix. |
+| `bucket` | none | Bucket name. |
 | `region` | `us-east-1` | AWS region where the bucket resides. |
-| `key` | — | IAM Access Key ID. |
-| `secret` | — | IAM Secret Access Key. Not logged or serialized. |
-| `token` | — | Session token for temporary credentials. Not logged or serialized. |
-| `base_path` | — | Path prefix inside the bucket. All objects are stored under this prefix. |
-| `endpoint` | — | Override the S3 endpoint URL. Required for self-hosted S3-compatible services such as MinIO or DigitalOcean Spaces. |
+| `key` | none | IAM Access Key ID. |
+| `secret` | none | IAM Secret Access Key. Not logged or serialized. |
+| `token` | none | Session token for temporary credentials. Not logged or serialized. |
+| `base_path` | none | Path prefix inside the bucket. All objects are stored under this prefix. |
+| `endpoint` | none | Override the S3 endpoint URL. Required for self-hosted S3-compatible services such as MinIO or DigitalOcean Spaces. A dual-stack AWS or Cloudflare R2 `url` sets its own endpoint, which overrides this one. |
 | `multipart_threshold` | `100 MiB` | Files at or above this size use the S3 multipart upload API. Accepts SI/IEC unit strings. |
-| `kms` | — | SSE-KMS key ARN for server-side encryption. |
-| `use_bucket_key` | — | Enable S3 Bucket Keys for KMS encryption. Should match the bucket setting. |
-| `use_vhost_request` | — | Override virtual-hosted-style request path. Derived automatically from the URL by default. |
+| `kms` | none | SSE-KMS key ARN for server-side encryption. |
+| `use_bucket_key` | none | Enable S3 Bucket Keys for KMS encryption. Should match the bucket setting. |
+| `use_vhost_request` | none | Turn virtual-hosted-style requests on or off. A virtual-hosted AWS `url` (`https://<bucket>.s3.<region>.amazonaws.com`) turns them on regardless. |
 | `use_https` | `true` | Require HTTPS. Set `false` only for local development with HTTP-only test endpoints. |
 | `startup_check` | `true` | Ping the bucket at startup to confirm connectivity. Failure aborts startup. Set `false` if the provider may be unavailable during startup. |
+
+### Google Cloud Storage
+
+```toml
+[global]
+media_storage_providers = ["media_on_gcs"]
+
+[global.storage_provider.media_on_gcs.gcs]
+bucket = "my-matrix-media"
+```
+
+This selects GCS for media storage. Credentials resolve from the environment and
+fall back to the instance metadata server, so on Google Kubernetes Engine or
+Compute Engine the server can authenticate as the attached service account with
+no exported key material. Grant that service account
+`roles/storage.objectAdmin` on the bucket, or equivalent object permissions.
+
+Use this rather than pointing the `s3` provider at
+`https://storage.googleapis.com`. The S3-interoperability endpoint accepts only
+HMAC keys, which are service-account keys, so it cannot use an attached service
+account. The `constraints/iam.disableServiceAccountKeyCreation` policy prevents
+creating the new service-account keys that this setup would require.
+
+An object prefix is set separately, with `base_path`:
+
+```toml
+[global.storage_provider.media_on_gcs.gcs]
+bucket    = "my-matrix-media"
+base_path = "prefix"
+```
+
+A `gs://bucket/path` URL is not accepted here, because the path component would
+not be applied as a prefix.
+
+#### GCS configuration reference
+
+| Option | Default | Description |
+|---|---|---|
+| `bucket` | None | Bucket name. Required; an unset bucket disables the provider. |
+| `base_path` | None | Object prefix within the bucket. Alias: `path`. |
+| `service_account_path` | None | Path to a service account key file. Leave unset to use the environment, which on GCE/GKE ends at the metadata server, the keyless and recommended configuration. |
+| `application_credentials_path` | None | Path to an application default credentials file. Only service-account and authorized-user documents are recognised. |
+| `multipart_threshold` | 100 MiB | Upload size above which multipart upload is used. |
+| `multipart_part_size` | 10 MiB | Size of each part within a multipart upload. |
+| `startup_check` | true | Ping the provider at startup; failures abort startup. The probe is a listing operation, so it requires `storage.objects.list`, passes on an empty bucket, and proves neither write nor delete. |
+
+Credential file settings are applied to the environment-derived builder. Do not
+combine `service_account_path` with `GOOGLE_SERVICE_ACCOUNT_KEY`; the underlying
+client rejects simultaneous service-account path and inline-key credentials.
+Environment service-account credentials take priority over
+`application_credentials_path`.
+
+Media redirects (`media_allow_redirect`) work without a key as well: with no
+private key configured, signing goes through the IAM `signBlob` API, where
+Google holds the key. That path additionally needs the IAM Service Account
+Credentials API enabled and `iam.serviceAccounts.signBlob` on the service
+account.
 
 #### Self-hosted S3-compatible services
 
@@ -131,6 +190,14 @@ TUWUNEL_STORAGE_PROVIDER__MEDIA_ON_S3__S3__KEY="AKIAIOSFODNN7EXAMPLE"
 TUWUNEL_STORAGE_PROVIDER__MEDIA_ON_S3__S3__SECRET="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 ```
 
+#### GCS example
+
+```env
+TUWUNEL_STORAGE_PROVIDER__MEDIA_ON_GCS__GCS__BUCKET="my-matrix-media"
+```
+
+No credential variables: on GCE/GKE the attached service account is used.
+
 #### Self-hosted S3-compatible example
 
 ```env
@@ -157,7 +224,8 @@ To migrate from local storage to S3 (or between any two providers) without
 downtime:
 
 **Step 1** — Add the new provider and list both in `media_storage_providers`,
-but direct new writes only to the new one via `store_media_on_providers`:
+but direct new writes only to the new one via `store_media_on_providers`, then
+restart (a configuration reload refuses a new provider section):
 
 ```toml
 media_storage_providers  = ["media", "media_on_s3"]
@@ -171,7 +239,7 @@ secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 ```
 
 Tuwunel now writes new media to S3 and reads from whichever provider holds
-the file, falling back to local if not found on S3.
+the file, trying the providers in name order (`media` before `media_on_s3`).
 
 **Step 2** — Copy existing files to the new provider using the storage sync
 admin command:
@@ -183,7 +251,7 @@ admin command:
 This copies all objects present in `media` but absent from `media_on_s3`.
 
 **Step 3** — Once the sync is complete and verified, remove `"media"` from
-both lists and restart:
+both lists and restart or reload the configuration:
 
 ```toml
 media_storage_providers  = ["media_on_s3"]

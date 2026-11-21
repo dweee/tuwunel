@@ -12,9 +12,19 @@ use tuwunel_core::{
 };
 use tuwunel_service::Services;
 
-use self::client::{Client, field, poll_until, register, wait_until_ready};
+use self::{
+	client::{Client, field, poll_until, register, wait_until_ready},
+	sync::joined_room,
+};
 
 mod client;
+
+#[path = "client/sync.rs"]
+mod sync;
+
+#[expect(dead_code)] // Only the self-membership action is used from the add-on.
+#[path = "client/membership.rs"]
+mod membership;
 
 /// How long a notification count is polled for before the case gives up.
 const COUNT_DEADLINE: Duration = Duration::from_secs(5);
@@ -36,9 +46,8 @@ fn busy_round_reports_the_zeroed_notification_count() -> Result {
 	let db_path = Args::test_database_path("sync-busy-round");
 
 	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_option(format!("database_path={db_path:?}"))
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_database_path(&db_path)
+		.with_loopback_listener(port)
 		.with_option("listening=true");
 
 	let runtime = Runtime::new(Some(&args))?;
@@ -84,7 +93,7 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.create_room(&json!({ "preset": "public_chat" }))
 		.await?;
 
-	reader.join(&room).await?;
+	reader.act(&room, "join").await?;
 
 	let opening = reader.sync(None).await?;
 	let since = next_batch(&opening)?;
@@ -135,22 +144,6 @@ async fn exercise(services: &Services, base: &str) -> Result {
 		.eq(&0)
 		.into_option()
 		.ok_or_else(|| err!("the busy reset round withheld the zeroed notification count"))?;
-
-	Ok(())
-}
-
-#[implement(Client, params = "<'_>")]
-async fn join(&self, room_id: &RoomId) -> Result {
-	self.services
-		.client
-		.clients
-		.default
-		.post(self.url(&format!("rooms/{room_id}/join")))
-		.bearer_auth(self.token)
-		.json(&json!({}))
-		.send()
-		.await?
-		.error_for_status()?;
 
 	Ok(())
 }
@@ -273,10 +266,4 @@ fn carries_reaction(response: &Value, room_id: &RoomId) -> Result<bool> {
 		.any(|event_type| event_type == "m.reaction");
 
 	Ok(reacted)
-}
-
-fn joined_room<'a>(response: &'a Value, room_id: &RoomId) -> Result<&'a Value> {
-	response["rooms"]["join"]
-		.get(room_id.as_str())
-		.ok_or_else(|| err!("sync response omitted joined room {room_id}"))
 }

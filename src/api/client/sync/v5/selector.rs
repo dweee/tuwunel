@@ -9,9 +9,7 @@ use ruma::{
 	events::room::member::MembershipState, uint,
 };
 use tuwunel_core::{
-	Result, apply, debug_error, is_true,
-	matrix::PduCount,
-	trace,
+	Result, apply, debug_error, is_true, trace,
 	utils::{
 		BoolExt,
 		math::usize_from_ruma,
@@ -19,12 +17,13 @@ use tuwunel_core::{
 		stream::{BroadbandExt, IterStream},
 	},
 };
+use tuwunel_matrix::PduCount;
 use tuwunel_service::{sync::Connection, users::InviteFilter};
 
 use super::{
 	super::invite_permitted_room,
-	ListIds, ResponseLists, SyncInfo, Window, WindowRoom,
-	filter::{filter_room, filter_room_meta},
+	ListIds, ResponseLists, SyncInfo, Window, WindowRoom, departed,
+	filter::{filter_room, filter_room_meta, is_forgotten},
 };
 
 #[tracing::instrument(level = "debug", skip_all)]
@@ -70,8 +69,9 @@ pub(super) async fn selector(
 		.broad_filter_map(async |room_id| {
 			services
 				.state_cache
-				.is_left(sender_user, room_id)
+				.get_departure_count(room_id, sender_user)
 				.await
+				.is_ok()
 				.then_some((room_id.clone(), Some(Leave)))
 		});
 
@@ -89,10 +89,10 @@ pub(super) async fn selector(
 	}
 
 	trace!(?rooms);
-	let lists = response_lists(rooms.iter());
+	let lists = response_lists(conn.lists.keys(), rooms.iter());
 
 	trace!(?lists);
-	let window = window(sync_info, conn, rooms.iter(), &lists, &invite_filter).await;
+	let window = window(sync_info, conn, rooms.iter(), &invite_filter).await;
 
 	trace!(?window);
 	(window, lists)
@@ -130,9 +130,8 @@ async fn matcher(
 		.map(|lists| (lists.is_empty().is_false(), lists))
 		.await;
 
-	let selected = matched
-		|| conn.subscriptions.contains_key(&room_id)
-		|| matches!(membership, Some(MembershipState::Leave | MembershipState::Ban));
+	let selected =
+		matched || conn.subscriptions.contains_key(&room_id) || departed(membership.as_ref());
 
 	if !selected {
 		return None;
@@ -190,7 +189,7 @@ async fn matcher(
 			| Some(MembershipState::Leave | MembershipState::Ban) => Some(
 				services
 					.state_cache
-					.get_left_count(&room_id, sender_user)
+					.get_departure_count(&room_id, sender_user)
 					.await,
 			),
 			| _ => None,
@@ -217,6 +216,7 @@ async fn matcher(
 	Some(WindowRoom {
 		room_id,
 		membership,
+		forgotten: false, // Subscriptions filter these, and selections exclude departures.
 		lists,
 		event_count,
 		payload_count,
@@ -300,6 +300,37 @@ fn bounded_count(next_batch: u64, count: Option<u64>) -> u64 {
 		.unwrap_or_default()
 }
 
+fn room_sort(a: &WindowRoom, b: &WindowRoom) -> Ordering {
+	b.event_count
+		.cmp(&a.event_count)
+		.then_with(|| a.room_id.cmp(&b.room_id))
+}
+
+fn response_lists<'a, Ids, Rooms>(ids: Ids, rooms: Rooms) -> ResponseLists
+where
+	Ids: Iterator<Item = &'a ListId>,
+	Rooms: Iterator<Item = &'a WindowRoom>,
+{
+	// matrix-rust-sdk polls with `timeout=0` until a list reports its count.
+	let lists: ResponseLists = ids
+		.map(|id| (id.clone(), Default::default()))
+		.collect();
+
+	rooms
+		.filter(|room| !departed(room.membership.as_ref()))
+		.flat_map(|room| room.lists.iter())
+		.fold(lists, |mut lists, id| {
+			let list = lists.entry(id.clone()).or_default();
+
+			list.count = list
+				.count
+				.checked_add(uint!(1))
+				.expect("list count must not overflow JsInt");
+
+			lists
+		})
+}
+
 #[tracing::instrument(
 	level = "debug",
 	skip_all,
@@ -309,7 +340,6 @@ async fn window<'a, Rooms>(
 	sync_info: SyncInfo<'_>,
 	conn: &Connection,
 	rooms: Rooms,
-	lists: &ResponseLists,
 	invite_filter: &InviteFilter,
 ) -> Window
 where
@@ -319,9 +349,9 @@ where
 
 	let SyncInfo { services, sender_user, .. } = sync_info;
 
-	let selections = lists
-		.keys()
-		.filter_map(|id| conn.lists.get(id).map(|list| (id, list)))
+	let selections = conn
+		.lists
+		.iter()
 		.flat_map(|(id, list)| {
 			let full_range = list
 				.ranges
@@ -335,10 +365,7 @@ where
 				.map(apply!(2, usize_from_ruma))
 				.map(move |range| (id, range))
 		})
-		.flat_map(|(id, (start, end))| {
-			select_list_range(rooms.clone(), id, start, end)
-				.map(|room| (room.room_id.clone(), room.clone()))
-		})
+		.flat_map(|(id, (start, end))| select_list_range(rooms.clone(), id, start, end).cloned())
 		.stream();
 
 	let indexed_subscriptions = (conn.subscriptions.len() > 1).then(|| {
@@ -352,7 +379,7 @@ where
 	let retractions = rooms
 		.clone()
 		.filter(|room| {
-			matches!(room.membership, Some(MembershipState::Leave | MembershipState::Ban))
+			departed(room.membership.as_ref())
 				&& conn
 					.rooms
 					.get(&room.room_id)
@@ -360,8 +387,13 @@ where
 						conn_room.roomsince != 0 && room.payload_count > conn_room.roomsince
 					})
 		})
-		.map(|room| (room.room_id.clone(), detached_room(room.clone())))
-		.stream();
+		.cloned()
+		.map(detached_room)
+		.stream()
+		.broad_then(async |room| WindowRoom {
+			forgotten: is_forgotten(sync_info, &room.room_id).await,
+			..room
+		});
 
 	let subscriptions = conn
 		.subscriptions
@@ -411,12 +443,12 @@ where
 			matcher(sync_info, conn, room_id.clone(), membership)
 				.await
 				.map(detached_room)
-		})
-		.map(|room| (room.room_id.clone(), room));
+		});
 
 	retractions
 		.chain(subscriptions)
 		.chain(selections)
+		.map(|room| (room.room_id.clone(), room))
 		.collect()
 		.await
 }
@@ -434,49 +466,21 @@ where
 {
 	rooms
 		.filter(move |room| room.lists.contains(id))
-		.filter(|room| {
-			!matches!(room.membership, Some(MembershipState::Leave | MembershipState::Ban))
-		})
+		.filter(|room| !departed(room.membership.as_ref()))
 		.skip(start)
 		.take(end.saturating_add(1).saturating_sub(start))
-}
-
-fn response_lists<'a, Rooms>(rooms: Rooms) -> ResponseLists
-where
-	Rooms: Iterator<Item = &'a WindowRoom>,
-{
-	rooms
-		.filter(|room| {
-			!matches!(room.membership, Some(MembershipState::Leave | MembershipState::Ban))
-		})
-		.flat_map(|room| room.lists.iter())
-		.fold(ResponseLists::default(), |mut lists, id| {
-			let list = lists.entry(id.clone()).or_default();
-			list.count = list
-				.count
-				.checked_add(uint!(1))
-				.expect("list count must not overflow JsInt");
-
-			lists
-		})
-}
-
-fn room_sort(a: &WindowRoom, b: &WindowRoom) -> Ordering {
-	b.event_count
-		.cmp(&a.event_count)
-		.then_with(|| a.room_id.cmp(&b.room_id))
 }
 
 #[cfg(test)]
 mod tests {
 	use ruma::{
 		OwnedRoomId, api::client::sync::sync_events::v5::ListId,
-		events::room::member::MembershipState, room_id,
+		events::room::member::MembershipState, room_id, uint,
 	};
 
 	use super::{
-		ActivityCounts, ListIds, WindowRoom, activity_counts, detached_room, room_sort,
-		select_list_range,
+		ActivityCounts, ListIds, WindowRoom, activity_counts, detached_room, response_lists,
+		room_sort, select_list_range,
 	};
 
 	const NEXT_BATCH: u64 = 10;
@@ -611,6 +615,22 @@ mod tests {
 		assert_eq!(room.membership, Some(MembershipState::Leave));
 	}
 
+	#[test]
+	fn unmatched_list_reports_zero() {
+		let all = ListId::from("all");
+		let invites = ListId::from("invites");
+		let joined = WindowRoom {
+			lists: [all.clone()].into(),
+			..room(room_id!("!joined:example.com").to_owned(), 1, 1, Some(MembershipState::Join))
+		};
+
+		let lists = response_lists([&all, &invites].into_iter(), [joined].iter());
+
+		assert_eq!(lists.len(), 2);
+		assert_eq!(lists[&all].count, uint!(1));
+		assert_eq!(lists[&invites].count, uint!(0));
+	}
+
 	fn room(
 		room_id: OwnedRoomId,
 		event_count: u64,
@@ -620,6 +640,7 @@ mod tests {
 		WindowRoom {
 			room_id,
 			membership,
+			forgotten: false,
 			lists: ListIds::new(),
 			event_count,
 			payload_count,

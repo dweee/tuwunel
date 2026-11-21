@@ -1,6 +1,13 @@
+//! Users' pushers and the notifications they deliver.
+//!
+//! The service stores pushers, evaluates push rules for each appended event,
+//! keeps notification counts, and delivers to push gateways and by email.
+
 mod append;
 mod badge;
+mod email;
 mod notification;
+mod redact;
 mod request;
 mod send;
 mod suppressed;
@@ -12,6 +19,7 @@ use std::{
 	sync::{Arc, LazyLock},
 };
 
+use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryFutureExt, future::join};
 use ruma::{
 	DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
@@ -28,25 +36,32 @@ use serde::Deserialize;
 use tracing::Level;
 use tuwunel_core::{
 	Err, Result, err, implement,
-	matrix::Event,
 	utils::{
-		MutexMap,
+		BoolExt, MutexMap,
 		future::TryExtExt,
 		result::ErrLog,
 		stream::{BroadbandExt, IterStream, ReadyExt, TryIgnore, WidebandExt},
 	},
 };
-use tuwunel_database::{Database, Deserialized, Ignore, Interfix, Json, Map};
+use tuwunel_database::{Database, Deserialized, Ignore, Interfix, Map};
+use tuwunel_matrix::Event;
 use url::Url;
 
 use self::badge::SentBadges;
 pub use self::{
 	append::Notified,
+	email::Outcome as EmailOutcome,
 	suppressed::{SuppressedPushes, SuppressedRooms},
 };
 
 /// The events an event relates to, keyed by relation type, for MSC3664.
 type RelatedEvents = BTreeMap<String, FlattenedJson>;
+
+/// Guards one user's counter in one room across a read-modify-write.
+///
+/// It holds one entry per (room, user) with an increment (append), decrement
+/// (redaction) or reset (receipt, local send) in flight.
+type CountMutex = MutexMap<(OwnedRoomId, OwnedUserId), ()>;
 
 /// The inputs for evaluating one user's push rules against one event.
 pub struct Evaluate<'a, 'b> {
@@ -92,18 +107,26 @@ struct InReplyTo {
 	event_id: OwnedEventId,
 }
 
+/// Stores pushers and delivers the notifications they ask for.
+///
+/// HTTP pushers are pushed through the sending queue, and email pushers are
+/// mailed by this service's worker.
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
-	notification_increment_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
-	highlight_increment_mutex: MutexMap<(OwnedRoomId, OwnedUserId), ()>,
+	notification_increment_mutex: CountMutex,
+	highlight_increment_mutex: CountMutex,
 	db: Data,
 	suppressed: suppressed::SuppressedQueue,
 	sent_badges: SentBadges,
+	email_wakes: email::Wakes,
+	email_locks: email::Locks,
 }
 
 struct Data {
 	db: Arc<Database>,
+	senderkey_emailcursor: Arc<Map>,
 	senderkey_pusher: Arc<Map>,
+	senderkeyroom_emailthrottle: Arc<Map>,
 	pushkey_deviceid: Arc<Map>,
 	useridcount_notification: Arc<Map>,
 	userroomid_highlightcount: Arc<Map>,
@@ -111,6 +134,7 @@ struct Data {
 	roomuserid_lastnotificationread: Arc<Map>,
 }
 
+#[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
@@ -119,7 +143,9 @@ impl crate::Service for Service {
 			highlight_increment_mutex: MutexMap::new(),
 			db: Data {
 				db: args.db.clone(),
+				senderkey_emailcursor: args.db["senderkey_emailcursor"].clone(),
 				senderkey_pusher: args.db["senderkey_pusher"].clone(),
+				senderkeyroom_emailthrottle: args.db["senderkeyroom_emailthrottle"].clone(),
 				pushkey_deviceid: args.db["pushkey_deviceid"].clone(),
 				useridcount_notification: args.db["useridcount_notification"].clone(),
 				userroomid_highlightcount: args.db["userroomid_highlightcount"].clone(),
@@ -129,12 +155,31 @@ impl crate::Service for Service {
 			},
 			suppressed: suppressed::SuppressedQueue::default(),
 			sent_badges: SentBadges::default(),
+			email_wakes: email::Wakes::default(),
+			email_locks: MutexMap::new(),
 		}))
 	}
+
+	async fn worker(self: Arc<Self>) -> Result {
+		if self.db.db.is_read_only() {
+			return Ok(()); // Mailed notifications could not be recorded and would be mailed again.
+		}
+
+		self.email_worker().await;
+
+		Ok(())
+	}
+
+	async fn interrupt(&self) { self.close_email_wakes(); }
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
 }
 
+/// Stores or deletes one of the user's pushers, as `/pushers/set` asks.
+///
+/// Storing refuses an HTTP pusher whose URL is invalid or forbidden. It
+/// refuses an email pusher when the server has no SMTP, or when the address is
+/// malformed or not verified on the user's account.
 #[implement(Service)]
 pub async fn set_pusher(
 	&self,
@@ -147,7 +192,8 @@ pub async fn set_pusher(
 			self.set_pusher_delete(sender, ids.pushkey.as_str())
 				.await,
 		| PusherAction::Post(data) =>
-			self.set_pusher_post(sender, sender_device, pusher, &data.pusher)?,
+			self.set_pusher_post(sender, sender_device, pusher, &data.pusher)
+				.await?,
 	}
 
 	Ok(())
@@ -159,7 +205,7 @@ async fn set_pusher_delete(&self, sender: &UserId, pushkey: &str) {
 }
 
 #[implement(Service)]
-fn set_pusher_post(
+async fn set_pusher_post(
 	&self,
 	sender: &UserId,
 	sender_device: &DeviceId,
@@ -185,8 +231,12 @@ fn set_pusher_post(
 		self.check_http_pusher_url(&url)?;
 	}
 
-	let key = (sender, pushkey);
-	self.db.senderkey_pusher.put(key, Json(action));
+	if matches!(pusher.kind, PusherKind::Email(_)) {
+		self.check_email_pusher(sender, pushkey).await?;
+	}
+
+	self.put_pusher(sender, pushkey, action).await;
+
 	self.db
 		.pushkey_deviceid
 		.insert(pushkey, sender_device);
@@ -222,13 +272,54 @@ fn check_http_pusher_url(&self, url: &Url) -> Result {
 	Ok(())
 }
 
+/// Refuses an email pusher this server cannot or may not deliver.
+///
+/// Mail needs SMTP configured and the address verified on the sender's own
+/// account. Without the binding check any user could direct notification mail
+/// at any address.
+#[implement(Service)]
+async fn check_email_pusher(&self, sender: &UserId, address: &str) -> Result {
+	if !self.services.sendmail.is_enabled() {
+		return Err!(Request(InvalidParam(
+			"Email notifications are not available on this server."
+		)));
+	}
+
+	self.services.sendmail.check_address(address)?;
+	self.services
+		.threepid
+		.address_bound_to(sender, address)
+		.await?
+		.into_option()
+		.ok_or_else(|| {
+			err!(Request(ThreepidNotFound("Email address is not bound to your account.")))
+		})
+}
+
+/// Deletes one of the user's pushers, with its email cursor and throttles.
+///
+/// The email lock keeps the worker from writing them back.
 #[implement(Service)]
 pub async fn delete_pusher(&self, sender: &UserId, pushkey: &str) {
+	let _lock = self.email_lock(sender, pushkey).await;
+
+	self.remove_pusher(sender, pushkey).await;
+}
+
+/// Deletes a pusher and everything kept for it.
+///
+/// Callers hold the pusher's email lock.
+#[implement(Service)]
+async fn remove_pusher(&self, sender: &UserId, pushkey: &str) {
 	let key = (sender, pushkey);
+
 	self.db.senderkey_pusher.del(key);
 	self.db.pushkey_deviceid.remove(pushkey);
 	self.clear_suppressed_pushkey(sender, pushkey);
 	self.forget_sent_badge(sender, pushkey);
+
+	// Last: a cancelled removal leaves only email rows, cleared at boot or by a new email pusher.
+	self.forget_email_state(sender, pushkey).await;
 
 	self.services
 		.sending
@@ -386,7 +477,7 @@ pub async fn get_actions<'a>(
 
 /// Resolve the events an event relates to, for the MSC3664 push condition.
 ///
-/// `None` while `msc3664_related_event_match` is disabled, which leaves every
+/// `None` while `push.msc3664_related_event_match` is disabled, which leaves every
 /// MSC3664 condition unable to match. The relations do not vary by recipient,
 /// so the append path resolves them once for the whole room; the push-notice
 /// path resolves them per notice, since it holds one event at a time.
@@ -395,41 +486,44 @@ pub async fn get_actions<'a>(
 pub async fn related_events<E: Event>(&self, event: &E) -> Option<Arc<RelatedEvents>> {
 	let config = &self.services.server.config;
 
-	if !config.msc3664_related_event_match {
-		return None;
-	}
+	config
+		.push
+		.msc3664_related_event_match
+		.then_async(async || {
+			let Ok(ExtractRelatesTo { relates_to }) = event.get_content() else {
+				return Some(NO_RELATED_EVENTS.clone());
+			};
 
-	let Ok(ExtractRelatesTo { relates_to }) = event.get_content() else {
-		return Some(NO_RELATED_EVENTS.clone());
-	};
+			let reply = relates_to
+				.in_reply_to
+				.map(|reply| (IN_REPLY_TO.to_owned(), reply.event_id));
 
-	let reply = relates_to
-		.in_reply_to
-		.map(|reply| (IN_REPLY_TO.to_owned(), reply.event_id));
+			let related = relates_to
+				.rel_type
+				.zip(relates_to.event_id)
+				.into_iter()
+				.chain(reply)
+				.stream()
+				.wide_filter_map(async |(rel_type, event_id)| {
+					let related = self
+						.services
+						.timeline
+						.get_pdu(&event_id)
+						.await
+						.ok()
+						// A relation crossing rooms is not one the sender could have made, and
+						// following it would expose an event the recipient may not be in a room for.
+						.filter(|related| related.room_id() == event.room_id())?;
 
-	let related = relates_to
-		.rel_type
-		.zip(relates_to.event_id)
-		.into_iter()
-		.chain(reply)
-		.stream()
-		.wide_filter_map(async |(rel_type, event_id)| {
-			let related = self
-				.services
-				.timeline
-				.get_pdu(&event_id)
-				.await
-				.ok()
-				// A relation crossing rooms is not one the sender could have made, and
-				// following it would expose an event the recipient may not be in a room for.
-				.filter(|related| related.room_id() == event.room_id())?;
+					let related: Raw<AnySyncTimelineEvent> = related.to_format();
 
-			let related: Raw<AnySyncTimelineEvent> = related.to_format();
+					Some((rel_type, FlattenedJson::from_raw(&related)))
+				})
+				.collect()
+				.await;
 
-			Some((rel_type, FlattenedJson::from_raw(&related)))
+			Some(Arc::new(related))
 		})
-		.collect()
-		.await;
-
-	Some(Arc::new(related))
+		.await
+		.flatten()
 }

@@ -11,6 +11,11 @@ use tuwunel_core::{
 };
 use tuwunel_service::{Services, users::Register};
 
+use self::sync::joined_room;
+
+#[path = "client/sync.rs"]
+mod sync;
+
 const STABLE_REQUEST: &str = "use_state_after";
 const STABLE_RESPONSE: &str = "state_after";
 const UNSTABLE_REQUEST: &str = "org.matrix.msc4222.use_state_after";
@@ -23,14 +28,11 @@ fn corrupt_state_after_is_scoped_to_one_joined_room() -> Result {
 
 	let db_path = Args::test_database_path("sync-state-after-corruption");
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	let mut args = Args::default_test(&["fresh", "cleanup"])
+		.with_database_path(&db_path)
+		.with_loopback_listener(port);
 
-	args.option.extend([
-		format!("database_path={db_path:?}"),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
-		"listening=true".to_owned(),
-	]);
+	args.option.extend(["listening=true".to_owned()]);
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;
@@ -361,10 +363,4 @@ fn assert_empty_requested_field(response: &Value, room_id: &OwnedRoomId, field: 
 	}
 
 	Ok(())
-}
-
-fn joined_room<'a>(response: &'a Value, room_id: &OwnedRoomId) -> Result<&'a Value> {
-	response["rooms"]["join"]
-		.get(room_id.as_str())
-		.ok_or_else(|| err!("sync response omitted joined room {room_id}"))
 }

@@ -6,12 +6,14 @@
 mod direct;
 mod push_rules;
 mod room_tags;
+#[cfg(test)]
+mod tests;
 
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryFutureExt, pin_mut};
 use ruma::{
-	RoomId, UserId,
+	OwnedUserId, RoomId, UserId,
 	events::{
 		AnyGlobalAccountDataEvent, AnyRawAccountDataEvent, AnyRoomAccountDataEvent,
 		GlobalAccountDataEventType, RoomAccountDataEventType,
@@ -23,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tuwunel_core::{
 	Err, Result, at, err, implement,
-	utils::{ReadyExt, TryReadyExt, result::LogErr, stream::TryIgnore},
+	utils::{MutexMap, ReadyExt, TryReadyExt, result::LogErr, stream::TryIgnore},
 };
 use tuwunel_database::{Deserialized, Handle, Ignore, Interfix, Json, Map};
 
@@ -53,6 +55,15 @@ pub const MAX_RULE_BYTES: usize = 1024;
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
 	db: Data,
+	/// Serializes each user's updates and erases, from the first read to the
+	/// commit.
+	///
+	/// A superseded revision is keyed by a count that only the pointer names, so
+	/// replacing it needs that read; skipping orphans on read instead would cost
+	/// every sync. An erase holds the lock across its scans, so no update lands
+	/// between a scan and the commit. An entry lives only while a writer for the
+	/// user holds or awaits the lock.
+	updating: MutexMap<OwnedUserId, ()>,
 }
 
 struct Data {
@@ -68,6 +79,7 @@ impl crate::Service for Service {
 				roomuserdataid_accountdata: args.db["roomuserdataid_accountdata"].clone(),
 				roomusertype_roomuserdataid: args.db["roomusertype_roomuserdataid"].clone(),
 			},
+			updating: MutexMap::new(),
 		}))
 	}
 
@@ -90,7 +102,8 @@ pub fn admits_rule(ruleset: &Ruleset, kind: RuleKind, rule_id: &str) -> bool {
 /// Stores an account data event and replaces its previous revision.
 ///
 /// The input must contain complete `type` and `content` fields. A new global counter value keys the
-/// event blob, secondary pointer, and removal of the superseded blob in one transaction.
+/// event blob, secondary pointer, and removal of the superseded blob in one transaction. One user's
+/// updates take turns, so each replaces the revision the previous one stored.
 ///
 /// # Panics
 ///
@@ -107,14 +120,18 @@ pub async fn update(
 		return Err!(Request(InvalidParam("Account data doesn't have all required fields.")));
 	}
 
-	let count = self.services.globals.next_count();
-	let roomuserdataid = (room_id, user_id, *count, &event_type);
+	// Taken before the count, so an update holds no sequence number of its own while it waits.
+	let _updating = self.updating.lock(user_id).await;
+
 	let key = (room_id, user_id, &event_type);
 	let prev = self
 		.db
 		.roomusertype_roomuserdataid
 		.qry(&key)
 		.await;
+
+	let count = self.services.globals.next_count();
+	let roomuserdataid = (room_id, user_id, *count, &event_type);
 
 	let mut txn = self.services.db.txn();
 
@@ -267,9 +284,18 @@ pub fn changes_since_fallible<'a>(
 /// Erases a user's account data within one MSC4025 namespace.
 ///
 /// An absent room selects global data, while a room selects only that room's data. Rows yielded
-/// successfully from both prefix scans are deleted together; scan errors are skipped.
+/// successfully from both prefix scans are deleted together; scan errors are skipped. The user's
+/// update lock spans the scans and the commit, so an update lands wholly before or after the
+/// erase.
 #[implement(Service)]
 pub async fn erase_user(&self, user_id: &UserId, room_id: Option<&RoomId>) {
+	let _updating = self.updating.lock(user_id).await;
+
+	self.erase_rows(user_id, room_id).await;
+}
+
+#[implement(Service)]
+async fn erase_rows(&self, user_id: &UserId, room_id: Option<&RoomId>) {
 	let prefix = (room_id, user_id, Interfix);
 	let mut txn = self.services.db.txn();
 

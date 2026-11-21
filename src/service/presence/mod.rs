@@ -14,6 +14,7 @@ use futures::{
 use loole::{Receiver, Sender};
 use ruma::{
 	DeviceId, OwnedUserId, UInt, UserId,
+	api::federation::transactions::edu::PresenceUpdate,
 	events::presence::{PresenceEvent, PresenceEventContent},
 	presence::PresenceState,
 };
@@ -23,7 +24,7 @@ use tuwunel_core::{
 	Result, checked, debug, debug_warn, err, implement,
 	result::LogErr,
 	trace,
-	utils::{self, TryFutureExtExt},
+	utils::{TryFutureExtExt, millis_since_unix_epoch},
 };
 
 use self::{aggregate::PresenceAggregator, data::Data};
@@ -72,11 +73,12 @@ type TimerFired = (OwnedUserId, u64);
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		let config = &args.server.config;
-		let idle_timeout_s = config.presence_idle_timeout_s;
-		let offline_timeout_s = config.presence_offline_timeout_s;
+		let idle_timeout_s = config.presence.idle_timeout_s;
+		let offline_timeout_s = config.presence.offline_timeout_s;
+
 		Ok(Arc::new(Self {
 			timer_channel: loole::unbounded(),
-			timeout_remote_users: config.presence_timeout_remote_users,
+			timeout_remote_users: config.presence.timeout_remote_users,
 			idle_timeout: checked!(idle_timeout_s * 1_000)?,
 			offline_timeout: checked!(offline_timeout_s * 1_000)?,
 			db: Data::new(args),
@@ -164,11 +166,11 @@ impl Service {
 	/// record that a user has just successfully completed a /sync (or
 	/// equivalent activity)
 	pub async fn note_sync(&self, user_id: &UserId, appservice: Option<&RegistrationInfo>) {
-		if appservice.is_some() || !self.services.config.suppress_push_when_active {
+		if appservice.is_some() || !self.services.config.push.suppress_when_active {
 			return;
 		}
 
-		let now = utils::millis_since_unix_epoch();
+		let now = millis_since_unix_epoch();
 		self.last_sync_seen
 			.write()
 			.await
@@ -177,7 +179,7 @@ impl Service {
 
 	/// Returns milliseconds since last observed sync for user (if any)
 	pub async fn last_sync_gap_ms(&self, user_id: &UserId) -> Option<u64> {
-		let now = utils::millis_since_unix_epoch();
+		let now = millis_since_unix_epoch();
 		self.last_sync_seen
 			.read()
 			.await
@@ -202,7 +204,7 @@ impl Service {
 
 	// Unset online/unavailable presence to offline on startup
 	async fn unset_all_presence(&self) {
-		if !self.services.server.config.allow_local_presence || self.services.db.is_read_only() {
+		if !self.services.server.config.presence.allow_local || self.services.db.is_read_only() {
 			return;
 		}
 
@@ -276,7 +278,7 @@ impl Service {
 
 	/// Creates a PresenceEvent from available data.
 	async fn to_presence_event(&self, presence: Presence, user_id: &UserId) -> PresenceEvent {
-		let now = utils::millis_since_unix_epoch();
+		let now = millis_since_unix_epoch();
 		let last_active_ago = now.saturating_sub(presence.last_active_ts);
 
 		let avatar_url = self.services.profile.avatar_url(user_id).ok();
@@ -295,6 +297,29 @@ impl Service {
 			},
 		}
 	}
+}
+
+/// Decode stored presence for a federation update.
+///
+/// Activity age saturates at the protocol integer limit and at zero for future
+/// timestamps. Federation updates omit profile fields and require no profile reads.
+#[implement(Service)]
+pub fn from_json_bytes_to_update(
+	&self,
+	bytes: &[u8],
+	user_id: &UserId,
+) -> Result<PresenceUpdate> {
+	let presence = Presence::from_json_bytes(bytes)?;
+	let now = millis_since_unix_epoch();
+	let last_active_ago = now.saturating_sub(presence.last_active_ts);
+
+	Ok(PresenceUpdate {
+		user_id: user_id.to_owned(),
+		presence: presence.state,
+		currently_active: presence.currently_active,
+		status_msg: presence.status_msg,
+		last_active_ago: UInt::new_saturating(last_active_ago),
+	})
 }
 
 /// Returns the latest optional presence event.

@@ -20,10 +20,10 @@ use tuwunel_database::Map;
 use self::peer::MAX_BACKOFF;
 /// Re-exports peer reachability verdicts and candidate-ranking types.
 ///
-/// These types classify failures, expose retry eligibility, and preserve the
+/// These items classify failures, expose retry eligibility, and preserve the
 /// ranking policy shared by federation request paths.
 pub use self::{
-	peer::{Classification, PeerBackoff, ShouldAttempt},
+	peer::{Classification, PeerBackoff, ShouldAttempt, is_content_rejection},
 	rank::{Candidates, WhenAllBackedOff},
 };
 use crate::services::OnceServices;
@@ -55,9 +55,9 @@ pub struct Service {
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
-		let window_secs = args.server.config.sender_timeout.max(1);
+		let window_secs = args.server.config.sending.timeout.max(1);
 		let n_max = exponential_backoff_streak_cap(Duration::from_secs(window_secs), MAX_BACKOFF);
-		let grace = Duration::from_secs(args.server.config.sender_retry_grace);
+		let grace = Duration::from_secs(args.server.config.sending.retry_grace);
 
 		Ok(Arc::new(Self {
 			services: args.services.clone(),

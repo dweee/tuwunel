@@ -1,9 +1,59 @@
 #![cfg(test)]
 
+use std::borrow::Cow;
+
+use super::{
+	contains_any, equals_any, is_opaque_id, is_unreserved, is_unreserved_byte, markdown_cell,
+	plural, single_line, truncate_chars,
+};
 use crate::{arrayvec::ArrayString, smallstr::SmallString};
 
 type SmallBuf = SmallString<[u8; 16]>;
 type ArrayBuf = ArrayString<16>;
+
+#[test]
+fn truncate_chars_counts_characters_not_bytes() {
+	assert_eq!(truncate_chars("héllo", 2), "hé");
+	assert_eq!(truncate_chars("héllo", 5), "héllo");
+	assert_eq!(truncate_chars("héllo", 9), "héllo");
+	assert_eq!(truncate_chars("héllo", 0), "");
+}
+
+#[test]
+fn single_line_normalizes_controls_and_separators() {
+	assert_eq!(single_line("a\r\nb\t\0c\u{2028}d\u{2029}e"), "a  b  c d e");
+}
+
+#[test]
+fn single_line_borrows_literal_text() {
+	let text = "**bold** <text> [link](url) | \\";
+
+	assert!(matches!(single_line(text), Cow::Borrowed(value) if value == text));
+}
+
+#[test]
+fn contains_any_skips_empty_needles() {
+	let needles = ["google.com"];
+	let none: [&str; 0] = [];
+
+	assert!(contains_any("google.com", &needles));
+	assert!(contains_any("www.google.com", &needles));
+	assert!(!contains_any("e.com", &needles));
+	assert!(!contains_any("google.com", &none));
+	assert!(!contains_any("google.com", [""]));
+}
+
+#[test]
+fn equals_any_matches_whole_items() {
+	let candidates = ["*".to_owned(), "example.com".to_owned()];
+	let none: [&str; 0] = [];
+
+	assert!(equals_any("*", &candidates));
+	assert!(equals_any("example.com", &candidates));
+	assert!(!equals_any("www.example.com", &candidates));
+	assert!(!equals_any("example", &candidates));
+	assert!(!equals_any("*", &none));
+}
 
 #[test]
 fn common_prefix() {
@@ -152,6 +202,7 @@ fn chunk_markdown_fence_closes_and_reopens_with_info() {
 		"```rust\nline1\n```\n".to_owned(),
 		"```rust\nline2\n```\n".to_owned(),
 	]);
+
 	assert!(parts.iter().all(|p| p.len() <= 20));
 }
 
@@ -194,6 +245,7 @@ fn chunk_long_line_splits_on_char_boundaries() {
 fn chunk_every_segment_honors_the_budget() {
 	let text = "# header\n\n```json\n{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}\n```\n\nfinal \
 	            paragraph with a fairly long single line of prose here\n";
+
 	let parts = chunks(text, true, 24);
 
 	assert!(parts.len() > 1);
@@ -211,4 +263,58 @@ fn chunk_segment_count_tracks_the_budget() {
 	assert_eq!(chunks(text, false, 4096).len(), 1);
 	assert_eq!(chunks(text, false, 10).len(), 2);
 	assert_eq!(chunks(text, false, 5).len(), 4);
+}
+
+#[test]
+fn markdown_cell_escapes_what_would_break_the_cell() {
+	assert_eq!(markdown_cell("a|b\\c\nd\u{2028}e"), "a\\|b\\\\c d e");
+}
+
+#[test]
+fn markdown_cell_borrows_a_clean_value() {
+	let clean = "!room:example.org";
+
+	assert!(matches!(markdown_cell(clean), Cow::Borrowed(borrowed) if borrowed == clean));
+}
+
+#[test]
+fn plural_takes_the_singular_for_one_only() {
+	let nouns = [0, 1, 2].map(|count| plural(count, "room", "rooms"));
+
+	assert_eq!(nouns, ["rooms", "room", "rooms"]);
+}
+
+#[test]
+fn unreserved_bytes_are_the_rfc_3986_set() {
+	let bytes = 0..=u8::MAX;
+	let unreserved: Vec<u8> = bytes
+		.filter(|&byte| is_unreserved_byte(byte))
+		.collect();
+
+	assert_eq!(
+		unreserved,
+		b"-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~",
+	);
+}
+
+#[test]
+fn unreserved_tests_every_byte() {
+	assert!(is_unreserved(""));
+	assert!(is_unreserved("0aZ._~-"));
+	assert!(!is_unreserved("a b"));
+	assert!(!is_unreserved("\u{3bb}"));
+}
+
+#[test]
+fn opaque_id_takes_one_to_255_unreserved_characters() {
+	let longest = "a".repeat(255);
+	let overlong = "a".repeat(256);
+
+	assert!(is_opaque_id("a"));
+	assert!(is_opaque_id("0aZ._~-"));
+	assert!(is_opaque_id(&longest));
+	assert!(!is_opaque_id(""));
+	assert!(!is_opaque_id(&overlong));
+	assert!(!is_opaque_id("a/b"));
+	assert!(!is_opaque_id("a%20b"));
 }

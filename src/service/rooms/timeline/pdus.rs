@@ -7,16 +7,12 @@
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{MilliSecondsSinceUnixEpoch, RoomId, UInt, UserId, api::Direction};
 use tuwunel_core::{
-	Result, at, err, implement,
-	matrix::pdu::{PduCount, PduEvent},
-	trace,
-	utils::{
-		result::LogErr,
-		stream::{TryIgnore, TryReadyExt, TryWidebandExt},
-	},
+	Result, at, err, implement, trace,
+	utils::stream::{TryIgnore, TryReadyExt, TryWidebandExt},
 	warn,
 };
 use tuwunel_database::{KeyVal, keyval::Val};
+use tuwunel_matrix::pdu::{PduCount, PduEvent};
 
 use super::{PduId, RawPduId};
 
@@ -79,7 +75,7 @@ pub async fn delete_pdus(&self, room_id: &RoomId) -> Result {
 /// Streams decoded room events from the timestamp index in one direction.
 ///
 /// The timestamp boundary is inclusive. `user_id` controls sender-only
-/// transaction metadata, while event age is always updated. It does not filter
+/// unsigned fields, while event age is always updated. It does not filter
 /// which events are yielded.
 #[implement(super::Service)]
 pub fn pdus_near_ts(
@@ -96,7 +92,7 @@ pub fn pdus_near_ts(
 				.map_ok(|pdu| (pdu_id, pdu))
 				.await
 		})
-		.ready_and_then(move |item| Self::each_pdu(item, user_id))
+		.map_ok(move |item| Self::each_pdu(item, user_id))
 }
 
 /// Streams timestamp and PDU-ID pairs from the room timestamp index.
@@ -147,7 +143,7 @@ pub fn pdu_ids_near_ts(
 
 /// Streams all accepted PDUs in a room in forward order.
 ///
-/// The requesting user receives sender-only transaction metadata where
+/// The requesting user receives sender-only unsigned fields where
 /// applicable. Unknown rooms and all per-item storage or decoding errors are
 /// suppressed, producing only successfully presented events.
 #[implement(super::Service)]
@@ -239,16 +235,10 @@ fn each_slice((pdu_id, pdu): KeyVal<'_>, user_id: Option<&UserId>) -> Result<Pdu
 	let pdu_id: RawPduId = pdu_id.into();
 	let pdu = serde_json::from_slice::<PduEvent>(pdu)?;
 
-	Self::each_pdu((pdu_id, pdu), user_id)
+	Ok(Self::each_pdu((pdu_id, pdu), user_id))
 }
 
 #[implement(super::Service)]
-fn each_pdu(
-	(pdu_id, mut pdu): (RawPduId, PduEvent),
-	user_id: Option<&UserId>,
-) -> Result<PdusIterItem> {
-	pdu.remove_transaction_id_unless_sender(user_id)?;
-	pdu.add_age().log_err().ok();
-
-	Ok((pdu_id.pdu_count(), pdu))
+fn each_pdu((pdu_id, pdu): (RawPduId, PduEvent), user_id: Option<&UserId>) -> PdusIterItem {
+	(pdu_id.pdu_count(), pdu.served_to(user_id))
 }

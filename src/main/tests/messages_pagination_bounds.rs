@@ -7,9 +7,12 @@ use reqwest::{Response, StatusCode};
 use serde_json::{Value, json};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
 use tuwunel_core::{
-	PduId, Result,
-	matrix::pdu::{PduCount, RawPduId},
+	Result,
 	ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId},
+};
+use tuwunel_matrix::{
+	PduId,
+	pdu::{PduCount, RawPduId},
 };
 use tuwunel_service::Services;
 
@@ -34,9 +37,8 @@ fn messages_respect_pagination_bounds() -> Result {
 	let port = listener.local_addr()?.port();
 	let db_path = Args::test_database_path("pagination-bounds");
 	let args = Args::default_test(&["fresh", "cleanup"])
-		.with_option(format!("database_path={db_path:?}"))
-		.with_option("address=[\"127.0.0.1\"]")
-		.with_option(format!("port={port}"))
+		.with_database_path(&db_path)
+		.with_loopback_listener(port)
 		.with_option("listening=true");
 
 	let runtime = Runtime::new(Some(&args))?;

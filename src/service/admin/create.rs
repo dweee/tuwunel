@@ -16,7 +16,8 @@ use ruma::{
 		topic::{RoomTopicEventContent, TopicContentBlock},
 	},
 };
-use tuwunel_core::{Result, matrix::room_version, pdu::PduBuilder};
+use tuwunel_core::Result;
+use tuwunel_matrix::{pdu::PduBuilder, room_version};
 
 use crate::Services;
 
@@ -73,7 +74,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 		.timeline
 		.build_and_append_pdu(
 			PduBuilder::state(String::new(), &RoomCreateEventContent {
-				federate: services.config.federate_admin_room,
+				federate: services.config.admin.room.federate,
 				predecessor: None,
 				room_version: room_version_id.clone(),
 				..create_content
@@ -82,7 +83,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 2. Make server user/bot join
@@ -97,7 +98,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 3. Power levels
@@ -114,7 +115,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 4.1 Join Rules
@@ -126,7 +127,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 4.2 History Visibility
@@ -141,7 +142,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 4.3 Guest Access
@@ -156,7 +157,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 5. Events implied by name and topic
@@ -169,7 +170,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	services
@@ -183,7 +184,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 6. Room alias
@@ -200,7 +201,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	services.alias.set_alias(alias, &room_id)?;
@@ -214,7 +215,7 @@ pub async fn create_admin_room(services: &Services) -> Result {
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	Ok(())

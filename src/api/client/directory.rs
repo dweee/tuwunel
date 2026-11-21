@@ -23,17 +23,19 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Error, Result, err, info,
-	matrix::Event,
 	utils::{
 		TryFutureExtExt,
-		math::Expected,
+		math::{Expected, usize_from_ruma_bounded},
 		stream::{IterStream, ReadyExt, WidebandExt},
 	},
 	warn,
 };
+use tuwunel_matrix::Event;
 use tuwunel_service::Services;
 
-use crate::{ClientIp, Ruma};
+use crate::{ClientIp, Ruma, utils::sender_is_guest};
+
+const DEFAULT_LIMIT: usize = 100;
 
 /// # `POST /_matrix/client/v3/publicRooms`
 ///
@@ -108,13 +110,7 @@ pub(crate) async fn set_room_visibility_route(
 		return Err!(Request(NotFound("Room not found")));
 	}
 
-	if services
-		.users
-		.is_deactivated(sender_user)
-		.await
-		.unwrap_or(false)
-		&& body.appservice_info.is_none()
-	{
+	if sender_is_guest(&services, &body).await {
 		return Err!(Request(Forbidden("Guests cannot publish to room directories")));
 	}
 
@@ -124,24 +120,22 @@ pub(crate) async fn set_room_visibility_route(
 
 	match &body.visibility {
 		| room::Visibility::Public => {
-			if services
-				.server
-				.config
-				.lockdown_public_room_directory
+			if services.server.config.directory.rooms.lockdown
 				&& !services.admin.user_is_admin(sender_user).await
 				&& body.appservice_info.is_none()
 			{
 				info!(
-					"Non-admin user {sender_user} tried to publish {0} to the room directory \
-					 while \"lockdown_public_room_directory\" is enabled",
-					body.room_id
+					%sender_user,
+					room_id = %body.room_id,
+					"Non-admin user tried to publish a room to the directory while \
+					 directory.rooms.lockdown is enabled"
 				);
 
 				services
 					.admin
 					.notify_loud(&format!(
 						"Non-admin user {sender_user} tried to publish {0} to the room \
-						 directory while \"lockdown_public_room_directory\" is enabled",
+						 directory while \"directory.rooms.lockdown\" is enabled",
 						body.room_id
 					))
 					.await;
@@ -206,7 +200,12 @@ pub(crate) async fn get_room_visibility_route(
 	})
 }
 
-pub(crate) async fn get_public_rooms_filtered_helper(
+/// Lists public rooms matching the requested filter.
+///
+/// A remote server is queried when specified; otherwise the local directory is
+/// used. A local query with a zero or absent `limit` takes a page of 100, as
+/// Synapse does.
+pub async fn get_public_rooms_filtered_helper(
 	services: &Services,
 	server: Option<&ServerName>,
 	limit: Option<UInt>,
@@ -239,8 +238,10 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 		});
 	}
 
-	// Use limit or else 10, with maximum 100
-	let limit: usize = limit.map_or(10_u64, u64::from).try_into()?;
+	let limit = limit
+		.filter(|&limit| limit > uint!(0))
+		.map_or(DEFAULT_LIMIT, |limit| usize_from_ruma_bounded(limit, usize::MAX, usize::MAX));
+
 	let mut num_since: usize = 0;
 
 	if let Some(s) = &since {
@@ -271,12 +272,24 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 	let search_room_id = filter
 		.generic_search_term
 		.as_deref()
-		.filter(|_| services.config.allow_public_room_search_by_id)
+		.filter(|_| {
+			services
+				.config
+				.directory
+				.rooms
+				.allow_public_search_by_id
+		})
 		.filter(|s| s.starts_with('!'))
 		.filter(|s| s.len() > 5); // require some characters to limit scope.
 
 	let meta_public_rooms = search_room_id
-		.filter(|_| services.config.allow_unlisted_room_search_by_id)
+		.filter(|_| {
+			services
+				.config
+				.directory
+				.rooms
+				.allow_unlisted_search_by_id
+		})
 		.map(|prefix| services.metadata.public_ids_prefix(prefix))
 		.into_iter()
 		.stream()
@@ -298,25 +311,32 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 			}
 
 			if let Some(query) = search_room_id
-				&& chunk.room_id.as_str().contains(query) {
-					return Some(chunk);
-				}
+				&& chunk.room_id.as_str().contains(query)
+			{
+				return Some(chunk);
+			}
 
 			if let Some(query) = search_term.as_deref() {
 				if let Some(name) = &chunk.name
-					&& name.as_str().to_lowercase().contains(query) {
-						return Some(chunk);
-					}
+					&& name.as_str().to_lowercase().contains(query)
+				{
+					return Some(chunk);
+				}
 
 				if let Some(topic) = &chunk.topic
-					&& topic.to_lowercase().contains(query) {
-						return Some(chunk);
-					}
+					&& topic.to_lowercase().contains(query)
+				{
+					return Some(chunk);
+				}
 
 				if let Some(canonical_alias) = &chunk.canonical_alias
-					&& canonical_alias.as_str().to_lowercase().contains(query) {
-						return Some(chunk);
-					}
+					&& canonical_alias
+						.as_str()
+						.to_lowercase()
+						.contains(query)
+				{
+					return Some(chunk);
+				}
 
 				return None;
 			}
@@ -340,14 +360,12 @@ pub(crate) async fn get_public_rooms_filtered_helper(
 		.take(limit)
 		.collect();
 
-	let prev_batch = num_since
-		.ne(&0)
-		.then_some(format!("p{num_since}"));
+	let prev_batch = num_since.ne(&0).then(|| format!("p{num_since}"));
 
 	let next_batch = chunk
 		.len()
 		.ge(&limit)
-		.then_some(format!("n{}", num_since.expected_add(limit)));
+		.then(|| format!("n{}", num_since.expected_add(limit)));
 
 	Ok(get_public_rooms_filtered::v3::Response {
 		chunk,
@@ -432,7 +450,7 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 		join5(avatar_url, canonical_alias, guest_can_join, join_rule, name),
 		join4(num_joined_members, room_type, topic, world_readable),
 	)
-	.boxed()
+	.boxed() // size firewall
 	.await;
 
 	PublicRoomsChunk {
@@ -485,7 +503,9 @@ fn check_server_banned(services: &Services, server: Option<&ServerName>) -> Resu
 
 	if services
 		.config
-		.forbidden_remote_room_directory_server_names
+		.directory
+		.rooms
+		.forbidden_remote_server_names
 		.is_match(server.host())
 		|| services
 			.config

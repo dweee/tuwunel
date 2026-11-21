@@ -15,10 +15,9 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, at, err, implement,
-	matrix::event::gen_event_id_canonical_json,
-	pdu::PduBuilder,
 	utils::future::{ReadyBoolExt, and4},
 };
+use tuwunel_matrix::{event::gen_event_id_canonical_json, pdu::PduBuilder};
 
 use super::Service;
 
@@ -38,11 +37,10 @@ pub async fn invite(
 ) -> Result {
 	if self.services.globals.user_is_local(user_id) {
 		self.local_invite(sender_user, user_id, room_id, reason, is_direct)
-			.boxed()
 			.await?;
 	} else {
 		self.remote_invite(sender_user, user_id, room_id, reason, is_direct)
-			.boxed()
+			.boxed() // cold arm
 			.await?;
 	}
 

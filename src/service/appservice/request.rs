@@ -29,8 +29,6 @@ where
 	for<'a> T::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
 	for<'a> T::PathBuilder: PathBuilder<Input<'a> = ()>,
 {
-	let client = &self.services.client.appservice;
-
 	let Some(dest) = registration.url else {
 		return Ok(None);
 	};
@@ -41,9 +39,10 @@ where
 
 	trace!("Appservice URL \"{dest}\", Appservice ID: {}", registration.id);
 
+	let (base, client) = self.transport(&dest)?;
 	let hs_token = registration.hs_token.as_str();
 	let mut http_request = request
-		.try_into_http_request::<BytesMut>(&dest, SendAccessToken::IfRequired(hs_token), ())
+		.try_into_http_request::<BytesMut>(base, SendAccessToken::IfRequired(hs_token), ())
 		.map_err(|e| {
 			err!(BadServerResponse(
 				warn!(appservice = %registration.id, "Failed to find destination {dest}: {e:?}")
@@ -59,6 +58,9 @@ where
 		.execute(reqwest_request)
 		.await
 		.map_err(|e| {
+			// The URL carries the hs_token in its access_token query.
+			let e = e.without_url();
+
 			warn!(
 				"Could not send request to appservice \"{}\" at {dest}: {e:?}",
 				registration.id
@@ -79,7 +81,13 @@ where
 			.expect("http::response::Builder is usable"),
 	);
 
-	let limit = self.services.config.max_response_size;
+	let limit = self
+		.services
+		.config
+		.network
+		.http
+		.max_response_size;
+
 	let body = read_response_capped(response, limit)
 		.await
 		.map_err(|e| {

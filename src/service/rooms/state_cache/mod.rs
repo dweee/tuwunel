@@ -5,6 +5,8 @@
 //! Read helpers expose point queries and cursor-backed streams over those
 //! derived indexes.
 
+#[cfg(test)]
+mod tests;
 mod update;
 mod via;
 
@@ -16,20 +18,18 @@ use std::{
 
 use futures::{
 	Stream, StreamExt, TryStreamExt,
-	future::join5,
+	future::{join5, ready},
 	pin_mut,
 	stream::{empty, select},
 };
 use ruma::{
-	OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
+	OwnedEventId, OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
 	events::{AnyStrippedStateEvent, AnySyncStateEvent, room::member::MembershipState},
 	serde::Raw,
 };
 use serde::de::DeserializeOwned;
 use tuwunel_core::{
-	Result, debug_warn, implement,
-	matrix::{Event, Pdu, event::Owned},
-	trace,
+	Err, Result, at, debug_warn, err, implement, trace,
 	utils::{
 		self, BoolExt,
 		result::NotFound,
@@ -37,7 +37,10 @@ use tuwunel_core::{
 	},
 	warn,
 };
-use tuwunel_database::{Deserialized, Ignore, Interfix, Map};
+use tuwunel_database::{
+	Deserialized, Ignore, IgnoreAll, Interfix, Map, SEP, deserialize_from_slice,
+};
+use tuwunel_matrix::{Event, Pdu, event::Owned};
 use update::EMPTY_INVITE_STATE;
 /// Input types for applying membership-cache transitions.
 ///
@@ -78,8 +81,12 @@ struct Data {
 }
 
 type AppServiceInRoomCache = RwLock<HashMap<OwnedRoomId, HashMap<String, bool>>>;
-type StrippedStateEventItem = (OwnedRoomId, Vec<Raw<AnyStrippedStateEvent>>);
+type StrippedState = Vec<Raw<AnyStrippedStateEvent>>;
+type StrippedStateEventItem = (OwnedRoomId, StrippedState);
 type SyncStateEventItem = (OwnedRoomId, Vec<Raw<AnySyncStateEvent>>);
+
+// CBOR tag 10 enclosing null, reserved for forgotten membership by this codec.
+const FORGOTTEN_STATE: &[u8] = b"\xCA\xF6";
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
@@ -176,6 +183,23 @@ pub fn clear_appservice_in_room_cache(&self) {
 		.clear();
 }
 
+/// Clears the memoized membership decisions of one appservice.
+///
+/// Its cached answers may not hold once its registration's namespaces change;
+/// every other registration keeps its own. A lookup already in flight can
+/// republish an older result after the clear.
+#[implement(Service)]
+#[tracing::instrument(level = "debug", skip(self))]
+pub fn clear_appservice_in_room_cache_for(&self, appservice_id: &str) {
+	self.appservice_in_room_cache
+		.write()
+		.expect("locked")
+		.retain(|_, appservices| {
+			appservices.remove(appservice_id);
+			!appservices.is_empty()
+		});
+}
+
 /// Returns a stream of the remote servers participating in this room.
 ///
 /// Our own server is filtered out, so the result is the federation fan-out
@@ -217,8 +241,29 @@ pub fn room_servers<'a>(
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn server_in_room<'a>(&'a self, server: &'a ServerName, room_id: &'a RoomId) -> bool {
+	self.server_in_room_result(server, room_id)
+		.await
+		.unwrap_or(false)
+}
+
+/// Tests whether a server is recorded as participating in a room.
+///
+/// Missing rows return `false`; storage failures are preserved for callers
+/// whose authority decision depends on the result.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn server_in_room_result<'a>(
+	&'a self,
+	server: &'a ServerName,
+	room_id: &'a RoomId,
+) -> Result<bool> {
 	let key = (server, room_id);
-	self.db.serverroomids.qry(&key).await.is_ok()
+
+	match self.db.serverroomids.qry(&key).await {
+		| Ok(_) => Ok(true),
+		| Err(error) if error.is_not_found() => Ok(false),
+		| Err(error) => Err(error),
+	}
 }
 
 /// Streams all rooms recorded for a participating server.
@@ -443,6 +488,41 @@ pub fn local_users_invited_to_room<'a>(
 		.ready_filter(|user| self.services.globals.user_is_local(user))
 }
 
+/// Tests whether local memberships permit pruning a room.
+///
+/// Joins, invites, and knocks always protect the room. When required,
+/// departures protect it until forgotten; read failures propagate.
+/// Callers must hold the room state lock through this check and deletion.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+pub async fn can_prune_room(&self, room_id: &RoomId, require_forgotten: bool) -> Result<bool> {
+	let prefix = (room_id, Interfix);
+	let occupied = [
+		&self.db.roomuserid_joinedcount,
+		&self.db.roomuserid_invitecount,
+		&self.db.roomuserid_knockedcount,
+	]
+	.into_iter()
+	.stream()
+	.flat_map(|map| map.keys_prefix(&prefix))
+	.try_any(|(_, user): (Ignore, &UserId)| ready(self.services.globals.user_is_local(user)))
+	.await?;
+
+	if occupied || !require_forgotten {
+		return Ok(!occupied);
+	}
+
+	self.db
+		.roomuserid_leftcount
+		.keys_prefix(&prefix)
+		.try_filter(|(_, user): &(Ignore, &UserId)| {
+			ready(self.services.globals.user_is_local(user))
+		})
+		.and_then(async |(_, user)| self.is_forgotten(user, room_id).await)
+		.try_all(ready)
+		.await
+}
+
 /// Streams user identifiers from the once-joined index under a room prefix.
 ///
 /// Once-joined rows are currently written with user-first keys, while this
@@ -500,10 +580,10 @@ pub fn room_members_knocked<'a>(
 		.map(|(_, user_id): (Ignore, &UserId)| user_id)
 }
 
-/// Returns the stream position associated with a user's current invite.
+/// Returns the stream position last recorded for a user's current invite.
 ///
-/// This value identifies the membership transition rather than counting
-/// invitations. Missing or malformed index rows return an error.
+/// Each invite event or forced replay rewrites it. Missing rows and malformed
+/// counts return an error; the optional event ID tail is ignored.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn get_invite_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
@@ -513,12 +593,42 @@ pub async fn get_invite_count(&self, room_id: &RoomId, user_id: &UserId) -> Resu
 		.qry(&key)
 		.await
 		.deserialized()
+		.map(|(count, _): (u64, IgnoreAll)| count)
 }
 
-/// Returns the stream position associated with a user's current knock.
+/// Returns the event ID recorded for a user's current invite.
 ///
-/// This value identifies the membership transition rather than counting
-/// knocks. Missing or malformed index rows return an error.
+/// Legacy rows have no ID. Missing rows and malformed values return an error.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn get_invite_event(
+	&self,
+	room_id: &RoomId,
+	user_id: &UserId,
+) -> Result<Option<OwnedEventId>> {
+	let key = (room_id, user_id);
+	let value = self.db.roomuserid_invitecount.qry(&key).await?;
+	let tail = value
+		.get(size_of::<u64>()..)
+		.ok_or_else(|| err!(Database("Invalid invite count prefix")))?;
+
+	// The generic codec checks framing and full consumption only in debug.
+	if let Some((&separator, event_id)) = tail.split_first()
+		&& (separator != SEP || event_id.contains(&SEP))
+	{
+		return Err!(Database("Invalid invite event tail framing"));
+	}
+
+	value
+		.deserialized()
+		.map(|(_, event_id): (u64, Option<OwnedEventId>)| event_id)
+}
+
+/// Returns the stream position last recorded for a user's current knock.
+///
+/// Each knock event for the user rewrites it, as does a forced state replay,
+/// so it neither counts knocks nor marks the first. Missing or malformed index
+/// rows return an error.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn get_knock_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
@@ -530,14 +640,33 @@ pub async fn get_knock_count(&self, room_id: &RoomId, user_id: &UserId) -> Resul
 		.deserialized()
 }
 
-/// Returns the stream position associated with a user's current leave row.
+/// Returns the stream position of a retained leave or ban.
 ///
-/// This value identifies the membership transition rather than counting
-/// leaves. Missing or malformed index rows return an error.
+/// Forgotten rooms return a missing-row error even though their departure
+/// position survives for incremental sync. Storage and decoding failures are
+/// propagated.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn get_left_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
+	let count = self.get_departure_count(room_id, user_id).await?;
+
+	if self.is_forgotten(user_id, room_id).await? {
+		return Err!(Request(NotFound("Room has been forgotten")));
+	}
+
+	Ok(count)
+}
+
+/// Returns the stream position of a current departure, including forgotten rooms.
+///
+/// Incremental sync uses this position to deliver pending departures.
+/// Forgotten departures retain their original position across state replay;
+/// missing or malformed count rows return an error.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn get_departure_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
 	let key = (room_id, user_id);
+
 	self.db
 		.roomuserid_leftcount
 		.qry(&key)
@@ -545,11 +674,32 @@ pub async fn get_left_count(&self, room_id: &RoomId, user_id: &UserId) -> Result
 		.deserialized()
 }
 
-/// Returns the stream position associated with a user's current join.
+/// Tests whether a user's departure carries the forgotten marker.
 ///
-/// This value identifies the membership transition rather than counting
-/// joins. A join recorded before positions were stored holds an empty value
-/// and reads as zero. Missing or malformed index rows return an error.
+/// Only the complete canonical marker matches; legacy state values do not.
+/// Missing rows return false and storage failures propagate.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn is_forgotten(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	let key = (user_id, room_id);
+
+	self.db
+		.userroomid_leftstate
+		.qry(&key)
+		.await
+		.optional()
+		.map(|state| state.is_some_and(|state| state.as_ref().eq(FORGOTTEN_STATE)))
+}
+
+/// Returns the stream position last recorded for a user's current join.
+///
+/// Every join and every forced state replay records it, except an appended
+/// profile change over a position no later than the join it replaces, which
+/// keeps that position. Federation ingest replays each accepted member event
+/// before appending it, so a remote user's accepted profile change still moves
+/// their position. A join recorded before positions were stored holds an empty value
+/// that reads as zero, and the next join rewrites it, as it does a malformed
+/// row. Missing or malformed rows return an error.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn get_joined_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
@@ -636,7 +786,7 @@ pub fn user_memberships<'a>(
 
 /// Streams rooms in which a user is currently indexed as joined.
 ///
-/// The raw user prefix preserves the established key scan. Storage and
+/// Only the user's exact encoded prefix is scanned. Storage and
 /// decoding failures are skipped, and each room identifier borrows the cursor
 /// until its next poll.
 #[implement(Service)]
@@ -645,9 +795,10 @@ pub fn rooms_joined<'a>(
 	&'a self,
 	user_id: &'a UserId,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
+	let prefix = (user_id, Interfix);
 	self.db
 		.userroomid_joinedcount
-		.keys_raw_prefix(user_id)
+		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
 }
@@ -673,7 +824,7 @@ pub fn rooms_joined_checked<'a>(
 
 /// Streams rooms in which a user is currently indexed as invited.
 ///
-/// The raw user prefix preserves the established key scan. Storage and
+/// Only the user's exact encoded prefix is scanned. Storage and
 /// decoding failures are skipped, and each room identifier borrows the cursor
 /// until its next poll.
 #[implement(Service)]
@@ -682,16 +833,17 @@ pub fn rooms_invited<'a>(
 	&'a self,
 	user_id: &'a UserId,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
+	let prefix = (user_id, Interfix);
 	self.db
 		.userroomid_invitestate
-		.keys_raw_prefix(user_id)
+		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
 }
 
 /// Streams rooms in which a user is currently indexed as knocking.
 ///
-/// The raw user prefix preserves the established key scan. Storage and
+/// Only the user's exact encoded prefix is scanned. Storage and
 /// decoding failures are skipped, and each room identifier borrows the cursor
 /// until its next poll.
 #[implement(Service)]
@@ -700,24 +852,58 @@ pub fn rooms_knocked<'a>(
 	&'a self,
 	user_id: &'a UserId,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
+	let prefix = (user_id, Interfix);
 	self.db
 		.userroomid_knockedstate
-		.keys_raw_prefix(user_id)
+		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
 }
 
 /// Streams rooms for which a user's leave state is retained.
 ///
-/// Forgotten rooms have no leave row and therefore do not appear. Storage and
+/// Forgotten rooms are filtered by their marker value. Storage and
 /// decoding failures are skipped, and each room identifier borrows the cursor
 /// until its next poll.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "debug")]
 pub fn rooms_left<'a>(&'a self, user_id: &'a UserId) -> impl Stream<Item = &RoomId> + Send + 'a {
+	self.retained_left_rows(user_id).map(at!(0))
+}
+
+#[implement(Service)]
+fn retained_left_rows<'a>(
+	&'a self,
+	user_id: &'a UserId,
+) -> impl Stream<Item = (&RoomId, &[u8])> + Send + 'a {
+	let prefix = (user_id, Interfix);
+
 	self.db
 		.userroomid_leftstate
-		.keys_raw_prefix(user_id)
+		.stream_prefix_raw(&prefix)
+		.ignore_err()
+		.ready_filter(|(_, state)| *state != FORGOTTEN_STATE)
+		.map(|(key, state)| {
+			deserialize_from_slice(key).map(|(_, room_id): (Ignore, &RoomId)| (room_id, state))
+		})
+		.ignore_err()
+}
+
+/// Streams rooms with departure evidence, including forgotten rooms.
+///
+/// Incremental sync checks each room's departure position before emitting it.
+/// Identifiers borrow the cursor until its next poll; storage and key-decoding
+/// failures are skipped.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+pub fn rooms_departed<'a>(
+	&'a self,
+	user_id: &'a UserId,
+) -> impl Stream<Item = &RoomId> + Send + 'a {
+	let prefix = (user_id, Interfix);
+	self.db
+		.userroomid_leftstate
+		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
 }
@@ -747,8 +933,9 @@ pub fn rooms_invited_state<'a>(
 
 /// Streams stored stripped state for a user's current knocks.
 ///
-/// Each item owns its room identifier and decoded state vector. Storage,
-/// key-decoding, and state-deserialization failures are skipped.
+/// Each item owns its room identifier and decoded state vector, read as
+/// [`Self::knock_state`] reads it. Storage, key-decoding, and
+/// state-deserialization failures are skipped.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub fn rooms_knocked_state<'a>(
@@ -766,6 +953,7 @@ pub fn rooms_knocked_state<'a>(
 		.map(|((_, room_id), state): KeyVal<'_>| (room_id.to_owned(), state))
 		.map(|(room_id, state)| Ok((room_id, state.deserialize_as_unchecked()?)))
 		.ignore_err()
+		.map(move |(room_id, state)| (room_id, without_superseded_membership(state, user_id)))
 }
 
 /// Streams stored state for rooms a user has left but not forgotten.
@@ -779,15 +967,12 @@ pub fn rooms_left_state<'a>(
 	&'a self,
 	user_id: &'a UserId,
 ) -> impl Stream<Item = SyncStateEventItem> + Send + 'a {
-	type KeyVal<'a> = (Key<'a>, Raw<Vec<Raw<AnySyncStateEvent>>>);
-	type Key<'a> = (&'a UserId, &'a RoomId);
-
-	let prefix = (user_id, Interfix);
-	self.db
-		.userroomid_leftstate
-		.stream_prefix(&prefix)
+	self.retained_left_rows(user_id)
+		.map(|(room_id, state)| {
+			deserialize_from_slice(state)
+				.map(|state: Raw<Vec<AnySyncStateEvent>>| (room_id.to_owned(), state))
+		})
 		.ignore_err()
-		.map(|((_, room_id), state): KeyVal<'_>| (room_id.to_owned(), state))
 		.map(|(room_id, state)| {
 			let state = state_events(&room_id, &state);
 
@@ -837,7 +1022,8 @@ pub async fn has_invite_state(&self, user_id: &UserId, room_id: &RoomId) -> Resu
 
 /// Returns the stripped state stored for a user's current knock.
 ///
-/// The value is decoded as an array of stripped state events. Missing rows,
+/// The value is decoded as an array of stripped state events, keeping only the
+/// last of the user's own member events, which is the knock. Missing rows,
 /// storage failures, and malformed state return an error.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
@@ -847,6 +1033,7 @@ pub async fn knock_state(
 	room_id: &RoomId,
 ) -> Result<Vec<Raw<AnyStrippedStateEvent>>> {
 	let key = (user_id, room_id);
+
 	self.db
 		.userroomid_knockedstate
 		.qry(&key)
@@ -855,13 +1042,35 @@ pub async fn knock_state(
 		.and_then(|val: Raw<Vec<AnyStrippedStateEvent>>| {
 			val.deserialize_as_unchecked().map_err(Into::into)
 		})
+		.map(|state| without_superseded_membership(state, user_id))
+}
+
+/// Drops all but the last of the user's member events from a knock summary.
+///
+/// A summary stored by an earlier version can carry the user's superseded
+/// membership ahead of the knock, and a client reads the first one it finds.
+fn without_superseded_membership(state: StrippedState, user_id: &UserId) -> StrippedState {
+	let own_member = |event: &Raw<AnyStrippedStateEvent>| {
+		let field = |key| event.get_field::<&str>(key).ok().flatten();
+
+		field("type") == Some("m.room.member") && field("state_key") == Some(user_id.as_str())
+	};
+
+	let last = state.iter().rposition(own_member);
+
+	state
+		.into_iter()
+		.enumerate()
+		.filter(|(i, event)| Some(*i) == last || !own_member(event))
+		.map(at!(1))
+		.collect()
 }
 
 /// Returns the cached state for a room a user has left.
 ///
 /// Native state arrays and compatible single-event rows are normalized into
-/// one vector. Missing or unreadable rows return an error, while an unusable
-/// stored JSON shape is logged and becomes an empty vector.
+/// one vector. Forgotten, missing or unreadable rows return an error. An
+/// unusable stored JSON shape is logged and becomes an empty vector.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn left_state(
@@ -874,6 +1083,13 @@ pub async fn left_state(
 		.userroomid_leftstate
 		.qry(&key)
 		.await
+		.and_then(|state| {
+			if state.as_ref().eq(FORGOTTEN_STATE) {
+				return Err!(Request(NotFound("Room has been forgotten")));
+			}
+
+			Ok(state)
+		})
 		.deserialized()
 		.map(|state: Raw<Vec<AnyStrippedStateEvent>>| state_events(room_id, &state))
 }
@@ -948,9 +1164,25 @@ where
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn is_joined<'a>(&'a self, user_id: &'a UserId, room_id: &'a RoomId) -> bool {
 	let key = (user_id, room_id);
+
 	self.db
 		.userroomid_joinedcount
 		.contains(&key)
+		.await
+}
+
+/// Tests whether a user is indexed as joined to a room, returning a failed read
+/// as an error.
+///
+/// Only a missing row returns `false`.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn try_is_joined(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	let key = (user_id, room_id);
+
+	self.db
+		.userroomid_joinedcount
+		.try_contains(&key)
 		.await
 }
 
@@ -976,21 +1208,42 @@ pub async fn is_knocked<'a>(&'a self, user_id: &'a UserId, room_id: &'a RoomId) 
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn is_invited(&self, user_id: &UserId, room_id: &RoomId) -> bool {
 	let key = (user_id, room_id);
+
 	self.db
 		.userroomid_invitestate
 		.contains(&key)
 		.await
 }
 
+/// Tests whether a user is indexed as invited to a room, returning a failed read
+/// as an error.
+///
+/// Only a missing row returns `false`.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn try_is_invited(&self, user_id: &UserId, room_id: &RoomId) -> Result<bool> {
+	let key = (user_id, room_id);
+
+	self.db
+		.userroomid_invitestate
+		.try_contains(&key)
+		.await
+}
+
 /// Tests whether a user's leave state is currently retained for a room.
 ///
-/// Explicitly forgotten rooms have no row and return `false`. Missing rows and
+/// Explicitly forgotten rooms carry a marker and return `false`. Missing rows and
 /// storage failures are otherwise indistinguishable.
 #[implement(Service)]
 #[tracing::instrument(skip(self), level = "trace")]
 pub async fn is_left(&self, user_id: &UserId, room_id: &RoomId) -> bool {
 	let key = (user_id, room_id);
-	self.db.userroomid_leftstate.contains(&key).await
+
+	self.db
+		.userroomid_leftstate
+		.qry(&key)
+		.await
+		.is_ok_and(|state| state.as_ref().ne(FORGOTTEN_STATE))
 }
 
 /// Deletes a room's aggregate and paired membership indexes.

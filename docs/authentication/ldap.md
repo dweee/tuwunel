@@ -5,9 +5,9 @@ user logs in with `m.login.password`, Tuwunel locates them in the directory,
 verifies the password by binding as that user, and creates a Matrix account on
 first successful login if one does not yet exist.
 
-LDAP support is a **compile-time feature**. It is not part of the default
-build — you must compile with `--features ldap` (or use a release artifact
-that already includes it) before any of the configuration below has effect.
+LDAP support is a **compile-time feature**. It is part of the default build;
+a binary built with `--no-default-features` needs `--features ldap` before any
+of the configuration below has effect.
 
 ## Enabling LDAP
 
@@ -88,7 +88,7 @@ as a bootstrap admin, cannot log in while direct-bind mode is active.
 
 | Field | Default | Description |
 |---|---|---|
-| `enable` | `false` | Master switch for LDAP login. Has no effect unless the binary was compiled with `--features ldap`. |
+| `enable` | `false` | Master switch for LDAP login. Has no effect unless the binary was built with the `ldap` feature (on by default). |
 | `uri` | — | LDAP server URI. `ldap://host:389` for plaintext, `ldaps://host:636` for TLS. |
 | `base_dn` | `""` | Subtree under which user searches are rooted. |
 | `bind_dn` | — | DN used for the initial bind. Contains `{username}` for direct-bind mode; otherwise identifies a service account. Omit for anonymous search. |
@@ -133,8 +133,8 @@ admin_filter = "(uid={username})"
 ```
 
 Admin synchronization only runs in the search-then-bind modes. In direct-bind
-mode the admin search is silently skipped — manage admins manually with
-`!admin users make-admin` and `!admin users revoke-admin` if you need that
+mode the admin search is silently skipped; manage admins manually with
+`!admin users make-user-admin` and `!admin users revoke-admin` if you need that
 combination.
 
 ## Account lifecycle
@@ -202,5 +202,10 @@ login for everyone (apart from accounts that authenticate via SSO), pair LDAP
 with a restrictive `filter` that matches every legitimate user, and remove or
 invalidate local passwords for accounts that should no longer be able to log
 in directly. Direct-bind mode already has no fallback, so it enforces this on
-its own. Alternatively, set `login_with_password = false` and rely on
-[identity providers](providers.md) for non-LDAP users.
+its own.
+
+> [!WARNING]
+> Setting `login_with_password = false` blocks LDAP logins as well as local
+> password logins. Keep password login enabled if your users sign in through
+> LDAP. With it disabled, only [identity provider](providers.md), JWT, token
+> and appservice logins remain available.

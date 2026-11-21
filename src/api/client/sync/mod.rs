@@ -6,24 +6,31 @@ mod v5;
 
 use futures::{StreamExt, pin_mut};
 use ruma::{
-	OwnedUserId, RoomId, UserId,
+	EventId, OwnedUserId, RoomId, UserId,
 	events::{
-		AnyStrippedStateEvent,
+		AnyStrippedStateEvent, AnySyncStateEvent, StateEventType,
 		TimelineEventType::{RoomCreate, RoomMember},
+		room::member::MembershipState,
 	},
 	serde::Raw,
+	uint,
 };
 use tuwunel_core::{
-	Error, PduCount, Result, debug_warn, is_equal_to,
-	matrix::{Event, pdu::PduEvent},
-	utils::{ReadyExt, result::LogErr, stream::BroadbandExt},
+	Error, Result, debug_warn, is_equal_to,
+	utils::{
+		result::{LogErr, NotFound},
+		time::now_millis,
+	},
+	warn,
+};
+use tuwunel_matrix::{
+	Event, PduCount,
+	pdu::{EventHash, PduEvent},
 };
 use tuwunel_service::{Services, users::InviteFilter};
 
-pub(crate) use self::{
-	v3::{calculate_heroes, sync_events_route},
-	v5::sync_events_v5_route,
-};
+pub use self::v3::calculate_heroes;
+pub(crate) use self::{v3::sync_events_route, v5::sync_events_v5_route};
 
 #[derive(Clone, Copy)]
 enum TimelineErrors {
@@ -146,20 +153,38 @@ async fn share_encrypted_room(
 	services: &Services,
 	sender_user: &UserId,
 	user_id: &UserId,
-	ignore_room: Option<&RoomId>,
 ) -> bool {
 	services
 		.state_cache
 		.get_shared_rooms(sender_user, user_id)
-		.ready_filter(|&room_id| Some(room_id) != ignore_room)
 		.map(ToOwned::to_owned)
-		.broad_any(async |other_room_id| {
+		.any(async |room_id| {
 			services
 				.state_accessor
-				.is_encrypted_room(&other_room_id)
+				.is_encrypted_room(&room_id)
 				.await
 		})
 		.await
+}
+
+/// Whether a user's join to a room is fresh since a sync token.
+///
+/// The joined count moves on every join and forced state replay except a local
+/// user's profile change over the position its join recorded, which keeps it.
+/// An unreadable count reads as unmoved.
+#[tracing::instrument(level = "trace", skip(services))]
+async fn joined_since(
+	services: &Services,
+	room_id: &RoomId,
+	user_id: &UserId,
+	since: u64,
+) -> bool {
+	services
+		.state_cache
+		.get_joined_count(room_id, user_id)
+		.await
+		.inspect_err(|error| debug_warn!(%room_id, %user_id, %error, "joined count unreadable"))
+		.is_ok_and(|recorded| recorded > since)
 }
 
 /// MSC4155: whether a stored invite may be served to the invitee.
@@ -243,12 +268,14 @@ fn invite_sender(
 		})
 }
 
-/// State sections strip the stored `prev_content`/`prev_sender` pair
-/// (Synapse injects the pair on timeline fetches only). The requester's own
-/// membership and events duplicated from the returned timeline (MSC4222,
-/// full_state) keep it: clients read membership transitions from those
-/// copies.
-fn strip_prev_state(
+/// Strips the unsigned fields a state section does not serve.
+///
+/// Fields private to the sender go unless the requester sent the event. The
+/// stored `prev_content`/`prev_sender` pair goes too (Synapse injects it on
+/// timeline fetches only), except on the requester's own membership and on
+/// events duplicated from the returned timeline (MSC4222, full_state), the
+/// copies clients read membership transitions from.
+fn strip_state_unsigned(
 	mut pdu: PduEvent,
 	sender_user: &UserId,
 	in_timeline: impl Fn(&PduEvent) -> bool,
@@ -256,9 +283,73 @@ fn strip_prev_state(
 	let own_membership =
 		*pdu.kind() == RoomMember && pdu.state_key() == Some(sender_user.as_str());
 
+	pdu.remove_private_unless_sender(Some(sender_user));
+
 	if !own_membership && !in_timeline(&pdu) {
 		pdu.remove_prev_state().log_err().ok();
 	}
 
 	pdu
+}
+
+/// The user's own departure in a left room's state, when it holds one.
+///
+/// A ban counts, since the membership indexes file a banned user as left. Any
+/// other membership yields `None`, as a room this server left still holds the
+/// invite a later rescission withdrew. A failed read is logged and yields `None`
+/// too, so the client still learns of the departure. A kick or ban is sent by
+/// someone else, so fields private to the sender are removed unless the user
+/// sent it.
+async fn own_departure(
+	services: &Services,
+	room_id: &RoomId,
+	user_id: &UserId,
+) -> Option<PduEvent> {
+	services
+		.state_accessor
+		.room_state_get(room_id, &StateEventType::RoomMember, user_id.as_str())
+		.await
+		.optional()
+		.inspect_err(|error| warn!(%room_id, %user_id, %error, "Unreadable own departure event"))
+		.ok()
+		.flatten()
+		.filter(|event| {
+			matches!(
+				event.membership_for(user_id),
+				Some(MembershipState::Leave | MembershipState::Ban)
+			)
+		})
+		.map(|event| event.without_private_unless_sender(Some(user_id)))
+}
+
+/// Builds a minimal leave event for a left room whose state supplies none.
+///
+/// A rescinded or rejected federated invite, or deleted, missing, or broken
+/// room state, leaves no real membership event to send, while clients read the
+/// departure from one. The stand-in names the user as sender under a fresh
+/// local event ID.
+fn stand_in_leave(
+	services: &Services,
+	room_id: &RoomId,
+	sender_user: &UserId,
+) -> Result<Raw<AnySyncStateEvent>> {
+	let event = PduEvent {
+		event_id: EventId::new_v1(services.globals.server_name()),
+		origin_server_ts: now_millis().try_into()?,
+		kind: RoomMember,
+		state_key: Some(sender_user.as_str().into()),
+		sender: sender_user.to_owned(),
+		content: serde_json::from_str(r#"{"membership":"leave"}"#)?,
+		// The following keys are dropped on conversion
+		room_id: room_id.to_owned(),
+		depth: uint!(1),
+		origin: None,
+		unsigned: None,
+		redacts: None,
+		hashes: EventHash::default(),
+		auth_events: Default::default(),
+		prev_events: Default::default(),
+	};
+
+	Ok(event.into_format())
 }

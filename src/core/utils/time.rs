@@ -56,6 +56,14 @@ pub fn duration_since_epoch(timepoint: SystemTime) -> Duration {
 		.unwrap_or(Duration::ZERO)
 }
 
+/// Converts a duration to whole milliseconds when they fit in a `u64`.
+///
+/// The submillisecond remainder is discarded; a count past `u64::MAX` gives
+/// `None` rather than truncating.
+#[inline]
+#[must_use]
+pub fn millis(duration: Duration) -> Option<u64> { duration.as_millis().try_into().ok() }
+
 /// Adds a duration to the Unix epoch using checked arithmetic.
 ///
 /// The resulting system time is returned when representable. An arithmetic
@@ -108,6 +116,15 @@ pub fn parse_timepoint_ago(ago: &str) -> Result<SystemTime> {
 pub fn parse_duration(duration: &str) -> Result<Duration> {
 	cyborgtime::parse_duration(duration)
 		.map_err(|error| err!("'{duration:?}' is not a valid duration string: {error:?}"))
+}
+
+/// Checks whether an optional deadline has passed.
+///
+/// An absent deadline never passes.
+#[inline]
+#[must_use]
+pub fn deadline_has_passed(deadline: Option<SystemTime>) -> bool {
+	deadline.is_some_and(timepoint_has_passed)
 }
 
 /// Checks whether a system time is at or before the current wall-clock time.

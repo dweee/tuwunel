@@ -4,8 +4,8 @@ use axum::extract::State;
 use futures::{FutureExt, StreamExt};
 use itertools::Itertools;
 use ruma::{
-	CanonicalJsonObject, EventEncryptionAlgorithm, Int, OwnedRoomAliasId, OwnedRoomId,
-	OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, EventEncryptionAlgorithm, Int, OwnedRoomAliasId,
+	OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
 	api::client::room::{
 		self,
 		create_room::{
@@ -39,18 +39,23 @@ use serde_json::{
 	value::{RawValue as RawJsonValue, to_raw_value},
 };
 use tuwunel_core::{
-	Err, Result, debug_info, debug_warn, err, info,
-	matrix::{
-		StateKey,
-		pdu::{Content, PduBuilder},
-		room_version,
+	Err, Error, Result, debug_info, debug_warn, err, info,
+	utils::{
+		BoolExt, IterStream, ReadyExt, json::serialized_len, option::OptionExt, result::FlatOk,
 	},
-	utils::{BoolExt, IterStream, ReadyExt, option::OptionExt, result::FlatOk},
 	warn,
 };
-use tuwunel_service::{Services, appservice::RegistrationInfo, rooms::state::RoomMutexGuard};
+use tuwunel_matrix::{
+	StateKey,
+	pdu::{Content, PduBuilder},
+	room_version,
+};
+use tuwunel_service::{
+	Services, appservice::RegistrationInfo, profile::check_member_content,
+	rooms::state::RoomMutexGuard,
+};
 
-use crate::{Ruma, client::utils::invite_check};
+use crate::{Ruma, utils::invite_check};
 
 pub(crate) async fn create_room_route(
 	State(services): State<crate::State>,
@@ -58,6 +63,9 @@ pub(crate) async fn create_room_route(
 ) -> Result<create_room::v3::Response> {
 	can_create_room_check(&services, &body).await?;
 	can_publish_directory_check(&services, &body).await?;
+	let initial_events = parse_initial_state(&body)?;
+
+	check_initial_member_content(&services, &initial_events)?;
 
 	// Figure out preset. We need it for preset specific events
 	let preset = body
@@ -72,7 +80,7 @@ pub(crate) async fn create_room_route(
 	let (room_version, version_rules) = body
 		.room_version
 		.as_ref()
-		.map_or(Ok(&services.server.config.default_room_version), |version| {
+		.map_or(Ok(&services.server.config.rooms.default_version), |version| {
 			services
 				.config
 				.supported_room_version(version)
@@ -84,11 +92,15 @@ pub(crate) async fn create_room_route(
 		})
 		.and_then(|version| Ok((version, room_version::rules(version)?)))?;
 
+	let sender_user = body.sender_user();
+
 	// Error on existing alias before committing to creation.
 	let alias = body
 		.room_alias_name
 		.as_ref()
-		.map_async(|alias| room_alias_check(&services, alias, body.appservice_info.as_ref()))
+		.map_async(|alias| {
+			room_alias_check(&services, alias, sender_user, body.appservice_info.as_ref())
+		})
 		.await
 		.transpose()?;
 
@@ -103,16 +115,17 @@ pub(crate) async fn create_room_route(
 		| RoomIdFormatVersion::V2 =>
 			create_create_event(&services, &body, &preset, room_version, &version_rules)
 				.await
-				.map_err(|e| {
-					err!(Request(InvalidParam("Error while creating m.room.create event: {e}")))
+				.map_err(|e| match e {
+					| Error::Request(..) | Error::BadRequest(..) => e,
+					| e => err!(Request(InvalidParam(
+						"Error while creating m.room.create event: {e}"
+					))),
 				})?,
 	};
 
-	let sender_user = body.sender_user();
-
 	// 2. Let the room creator join
 	apply_creator_join_pdu(&services, &body, sender_user, &room_id, &state_lock)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 3. Power levels
@@ -125,21 +138,27 @@ pub(crate) async fn create_room_route(
 		&room_id,
 		&state_lock,
 	)
-	.boxed()
+	.boxed() // size firewall
 	.await?;
 
 	// 4. Canonical room alias
 	if let Some(room_alias_id) = &alias {
 		apply_canonical_alias_pdu(&services, room_alias_id, sender_user, &room_id, &state_lock)
-			.boxed()
+			.boxed() // cold arm
 			.await?;
 	}
 
 	// 5. Events set by preset
-	let initial_state =
-		apply_preset_state_pdus(&services, &body, &preset, sender_user, &room_id, &state_lock)
-			.boxed()
-			.await?;
+	let initial_state = apply_preset_state_pdus(
+		&services,
+		initial_events,
+		&preset,
+		sender_user,
+		&room_id,
+		&state_lock,
+	)
+	.boxed() // size firewall
+	.await?;
 
 	// 6. Events listed in initial_state
 	apply_initial_state_pdus(
@@ -150,12 +169,12 @@ pub(crate) async fn create_room_route(
 		&room_id,
 		&state_lock,
 	)
-	.boxed()
+	.boxed() // size firewall
 	.await?;
 
 	// 7. Events implied by name and topic
 	apply_name_and_topic_pdus(&services, &body, sender_user, &room_id, &state_lock)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	drop(next_count);
@@ -168,7 +187,7 @@ pub(crate) async fn create_room_route(
 			.is_ok()
 	{
 		process_invites(&services, &body, sender_user, &room_id)
-			.boxed()
+			.boxed() // size firewall
 			.await;
 	}
 
@@ -229,6 +248,7 @@ async fn apply_power_levels_pdu(
 
 	let default_override = services
 		.config
+		.rooms
 		.default_power_level_content_override
 		.as_ref();
 
@@ -315,33 +335,29 @@ async fn apply_canonical_alias_pdu(
 
 async fn apply_preset_state_pdus(
 	services: &Services,
-	body: &Ruma<create_room::v3::Request>,
+	initial_events: impl IntoIterator<Item = InitialEvent>,
 	preset: &RoomPreset,
 	sender_user: &UserId,
 	room_id: &RoomId,
 	state_lock: &RoomMutexGuard,
 ) -> Result<Vec<InitialEvent>> {
-	let mut initial_state = body
-		.initial_state
-		.iter()
-		.map(|state| Ok(state.deserialize_as_unchecked::<InitialEvent>()?))
-		.filter_ok(|event| {
-			services.config.allow_encryption || event.event_type != StateEventType::RoomEncryption
+	let mut initial_state = initial_events
+		.into_iter()
+		.filter(|event| {
+			services.config.encryption.allow || event.event_type != StateEventType::RoomEncryption
 		})
-		.filter_ok(|event| {
+		.filter(|event| {
 			// client/appservice workaround: if a user sends an initial_state event with a
 			// state event in there with the content of literally `{}` (not null or empty
 			// string), let's just skip it over and warn.
-			if event.content.json().get() == "{}" {
+			if is_empty_content(event) {
 				debug_warn!("skipping empty initial state event of type {}", event.event_type);
 				false
 			} else {
 				true
 			}
 		})
-		.filter_ok(|event| body.name.is_none() || event.event_type != StateEventType::RoomName)
-		.filter_ok(|event| body.topic.is_none() || event.event_type != StateEventType::RoomTopic)
-		.collect::<Result<Vec<_>>>()?;
+		.collect::<Vec<_>>();
 
 	let join_rule_pdubuilder =
 		take_initial(&mut initial_state, &StateEventType::RoomJoinRules, "")
@@ -376,14 +392,14 @@ async fn apply_preset_state_pdus(
 	services
 		.timeline
 		.build_and_append_pdu(join_rule_pdubuilder, sender_user, room_id, state_lock)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 5.2 History Visibility
 	services
 		.timeline
 		.build_and_append_pdu(history_visibility_pdubuilder, sender_user, room_id, state_lock)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	// 5.3 Guest Access
@@ -391,7 +407,7 @@ async fn apply_preset_state_pdus(
 		services
 			.timeline
 			.build_and_append_pdu(guest_access, sender_user, room_id, state_lock)
-			.boxed()
+			.boxed() // size firewall
 			.await?;
 	}
 
@@ -420,17 +436,18 @@ async fn apply_initial_state_pdus(
 		services
 			.timeline
 			.build_and_append_pdu(event.into(), sender_user, room_id, state_lock)
-			.boxed()
+			.boxed() // size firewall
 			.await?;
 	}
 
-	if !services.config.allow_encryption || is_encrypted {
+	if !services.config.encryption.allow || is_encrypted {
 		return Ok(());
 	}
 
 	let config = services
 		.config
-		.encryption_enabled_by_default_for_room_type
+		.encryption
+		.enabled_by_default_for_room_type
 		.as_deref();
 
 	let should_encrypt = match config {
@@ -454,7 +471,7 @@ async fn apply_initial_state_pdus(
 			room_id,
 			state_lock,
 		)
-		.boxed()
+		.boxed() // cold arm
 		.await?;
 
 	Ok(())
@@ -492,7 +509,7 @@ async fn apply_name_and_topic_pdus(
 				room_id,
 				state_lock,
 			)
-			.boxed()
+			.boxed() // size firewall
 			.await?;
 	}
 
@@ -505,7 +522,7 @@ async fn apply_name_and_topic_pdus(
 				room_id,
 				state_lock,
 			)
-			.boxed()
+			.boxed() // cold arm
 			.await?;
 	}
 
@@ -529,7 +546,7 @@ async fn process_invites(
 			if let Err(e) = services
 				.membership
 				.invite(sender_user, user_id, room_id, None, body.is_direct)
-				.boxed()
+				.boxed() // size firewall
 				.await
 			{
 				warn!(%e, "Failed to send invite");
@@ -620,8 +637,8 @@ async fn create_create_event(
 					))))
 				})?;
 
-			if !services.config.federate_created_rooms
-				&& (!services.config.allow_federation || !content.contains_key("m.federate"))
+			if !services.config.rooms.federate_by_default
+				&& (!services.config.federation.enable || !content.contains_key("m.federate"))
 			{
 				content.insert("m.federate".into(), json!(false).try_into()?);
 			}
@@ -641,7 +658,7 @@ async fn create_create_event(
 			let mut content =
 				serde_json::from_str::<CanonicalJsonObject>(to_raw_value(&content)?.get())?;
 
-			if !services.config.federate_created_rooms {
+			if !services.config.rooms.federate_by_default {
 				content.insert("m.federate".into(), json!(false).try_into()?);
 			}
 
@@ -680,32 +697,40 @@ async fn create_create_event(
 		}
 	}
 
-	// 1. The room create event, using a placeholder room_id
-	let room_id = ruma::room_id!("!thiswillbereplaced").to_owned();
-	let state_lock = services.state.mutex.lock(&room_id).await;
+	let expected_room_id = body
+		.room_id
+		.as_deref()
+		.map(expected_room_id_check)
+		.transpose()?;
+
 	let create_event_id = services
 		.timeline
-		.build_and_append_pdu(
-			PduBuilder {
-				event_type: TimelineEventType::RoomCreate,
-				content: to_raw_value(&create_content)?.into(),
-				state_key: Some(StateKey::new()),
-				..Default::default()
-			},
+		.build_and_append_create_pdu(
+			create_content,
 			body.sender_user(),
-			&room_id,
-			&state_lock,
+			body.origin_server_ts,
+			expected_room_id,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
-
-	drop(state_lock);
 
 	// The real room_id is now the event_id.
 	let room_id = OwnedRoomId::from_parts('!', create_event_id.localpart(), None)?;
 	let state_lock = services.state.mutex.lock(&room_id).await;
 
 	Ok((room_id, state_lock))
+}
+
+// These versions derive the room ID from the create event, so only a hash-form ID is admitted.
+fn expected_room_id_check(expected: &str) -> Result<&str> {
+	let hashed = expected.starts_with('!') && !expected.contains(':');
+
+	hashed.then_some(expected).ok_or_else(|| {
+		err!(Request(InvalidParam(
+			"This room version derives the room ID from the create event; only that ID can be \
+			 expected."
+		)))
+	})
 }
 
 async fn create_create_event_legacy(
@@ -747,8 +772,8 @@ async fn create_create_event_legacy(
 				);
 			}
 
-			if !services.config.federate_created_rooms
-				&& (!services.config.allow_federation || !content.contains_key("m.federate"))
+			if !services.config.rooms.federate_by_default
+				&& (!services.config.federation.enable || !content.contains_key("m.federate"))
 			{
 				content.insert("m.federate".into(), json!(false).try_into()?);
 			}
@@ -772,7 +797,7 @@ async fn create_create_event_legacy(
 			let mut content =
 				serde_json::from_str::<CanonicalJsonObject>(to_raw_value(&content)?.get())?;
 
-			if !services.config.federate_created_rooms {
+			if !services.config.rooms.federate_by_default {
 				content.insert("m.federate".into(), json!(false).try_into()?);
 			}
 
@@ -795,7 +820,7 @@ async fn create_create_event_legacy(
 			&room_id,
 			&state_lock,
 		)
-		.boxed()
+		.boxed() // size firewall
 		.await?;
 
 	Ok((room_id, state_lock))
@@ -885,8 +910,14 @@ fn merge_power_level_content_override(
 async fn room_alias_check(
 	services: &Services,
 	room_alias_name: &str,
+	sender_user: &UserId,
 	appservice_info: Option<&RegistrationInfo>,
 ) -> Result<OwnedRoomAliasId> {
+	services
+		.alias
+		.creation_check(sender_user, appservice_info)
+		.await?;
+
 	// Basic checks on the room alias validity
 	if room_alias_name.contains(':') {
 		return Err!(Request(InvalidParam(
@@ -902,6 +933,7 @@ async fn room_alias_check(
 	// check if room alias is forbidden
 	if services
 		.config
+		.rooms
 		.forbidden_alias_names
 		.is_match(room_alias_name)
 	{
@@ -949,6 +981,7 @@ async fn custom_room_id_check(services: &Services, custom_room_id: &str) -> Resu
 	// apply forbidden room alias checks to custom room IDs too
 	if services
 		.config
+		.rooms
 		.forbidden_alias_names
 		.is_match(custom_room_id)
 	{
@@ -992,10 +1025,7 @@ async fn can_publish_directory_check(
 	services: &Services,
 	body: &Ruma<create_room::v3::Request>,
 ) -> Result {
-	if !services
-		.server
-		.config
-		.lockdown_public_room_directory
+	if !services.server.config.directory.rooms.lockdown
 		|| body.appservice_info.is_some()
 		|| body.visibility != room::Visibility::Public
 		|| services
@@ -1007,8 +1037,8 @@ async fn can_publish_directory_check(
 	}
 
 	let msg = format!(
-		"Non-admin user {} tried to publish new to the directory while \
-		 lockdown_public_room_directory is enabled",
+		"Non-admin user {} tried to publish new to the directory while directory.rooms.lockdown \
+		 is enabled",
 		body.sender_user(),
 	);
 
@@ -1018,11 +1048,51 @@ async fn can_publish_directory_check(
 	Err!(Request(Forbidden("Publishing rooms to the room directory is not allowed")))
 }
 
+// The entries are parsed once, before any PDU is appended, so a refusal cannot leave a
+// half-built room behind.
+fn parse_initial_state(body: &Ruma<create_room::v3::Request>) -> Result<Vec<InitialEvent>> {
+	body.initial_state
+		.iter()
+		.map(|state| Ok(state.deserialize_as_unchecked::<InitialEvent>()?))
+		.filter_ok(|event| body.name.is_none() || event.event_type != StateEventType::RoomName)
+		.filter_ok(|event| body.topic.is_none() || event.event_type != StateEventType::RoomTopic)
+		.collect::<Result<Vec<_>>>()
+}
+
+fn check_initial_member_content(services: &Services, initial_events: &[InitialEvent]) -> Result {
+	let max_bytes = services.config.profile.member_event_max_bytes;
+
+	initial_events
+		.iter()
+		.filter(|event| event.event_type == StateEventType::RoomMember)
+		.filter(|event| !is_empty_content(event))
+		.try_for_each(|event| {
+			// Appending parses this too, but by then the room exists.
+			event
+				.content
+				.deserialize_as_unchecked::<RoomMemberEventContent>()
+				.map_err(|e| err!(Request(BadJson("Invalid initial member event: {e}"))))?;
+
+			let content = event.content.deserialize()?;
+			let displayname = content
+				.get("displayname")
+				.and_then(CanonicalJsonValue::as_str);
+
+			let avatar_url = content
+				.get("avatar_url")
+				.and_then(CanonicalJsonValue::as_str);
+
+			check_member_content(max_bytes, serialized_len(&content)?, displayname, avatar_url)
+		})
+}
+
+fn is_empty_content(event: &InitialEvent) -> bool { event.content.json().get() == "{}" }
+
 async fn can_create_room_check(
 	services: &Services,
 	body: &Ruma<create_room::v3::Request>,
 ) -> Result {
-	if !services.config.allow_room_creation
+	if !services.config.rooms.allow_creation
 		&& body.appservice_info.is_none()
 		&& !services
 			.admin
@@ -1071,7 +1141,7 @@ fn take_initial(
 
 #[cfg(test)]
 mod tests {
-	use tuwunel_core::matrix::room_version::rules;
+	use tuwunel_matrix::room_version::rules;
 
 	use super::*;
 

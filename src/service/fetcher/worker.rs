@@ -141,6 +141,7 @@ fn push_attempt<'a>(
 	opts: Arc<Opts>,
 	weak: Weak<()>,
 ) {
+	// type-erasure boundary
 	futures.push(async move { (key, self.run_attempts(&opts, &weak).await) }.boxed());
 }
 
@@ -208,7 +209,10 @@ async fn run_attempts(&self, opts: &Opts, interest: &Weak<()>) -> SharedResult {
 		.map_or((0, 0), |services| {
 			let config = &services.server.config;
 
-			(config.fetch_fanout_max_width, config.fetch_fanout_rounds)
+			(
+				config.federation.history.fetch_fanout_max_width,
+				config.federation.history.fetch_fanout_rounds,
+			)
 		});
 
 	let max_width = effective_cap(opts.fanout_max_width, config_width);

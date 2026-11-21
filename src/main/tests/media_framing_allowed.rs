@@ -48,23 +48,23 @@ mod tests {
 	fn exercise(deny_framing: bool, deny_inline_styles: bool, policy: &str) -> Result {
 		let listener = TcpListener::bind(("127.0.0.1", 0))?;
 		let port = listener.local_addr()?.port();
+		let args = Args::default_test(&["fresh", "cleanup"]).with_loopback_listener(port);
+
 		let args = [
-			"address=[\"127.0.0.1\"]".to_owned(),
-			format!("port={port}"),
 			"listening=true".to_owned(),
-			"allow_legacy_media=true".to_owned(),
-			format!("media_deny_framing={deny_framing}"),
-			format!("media_deny_inline_styles={deny_inline_styles}"),
-			"log_enable=false".to_owned(),
+			"media.allow_legacy=true".to_owned(),
+			format!("media.deny_framing={deny_framing}"),
+			format!("media.deny_inline_styles={deny_inline_styles}"),
+			"logging.enable=false".to_owned(),
 		]
 		.into_iter()
-		.fold(Args::default_test(&["fresh", "cleanup"]), Args::with_option);
+		.fold(args, Args::with_option);
 
 		let runtime = Runtime::new(Some(&args))?;
 		let server = Server::new(Some(&args), Some(&runtime))?;
 
-		assert_eq!(server.server.config.media_deny_framing, deny_framing);
-		assert_eq!(server.server.config.media_deny_inline_styles, deny_inline_styles);
+		assert_eq!(server.server.config.media.deny_framing, deny_framing);
+		assert_eq!(server.server.config.media.deny_inline_styles, deny_inline_styles);
 
 		runtime.block_on(async {
 			let services = async_start(&server).await?;

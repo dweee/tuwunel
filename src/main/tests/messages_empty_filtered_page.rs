@@ -5,7 +5,8 @@ use std::{fs::remove_dir_all, net::TcpListener};
 use futures::future::join;
 use serde_json::{Value, json};
 use tuwunel::{Args, Runtime, Server, async_run, async_start, async_stop};
-use tuwunel_core::{Event, Result, ruma::events::TimelineEventType};
+use tuwunel_core::{Result, ruma::events::TimelineEventType};
+use tuwunel_matrix::Event;
 use tuwunel_service::Services;
 
 use self::client::{Client, register, wait_until_ready};
@@ -27,14 +28,11 @@ fn exhausted_backward_page_uses_scanned_edge() -> Result {
 
 	let db_path = Args::test_database_path("messages-empty-page");
 
-	let mut args = Args::default_test(&["fresh", "cleanup"]);
+	let mut args = Args::default_test(&["fresh", "cleanup"])
+		.with_database_path(&db_path)
+		.with_loopback_listener(port);
 
-	args.option.extend([
-		format!("database_path={db_path:?}"),
-		"address=[\"127.0.0.1\"]".to_owned(),
-		format!("port={port}"),
-		"listening=true".to_owned(),
-	]);
+	args.option.extend(["listening=true".to_owned()]);
 
 	let runtime = Runtime::new(Some(&args))?;
 	let server = Server::new(Some(&args), Some(&runtime))?;

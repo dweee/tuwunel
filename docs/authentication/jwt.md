@@ -16,6 +16,14 @@ identity is owned by an external system. Two typical uses:
   token that authenticates as any user for password resets, key recovery,
   or legal compliance without modifying the user's credentials.
 
+JWT login requires the `jwt_login` build feature, which is included in the
+default build. If you build without the default features and need JWT login,
+include `jwt_login` in your feature selection.
+
+> [!WARNING]
+> A binary built without `jwt_login` refuses to start with `enable = true`
+> in `[global.jwt]`.
+
 
 ## Enabling JWT
 
@@ -56,10 +64,11 @@ issuer must agree with the server on this naming.
 | Field | Default | Description |
 |---|---|---|
 | `enable` | `false` | Master switch for JWT login. Also gates the UIAA flow. |
-| `key` | — | Verification key. Plaintext, base64, or PEM depending on `format`. **Sensitive** — keep private when used as an HMAC secret. |
-| `format` | `"HMAC"` | One of `HMAC`, `B64HMAC`, `ECDSA`, `EDDSA`. Selects how `key` is decoded. |
+| `key` | `""` | Verification key. Plaintext, base64, or PEM depending on `format`. **Sensitive**: keep private when used as an HMAC secret. |
+| `format` | `"HMAC"` | One of `HMAC`, `B64HMAC`, `ECDSA`, `EDDSA`, in any case (`HMACB64` is also accepted for `B64HMAC`). Selects how `key` is decoded. |
 | `algorithm` | `"HS256"` | JWT `alg` header value. Must be compatible with `format`. |
 | `register_user` | `true` | Auto-create a Matrix account on first valid login if the user doesn't already exist. Set to `false` to require pre-existing accounts. |
+| `expire_access_token` | `false` | Expire the access token of a JWT login after `access_token_ttl` and withhold its refresh token, so the token issuer decides how long a login lasts. See [Session lifetime](#session-lifetime). |
 | `audience` | `[]` | Optional list of accepted `aud` claim values. When non-empty, tokens must claim at least one entry; `aud` becomes a required claim. |
 | `issuer` | `[]` | Optional list of accepted `iss` claim values. When non-empty, tokens must claim at least one entry; `iss` becomes a required claim. |
 | `require_exp` | `false` | If `true`, tokens without an `exp` claim are rejected. Defaults to `false` for Synapse compatibility. |
@@ -95,20 +104,79 @@ The first time a token authenticates as a user that does not yet exist:
 
 - If `register_user = true`, Tuwunel creates the account with origin
   `"jwt"` and a placeholder password marker. The local password field is
-  never read for a JWT-authenticated user — they can only re-authenticate
+  never read for a JWT-authenticated user; they can only re-authenticate
   by presenting another valid JWT.
 - If `register_user = false`, the request fails with `M_NOT_FOUND` and
   the account is not created.
 
-Subsequent logins reuse the existing account.
+Subsequent logins reuse the existing account. A deactivated account is
+refused with `M_USER_DEACTIVATED`, as it is for password login; a valid
+token does not bring it back.
 
 JWT does not synchronize admin status, group membership, or display
-names — the token grants login only. If you need ongoing identity
+names; the token grants login only. If you need ongoing identity
 attribute synchronization, use [LDAP](ldap.md) or an
 [OIDC identity provider](providers.md) instead.
 
 
-## UIAA — JWT for account override
+## Session lifetime
+
+A JWT is checked once, at login. The session it opens then follows the
+usual rules: the access token never expires unless the client asks for a
+refresh token, and a refresh token keeps the session going for as long as
+it lasts, which by default is indefinitely. The JWT's own `exp` has no say,
+so a login can far outlast the token that opened it.
+
+> [!WARNING]
+> A client that cannot obtain a fresh JWT would be signed out for good.
+> This is why `expire_access_token` is off by default.
+>
+> When you enable the option, remove the devices of earlier sessions once.
+> With the option enabled, a JWT login retires its device's refresh token.
+> A client that only refreshes never logs in again and can keep refreshing.
+> An access token issued without an expiry also keeps working.
+
+Set `expire_access_token` to let the token issuer decide instead:
+
+```toml
+[global.jwt]
+enable = true
+key = "..."
+expire_access_token = true
+require_exp = true
+```
+
+Every JWT login then gets an access token that expires after
+`access_token_ttl`, and no refresh token, even when the client asks for one.
+Once the token expires the client is soft-logged-out: its requests fail with
+`M_UNKNOWN_TOKEN` and `soft_logout: true`, and it keeps its device and
+encryption keys. To stay signed in, it logs in with a fresh JWT and the same
+`device_id`.
+
+The option also has limits to plan around:
+
+- **The lifetime is server-wide.** It comes from `access_token_ttl` in
+  `[global.authentication]` (7 days by default), not from the JWT's `exp`,
+  and the same setting governs every session holding a refresh token.
+- **The JWT itself must expire.** A client can log in again with any JWT that
+  is still valid, so have the issuer set `exp`, and keep `require_exp = true`
+  to refuse a token without one.
+- **Other sign-in routes stay open.** Password, LDAP and SSO logins keep their
+  usual lifetimes. A fresh JWT also passes the interactive authentication of
+  `/login/get_token`, and the login token it yields opens a session outside
+  this option. To hold a JWT-only deployment to the issuer's decision, close
+  both:
+
+  ```toml
+  [global.authentication.login]
+  via_existing_session = false
+  with_password = false
+  ```
+
+  `with_password = false` also turns off [LDAP](ldap.md) sign-in.
+
+
+## UIAA: JWT for account override
 
 When `enable = true`, the `m.login.jwt` UIAA stage becomes available
 alongside `m.login.password` and `m.login.sso` for sensitive operations
@@ -124,7 +192,12 @@ substitute identity for an existing one.
 A typical operator workflow for a forced password reset:
 
 1. Sign a JWT with `sub` set to the target user's localpart.
-2. Submit it as the `auth` field of `POST /_matrix/client/v3/account/password`:
+2. Submit it as the `auth` field of `POST /_matrix/client/v3/account/password`.
+   The request must carry an access token; without one it is refused with
+   `401 M_MISSING_TOKEN`. An operator with no session can open one by
+   logging in with a JWT for the same user (`org.matrix.login.jwt`, above).
+   That login adds a device to the user's account, so log it out
+   (`POST /_matrix/client/v3/logout`) once the password is changed.
 
    ```json
    {
@@ -148,16 +221,25 @@ user on the server.
 ## Key formats and algorithms
 
 `format` selects how `key` is interpreted. `algorithm` selects the JWT
-signing algorithm. The two must agree.
+signing algorithm. The two must agree. Format names are case-insensitive.
+`HMACB64` is also accepted for `B64HMAC`.
+
+> [!WARNING]
+> While `enable = true`, Tuwunel refuses to start or reload its
+> configuration if `key` is empty or `format` is not one of the supported
+> names below.
+
+If `key` cannot be decoded or `algorithm` does not suit the format,
+Tuwunel reports the error at each login instead.
 
 | Format | Algorithm | Key content |
 |---|---|---|
 | `HMAC` (default) | `HS256`, `HS384`, `HS512` | Plaintext shared secret. |
-| `B64HMAC` | `HS256`, `HS384`, `HS512` | Base64-encoded shared secret. Use this when the secret contains non-printable bytes. |
+| `B64HMAC` | `HS256`, `HS384`, `HS512` | Base64-encoded shared secret, in the standard alphabet (`+` and `/`) with `=` padding. Use this when the secret contains non-printable bytes. |
 | `ECDSA` | `ES256`, `ES384` | PEM-encoded ECDSA public key. |
 | `EDDSA` | `EdDSA` | PEM-encoded Ed25519 public key. |
 
-For asymmetric formats (`ECDSA`, `EDDSA`) the `key` is the **public** key —
+For asymmetric formats (`ECDSA`, `EDDSA`) the `key` is the **public** key:
 Tuwunel only verifies, it never signs. The corresponding private key
 stays with the issuer.
 
@@ -180,12 +262,12 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
 `exp` (expiration) and `nbf` (not-before) follow the spec semantics:
 seconds since the Unix epoch. Configure based on the issuer's behavior:
 
-- **Issuer always sets `exp`** — set `require_exp = true` to reject any
+- **Issuer always sets `exp`**: set `require_exp = true` to reject any
   token without an expiration. `validate_exp` is `true` by default.
-- **Issuer never sets `exp`** — leave both `require_exp` and
+- **Issuer never sets `exp`**: leave both `require_exp` and
   `validate_exp` at their defaults; tokens without `exp` are accepted as
   non-expiring (use cautiously).
-- **Mixed** — leave `require_exp = false` and `validate_exp = true` (the
+- **Mixed**: leave `require_exp = false` and `validate_exp = true` (the
   defaults). This is Synapse-compatible: `exp` is optional but enforced
   when present.
 

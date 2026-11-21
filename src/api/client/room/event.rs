@@ -1,16 +1,14 @@
 use axum::extract::State;
-use futures::{TryFutureExt, future::join3, pin_mut};
+use futures::{TryFutureExt, future::join};
 use ruma::api::client::room::get_room_event;
 use tuwunel_core::{
-	Err, Event, Pdu, Result, err,
+	Err, Result, err,
 	result::IsErrOr,
 	utils::{BoolExt, FutureBoolExt, TryFutureExtExt, future::OptionFutureExt},
 };
+use tuwunel_matrix::{Event, Pdu};
 
-use crate::{
-	Ruma,
-	client::{annotate_membership, is_ignored_pdu},
-};
+use crate::{Ruma, is_ignored_pdu, with_membership};
 
 /// # `GET /_matrix/client/r0/rooms/{roomId}/event/{eventId}`
 ///
@@ -35,6 +33,8 @@ pub(crate) async fn get_room_event_route(
 
 			let can_redact = services
 				.config
+				.rooms
+				.redaction
 				.allow_room_admins_to_request_unredacted_events
 				.then_async(|| {
 					services
@@ -45,8 +45,6 @@ pub(crate) async fn get_room_event_route(
 						})
 				})
 				.unwrap_or(false);
-
-			pin_mut!(is_admin, can_redact);
 
 			if is_admin.or(can_redact).await {
 				services
@@ -59,22 +57,20 @@ pub(crate) async fn get_room_event_route(
 			}
 		});
 
-	let visible = services
-		.state_accessor
-		.user_can_see_event(sender_user, room_id, event_id);
+	let (event, retained_event) = join(event, retained_event).await;
 
-	let (mut event, retained_event, visible): (Result<Pdu>, Option<Result<Pdu>>, _) =
-		join3(event, retained_event, visible).await;
+	let event: Result<Pdu> = retained_event
+		.filter(|_| event.as_ref().is_err_or(Event::is_redacted))
+		.unwrap_or(event);
 
-	if event.as_ref().is_err_or(Event::is_redacted)
-		&& let Some(retained_event) = retained_event
+	let event = event?;
+
+	if event.room_id() != room_id
+		|| !services
+			.state_accessor
+			.user_can_see_event(sender_user, &event)
+			.await
 	{
-		event = retained_event;
-	}
-
-	let mut event = event?;
-
-	if !visible {
 		return Err!(Request(NotFound("Event not found.")));
 	}
 
@@ -86,20 +82,15 @@ pub(crate) async fn get_room_event_route(
 		}));
 	}
 
-	debug_assert!(
-		event.event_id() == event_id && event.room_id() == room_id,
-		"Fetched PDU must match requested"
-	);
+	debug_assert!(event.event_id() == event_id, "Fetched PDU must match requested");
 
-	event.add_age().ok();
-
+	let event = event.served_to(Some(sender_user));
 	let encrypted = services
 		.state_accessor
 		.is_encrypted_room(room_id)
 		.await;
 
-	annotate_membership(&services, &mut event, sender_user, encrypted).await;
-
+	let event = with_membership(&services, event, sender_user, encrypted).await;
 	let event = services
 		.pdu_metadata
 		.bundle_aggregations(sender_user, event)

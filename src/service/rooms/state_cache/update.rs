@@ -5,14 +5,14 @@
 //! refreshes room counts, server participation, and appservice decisions after
 //! the per-user transition lands.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use futures::{
 	FutureExt, StreamExt,
 	future::{join, join3},
 };
 use ruma::{
-	OwnedServerName, RoomId, UserId,
+	EventId, OwnedServerName, RoomId, UserId,
 	events::{
 		AnyStrippedStateEvent, AnySyncStateEvent, GlobalAccountDataEventType,
 		RoomAccountDataEventType, StateEventType,
@@ -26,22 +26,30 @@ use ruma::{
 };
 use tuwunel_core::{
 	Result, at, implement, is_not_empty,
-	matrix::PduCount,
 	utils::{
-		BoolExt, FutureBoolExt, ReadyExt,
+		BoolExt, FutureBoolExt, OptionExt, ReadyExt,
 		future::ReadyBoolExt,
 		result::{LogErr, NotFound},
 	},
 	warn,
 };
-use tuwunel_database::{Json, Txn, keyval::ValBuf, serialize_key, serialize_val};
+use tuwunel_database::{Json, Map, Txn, keyval::ValBuf, serialize_key, serialize_val};
+use tuwunel_matrix::PduCount;
+
+use super::FORGOTTEN_STATE;
 
 /// Optional stripped room state attached to invite and knock transitions.
 ///
 /// `None` means the caller supplied no state, while `Some` can contain an empty
-/// event vector. Invite handling preserves an existing nonempty row when no new
-/// state is supplied.
+/// event vector. Invite and knock handling preserve an existing nonempty row
+/// when no new state is supplied.
 pub type StrippedRoomState = Option<Vec<Raw<AnyStrippedStateEvent>>>;
+
+struct Invite<'a> {
+	last_state: StrippedRoomState,
+	invite_via: Option<Vec<OwnedServerName>>,
+	invite_event: Option<&'a EventId>,
+}
 
 /// Parameters for one membership cache transition.
 ///
@@ -71,7 +79,8 @@ pub struct MembershipUpdate<'a> {
 	/// Stripped room state associated with an invite or knock.
 	///
 	/// Other membership transitions leave this value unused. An absent or empty
-	/// value preserves an invite's stored state rather than clearing it.
+	/// value preserves an invite's or knock's stored state rather than clearing
+	/// it.
 	pub last_state: StrippedRoomState,
 
 	/// Servers supplied as routing hints for an invite.
@@ -80,11 +89,25 @@ pub struct MembershipUpdate<'a> {
 	/// with the membership indexes.
 	pub invite_via: Option<Vec<OwnedServerName>>,
 
+	/// Event ID of the current invitation.
+	///
+	/// An absent ID clears any previously recorded ID on an invite transition.
+	pub invite_event: Option<&'a EventId>,
+
 	/// Whether to rebuild the room's aggregate membership counts.
 	///
 	/// Bulk state updates can defer this rebuild until all transitions are
 	/// applied.
 	pub update_joined_count: bool,
+
+	/// Stream position of the user's own join this event replaces, set only for
+	/// a profile change.
+	///
+	/// Such a join keeps a recorded position no later than the one it replaces,
+	/// so it never reads as a fresh join. Any other join records its own
+	/// position, as does a profile change over a position a forced replay
+	/// recorded after the replaced join.
+	pub replaced_join: Option<PduCount>,
 
 	/// Stream position associated with the membership event.
 	///
@@ -96,9 +119,10 @@ pub struct MembershipUpdate<'a> {
 ///
 /// Remote users are created before their transition is recorded, and paired
 /// forward and reverse rows change together. Joins can copy predecessor-room
-/// account data, while leaves can trigger push-badge refresh and configured
-/// forget behavior. Aggregate room counts are rebuilt only when requested by
-/// the update descriptor.
+/// account data and keep the recorded join position across a profile change,
+/// while leaves can trigger push-badge refresh and configured forget behavior.
+/// Aggregate room counts are rebuilt only when requested by the update
+/// descriptor.
 #[implement(super::Service)]
 #[tracing::instrument(
 		level = "debug",
@@ -120,7 +144,9 @@ pub async fn update_membership(
 		sender,
 		last_state,
 		invite_via,
+		invite_event,
 		update_joined_count,
+		replaced_join,
 		count,
 	}: MembershipUpdate<'_>,
 ) -> Result {
@@ -130,16 +156,19 @@ pub async fn update_membership(
 
 	match membership {
 		| MembershipState::Join => {
-			self.handle_join(room_id, user_id, count).await?;
+			self.handle_join(room_id, user_id, count, replaced_join)
+				.await?;
 		},
 		| MembershipState::Invite => {
 			// An ignored sender's invite is stored anyway; the recipient's list
 			// is applied when it is served, by InviteFilter::permission.
-			self.mark_as_invited(user_id, room_id, count, last_state, invite_via)
+			let invite = Invite { last_state, invite_via, invite_event };
+
+			self.mark_as_invited(user_id, room_id, count, invite)
 				.await?;
 		},
 		| MembershipState::Leave | MembershipState::Ban => {
-			self.handle_leave(room_id, user_id, count).await;
+			self.handle_leave(room_id, user_id, count).await?;
 
 			// A departure drops the room from the account-wide badge total.
 			if self.services.globals.user_is_local(user_id) {
@@ -152,7 +181,8 @@ pub async fn update_membership(
 			}
 		},
 		| MembershipState::Knock => {
-			self.mark_as_knocked(user_id, room_id, count, last_state);
+			self.mark_as_knocked(user_id, room_id, count, last_state)
+				.await?;
 		},
 		| _ => {},
 	}
@@ -162,6 +192,34 @@ pub async fn update_membership(
 	}
 
 	Ok(())
+}
+
+impl<'a> MembershipUpdate<'a> {
+	/// A transition a user makes to their own membership.
+	///
+	/// The user is also the sender; the update carries no stripped state or
+	/// invite routing, is not a profile change, and rebuilds the room's aggregate
+	/// counts. A caller changes any of these by struct update.
+	#[must_use]
+	pub fn self_sent(
+		room_id: &'a RoomId,
+		user_id: &'a UserId,
+		membership_event: RoomMemberEventContent,
+		count: PduCount,
+	) -> Self {
+		Self {
+			room_id,
+			user_id,
+			membership_event,
+			sender: user_id,
+			last_state: None,
+			invite_via: None,
+			invite_event: None,
+			update_joined_count: true,
+			replaced_join: None,
+			count,
+		}
+	}
 }
 
 /// Rebuilds a room's aggregate membership and server indexes.
@@ -298,26 +356,28 @@ pub(crate) fn mark_as_left(&self, user_id: &UserId, room_id: &RoomId, count: Pdu
 
 /// Writes the paired indexes for a current knock transition.
 ///
-/// Missing stripped state is stored as an empty array, and join, invite, and
-/// leave rows are removed in the same transaction. This low-level helper skips
-/// aggregate rebuilding performed by [`super::Service::update_membership`].
+/// Missing or empty stripped state preserves an existing nonempty knock row,
+/// while a new state replaces it. Join, invite, and leave rows are removed in
+/// the same transaction, and aggregate rebuilding is left to
+/// [`super::Service::update_membership`].
 #[implement(super::Service)]
-#[tracing::instrument(skip(self), level = "debug")]
-pub(crate) fn mark_as_knocked(
+#[tracing::instrument(skip(self, knocked_state), level = "debug")]
+pub(crate) async fn mark_as_knocked(
 	&self,
 	user_id: &UserId,
 	room_id: &RoomId,
 	count: PduCount,
 	knocked_state: StrippedRoomState,
-) {
+) -> Result {
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
 
 	let roomuser_id = (room_id, user_id);
 	let roomuser_id = serialize_key(roomuser_id).expect("failed to serialize roomuser_id");
 
-	let knocked_state = serialize_val(Json(knocked_state.unwrap_or_default()))
-		.expect("failed to serialize knocked state");
+	let knocked_state = self
+		.stripped_state_row(&self.db.userroomid_knockedstate, &userroom_id, knocked_state)
+		.await?;
 
 	let count = count.into_unsigned().to_be_bytes();
 	let mut txn = self.services.db.txn();
@@ -331,23 +391,68 @@ pub(crate) fn mark_as_knocked(
 	txn.del_raw(&self.db.userroomid_leftstate, &userroom_id);
 	txn.del_raw(&self.db.roomuserid_leftcount, &roomuser_id);
 	txn.execute();
+
+	Ok(())
+}
+
+/// The stripped state a membership row stores.
+///
+/// A replay carrying no stripped state must not blank a row that has some, so
+/// missing or empty state keeps the row's stored value. A probe that fails to
+/// read the row is an error, not an absence.
+#[implement(super::Service)]
+async fn stripped_state_row(
+	&self,
+	states: &Arc<Map>,
+	userroom_id: &[u8],
+	last_state: StrippedRoomState,
+) -> Result<ValBuf> {
+	let last_state = last_state.filter(is_not_empty!());
+	let stored = last_state
+		.is_none()
+		.then_async(|| states.get(userroom_id))
+		.await
+		.transpose()
+		.optional()?
+		.flatten();
+
+	let state = stored
+		.as_deref()
+		.map(ValBuf::from_slice)
+		.unwrap_or_else(|| {
+			serialize_val(Json(last_state.unwrap_or_default()))
+				.expect("failed to serialize stripped state")
+		});
+
+	Ok(state)
 }
 
 /// Forgets a user's retained leave state for a room.
 ///
-/// Only the paired leave rows are deleted; once-joined history and other room
-/// data remain untouched. Without a separate forget marker, absence of these
-/// rows is the durable forgotten state.
+/// The state value becomes a tombstone while its departure position remains
+/// available to incremental sync. Callers hold the room state lock so a rejoin
+/// cannot race this write; a room without a recorded departure stays absent.
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-pub fn forget(&self, room_id: &RoomId, user_id: &UserId) {
+pub async fn forget(&self, room_id: &RoomId, user_id: &UserId) -> Result {
 	let userroom_id = (user_id, room_id);
-	let roomuser_id = (room_id, user_id);
-	let mut txn = self.services.db.txn();
 
-	txn.del(&self.db.userroomid_leftstate, userroom_id);
-	txn.del(&self.db.roomuserid_leftcount, roomuser_id);
-	txn.execute();
+	if self
+		.get_departure_count(room_id, user_id)
+		.await
+		.optional()?
+		.is_none()
+	{
+		self.db.userroomid_leftstate.del(userroom_id);
+
+		return Ok(());
+	}
+
+	self.db
+		.userroomid_leftstate
+		.put_raw(userroom_id, FORGOTTEN_STATE);
+
+	Ok(())
 }
 
 #[implement(super::Service)]
@@ -376,13 +481,12 @@ pub(super) const EMPTY_INVITE_STATE: &[u8] = b"[]";
 /// membership rows are removed in the same transaction.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self, last_state, invite_via))]
-pub(crate) async fn mark_as_invited(
+async fn mark_as_invited(
 	&self,
 	user_id: &UserId,
 	room_id: &RoomId,
 	count: PduCount,
-	last_state: StrippedRoomState,
-	invite_via: Option<Vec<OwnedServerName>>,
+	Invite { last_state, invite_via, invite_event }: Invite<'_>,
 ) -> Result {
 	let userroom_id = (user_id, room_id);
 	let userroom_id = serialize_key(userroom_id).expect("failed to serialize userroom_id");
@@ -390,30 +494,20 @@ pub(crate) async fn mark_as_invited(
 	let roomuser_id = (room_id, user_id);
 	let roomuser_id = serialize_key(roomuser_id).expect("failed to serialize roomuser_id");
 
-	// A replay carrying no stripped state must not blank a row that has some, or
-	// the read side loses the sender it judges the invite by.
-	let last_state = last_state.filter(is_not_empty!());
-	let stored = last_state
-		.is_none()
-		.then_async(|| self.db.userroomid_invitestate.get(&userroom_id))
-		.await
-		.transpose()
-		.optional()?
-		.flatten();
+	// A blanked row would lose the sender the read side judges the invite by.
+	let invite_state = self
+		.stripped_state_row(&self.db.userroomid_invitestate, &userroom_id, last_state)
+		.await?;
 
-	let invite_state = stored.as_deref().map_or_else(
-		|| {
-			serialize_val(Json(last_state.unwrap_or_default()))
-				.expect("failed to serialize invite state")
-		},
-		ValBuf::from_slice,
-	);
-
-	let count = count.into_unsigned().to_be_bytes();
 	let mut txn = self.services.db.txn();
 
 	txn.insert_raw(&self.db.userroomid_invitestate, &userroom_id, invite_state);
-	txn.insert_raw(&self.db.roomuserid_invitecount, &roomuser_id, count);
+	txn.put(
+		&self.db.roomuserid_invitecount,
+		(room_id, user_id),
+		(count.into_unsigned(), invite_event),
+	);
+
 	txn.del_raw(&self.db.userroomid_joinedcount, &userroom_id);
 	txn.del_raw(&self.db.roomuserid_joinedcount, &roomuser_id);
 	txn.del_raw(&self.db.userroomid_leftstate, &userroom_id);
@@ -445,14 +539,34 @@ async fn ensure_remote_user(&self, user_id: &UserId) -> Result {
 }
 
 #[implement(super::Service)]
-async fn handle_join(&self, room_id: &RoomId, user_id: &UserId, count: PduCount) -> Result {
+async fn handle_join(
+	&self,
+	room_id: &RoomId,
+	user_id: &UserId,
+	count: PduCount,
+	replaced_join: Option<PduCount>,
+) -> Result {
 	if !self.once_joined(user_id, room_id).await {
 		self.mark_as_once_joined(user_id, room_id);
 		self.copy_predecessor_data(room_id, user_id)
 			.await?;
 	}
 
-	self.mark_as_joined(user_id, room_id, count);
+	// A missing, malformed or legacy empty row (read as zero) takes the position.
+	let keep = replaced_join
+		.map_async(async |replaced| {
+			let replaced = replaced.into_normal().into_unsigned();
+
+			self.get_joined_count(room_id, user_id)
+				.await
+				.is_ok_and(|recorded| (1..=replaced).contains(&recorded))
+		})
+		.await
+		.unwrap_or_default();
+
+	if !keep {
+		self.mark_as_joined(user_id, room_id, count);
+	}
 
 	Ok(())
 }
@@ -550,14 +664,24 @@ async fn copy_predecessor_direct(
 
 #[implement(super::Service)]
 #[tracing::instrument(skip(self), level = "debug")]
-async fn handle_leave(&self, room_id: &RoomId, user_id: &UserId, count: PduCount) {
+async fn handle_leave(&self, room_id: &RoomId, user_id: &UserId, count: PduCount) -> Result {
+	if self.is_forgotten(user_id, room_id).await? {
+		return Ok(());
+	}
+
 	self.mark_as_left(user_id, room_id, count);
 
 	if !self.services.globals.user_is_local(user_id) {
-		return;
+		return Ok(());
 	}
 
-	if !self.services.config.forget_forced_upon_leave {
+	if self
+		.services
+		.config
+		.rooms
+		.forget_forced_upon_leave
+		.is_false()
+	{
 		let not_disabled = self
 			.services
 			.metadata
@@ -571,9 +695,9 @@ async fn handle_leave(&self, room_id: &RoomId, user_id: &UserId, count: PduCount
 			.is_false();
 
 		if not_disabled.and(not_banned).await {
-			return;
+			return Ok(());
 		}
 	}
 
-	self.forget(room_id, user_id);
+	self.forget(room_id, user_id).await
 }
