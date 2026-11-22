@@ -99,7 +99,7 @@ class TransferSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {'ATTIC_TOKEN':'synthetic-fixture'}):
             with self.assertRaises(ValueError): module.transfer('export', Path(temporary), 1024)
 
-    def test_workflow_token_is_confined_to_the_isolated_publisher(self):
+    def test_workflow_oidc_is_confined_to_the_isolated_publishers(self):
         import re
         for path in Path(__file__).resolve().parents[1].joinpath('.github/workflows').glob('*actions.yml'):
             with self.subTest(workflow=path.name):
@@ -107,7 +107,10 @@ class TransferSafetyTests(unittest.TestCase):
                 jobs = dict(zip(sections[::2], sections[1::2]))
                 self.assertEqual(set(jobs), {'plan', 'dependencies', 'publish-dependencies', 'build', 'publish', 'test'})
                 for name, job in jobs.items():
+                    self.assertNotIn('ci/push-attic.py', job)
                     if name not in {'publish', 'publish-dependencies'}:
+                        self.assertNotIn('id-token: write', job)
+                        self.assertNotIn('ci/push-niks3.py', job)
                         lines = job.splitlines()
                         for index, line in enumerate(lines):
                             if 'secrets.ATTIC_TOKEN' in line:
@@ -115,15 +118,17 @@ class TransferSafetyTests(unittest.TestCase):
                                 self.assertIn("github.event_name == 'push'", preceding)
                                 self.assertIn('github.event.repository.default_branch', preceding)
                         continue
-                    self.assertEqual(job.count('secrets.ATTIC_TOKEN'), 1)
+                    self.assertNotIn('secrets.', job)
+                    self.assertIn('id-token: write', job)
                     dependency = 'dependencies' if name == 'publish-dependencies' else 'build'
                     self.assertIn('needs: [plan, ' + dependency + ']', job)
-                    self.assertIn('--max-jobs 0 --builders', job)
+                    self.assertIn("github.event_name != 'pull_request'", job)
+                    self.assertIn("github.event_name != 'pull_request_target'", job)
                     self.assertIn('github.event.repository.default_branch', job)
                     self.assertIn("github.event_name == 'push'", re.sub(r"\s+", " ", job))
                     self.assertIn("github.event_name == 'workflow_dispatch'", re.sub(r"\s+", " ", job))
-                    self.assertLess(job.index('Install the trusted pinned Attic client'), job.index('ci/transfer-attic.py import'))
-                    self.assertLess(job.index('ci/transfer-attic.py import'), job.index('secrets.ATTIC_TOKEN'))
+                    self.assertLess(job.index('ci/install-niks3.sh'), job.index('ci/transfer-attic.py import'))
+                    self.assertLess(job.index('ci/transfer-attic.py import'), job.index('ci/push-niks3.py'))
                     self.assertNotIn('Evaluate and build the selected native package', job)
 
 
